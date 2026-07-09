@@ -1,0 +1,464 @@
+<script setup lang="ts">
+import { computed, reactive, ref, watch } from 'vue'
+import { useWalletStore } from '@/stores/walletStore'
+import { useVmuStore } from '@/stores/vmuStore'
+import { CHAIN_KEYS, CHAINS, type ChainKey } from '@/config/chains'
+import { LIMITS, DEFAULT_TERM, DEFAULT_TERM_MAX, DEFAULT_MINT_VMUS } from '@/config/miner'
+import {
+  prepareOperation,
+  sendPreparedOperation,
+  abortPrepared,
+  resumePendingLocks,
+  clearAbandonedSoftLocks,
+  type OpType,
+  type TxStepState,
+  type PreparedOp
+} from '@/core/txManager'
+import { useGasPrice } from '@/composables/useGasPrice'
+import { usePendingTx } from '@/composables/usePendingTx'
+import WalletButton from '@/components/WalletButton.vue'
+import RpcSettings from '@/components/RpcSettings.vue'
+import TxModal from '@/components/TxModal.vue'
+import MintList from '@/components/MintList.vue'
+import PendingOpsPanel from '@/components/PendingOpsPanel.vue'
+import { CONTRACTS } from '@/config/contracts'
+
+const wallet = useWalletStore()
+const store = useVmuStore()
+
+type Tab = 'GENERAL_MINT' | 'MINT_EMPTY_SLOT' | 'CREATE_EMPTY_SLOT'
+const tab = ref<Tab>('GENERAL_MINT')
+
+const activeChain = computed<ChainKey | null>(() => wallet.chainKey)
+// Gas indicator works even before connecting: fall back to Ethereum.
+const { gwei, loading: gweiLoading } = useGasPrice(() => activeChain.value ?? 'eth')
+
+async function onChainSelect(ev: Event) {
+  const el = ev.target as HTMLSelectElement
+  const next = el.value as ChainKey
+  const prev = activeChain.value
+  // Keep the select on the current chain until the wallet confirms.
+  el.value = prev ?? ''
+  if (!next || next === prev || wallet.switchingChain) return
+  const name = CHAINS[next].name
+  if (!window.confirm(`Switch network to ${name}? Your wallet will ask for confirmation.`)) {
+    return
+  }
+  try {
+    await wallet.switchChain(next)
+  } catch {
+    /* switchError set in store; select already restored */
+  }
+}
+const {
+  hasPending,
+  pendingCount,
+  ops: pendingOps,
+  checking: pendingChecking,
+  check: checkPending,
+  trackHash: trackPendingHash
+} = usePendingTx(
+  () => wallet.address,
+  () => activeChain.value
+)
+
+const trackError = ref<string | null>(null)
+async function onTrackHash(payload: { hash: string; seenText?: string }) {
+  trackError.value = null
+  try {
+    await trackPendingHash(payload.hash, payload.seenText)
+  } catch (err: any) {
+    trackError.value = err?.message || String(err)
+  }
+}
+
+const limits = computed(() => (activeChain.value ? LIMITS[activeChain.value] : LIMITS.eth))
+
+const form = reactive({
+  mintVmus: Math.min(DEFAULT_MINT_VMUS, LIMITS.eth.generalMint),
+  mintTerm: DEFAULT_TERM,
+  createVmus: LIMITS.eth.createEmptySlot,
+  emptyVmus: 1,
+  emptyTerm: DEFAULT_TERM
+})
+
+// Load / reload wallet VMU data when account or chain changes.
+watch(
+  [() => wallet.address, () => wallet.chainKey],
+  async ([addr, key]) => {
+    if (addr && key) {
+      form.mintVmus = Math.min(DEFAULT_MINT_VMUS, LIMITS[key].generalMint)
+      form.createVmus = LIMITS[key].createEmptySlot
+      // Load immediately; resume pending locks in the background (do not block UI).
+      void store.load(key, addr)
+      void resumePendingLocks(key, addr)
+        .then((resolved) => {
+          if (resolved && wallet.address === addr && wallet.chainKey === key) store.refresh()
+        })
+        .catch(() => {})
+      void checkPending()
+    } else {
+      store.reset()
+    }
+  },
+  { immediate: true }
+)
+
+const emptySlotIds = computed(() => store.emptyIds)
+
+// ---- transaction orchestration ----
+const txVisible = ref(false)
+const txState = ref<TxStepState | null>(null)
+const txTitle = ref('')
+const busy = ref(false)
+
+const canOperate = computed(
+  () =>
+    wallet.isConnected &&
+    wallet.isSupportedChain &&
+    !wallet.isContractWallet &&
+    !busy.value &&
+    !hasPending.value
+)
+
+let opSeq = 0
+const prepared = ref<PreparedOp | null>(null)
+
+async function operate(op: OpType, args: { ids?: number[]; count?: number; term?: number }, title: string) {
+  if (!activeChain.value || !wallet.address) return
+  // Fresh check right before starting — polling may be a few seconds stale.
+  const n = await checkPending()
+  if (n > 0) {
+    txTitle.value = title
+    txState.value = {
+      estimate: 'error',
+      send: 'wait',
+      confirm: 'wait',
+      error: `Blocked: ${n} pending tx on-chain. Wait, Speed up, or Cancel in MetaMask first.`
+    }
+    txVisible.value = true
+    return
+  }
+
+  const seq = ++opSeq
+  busy.value = true
+  prepared.value = null
+  txTitle.value = title
+  txState.value = { estimate: 'wait', send: 'wait', confirm: 'wait' }
+  txVisible.value = true
+  try {
+    // Phase 1 only: estimate. Send waits for an explicit click (fresh user gesture).
+    const prep = await prepareOperation(
+      { chain: activeChain.value, wallet: wallet.address, op, ...args },
+      {
+        onStep: (s) => {
+          if (seq === opSeq) txState.value = s
+        }
+      }
+    )
+    if (seq !== opSeq) {
+      abortPrepared(prep)
+      return
+    }
+    prepared.value = prep
+    // Keep busy=true while waiting for the user to click "Open MetaMask & Sign".
+  } catch {
+    if (seq === opSeq) busy.value = false
+    void checkPending()
+  }
+}
+
+/** Phase 2: must run from a click so MetaMask gets a fresh user gesture. */
+async function signPrepared() {
+  const prep = prepared.value
+  if (!prep) return
+  const n = await checkPending()
+  if (n > 0) {
+    abortPrepared(prep)
+    prepared.value = null
+    busy.value = false
+    txState.value = {
+      estimate: 'done',
+      send: 'error',
+      confirm: 'wait',
+      readyToSign: false,
+      error: `A previous transaction is still pending (${n}). Wait for it in MetaMask, then retry.`
+    }
+    return
+  }
+  const seq = opSeq
+  prepared.value = null
+  try {
+    await sendPreparedOperation(prep, {
+      onStep: (s) => {
+        if (seq === opSeq) txState.value = s
+      }
+    })
+  } catch {
+    // error in txState
+  } finally {
+    if (seq === opSeq) {
+      busy.value = false
+      store.refresh()
+      void checkPending()
+    }
+  }
+}
+
+function cancelTx() {
+  opSeq++
+  abortPrepared(prepared.value)
+  prepared.value = null
+  busy.value = false
+  if (activeChain.value && wallet.address) clearAbandonedSoftLocks(activeChain.value, wallet.address)
+  if (txState.value?.send === 'process' || txState.value?.readyToSign) {
+    txState.value = {
+      estimate: txState.value.estimate,
+      send: 'error',
+      confirm: 'wait',
+      readyToSign: false,
+      error: 'Cancelled. If MetaMask still shows a request, reject it, then retry.'
+    }
+  } else {
+    txVisible.value = false
+  }
+}
+
+function clampTerm(n: number): number {
+  if (!Number.isFinite(n)) return DEFAULT_TERM
+  return Math.min(Math.max(1, Math.floor(n)), DEFAULT_TERM_MAX)
+}
+
+function doGeneralMint() {
+  clampMint()
+  form.mintTerm = clampTerm(form.mintTerm)
+  operate('GENERAL_MINT', { count: form.mintVmus, term: form.mintTerm }, 'General Mint')
+}
+function doCreateEmpty() {
+  clampCreate()
+  operate('CREATE_EMPTY_SLOT', { count: form.createVmus }, 'Create Empty Slots')
+}
+function doMintEmpty() {
+  clampEmpty()
+  form.emptyTerm = clampTerm(form.emptyTerm)
+  const ids = emptySlotIds.value.slice(0, form.emptyVmus)
+  operate('MINT_EMPTY_SLOT', { ids, term: form.emptyTerm }, 'Empty Slots Mint')
+}
+function onClaim(ids: number[]) {
+  operate('CLAIM', { ids }, 'Claim only')
+}
+function onClaimReuse(ids: number[], term: number) {
+  const t = clampTerm(term)
+  operate('CLAIM_REUSE', { ids, term: t }, `Claim & Re-Mint (${t} days)`)
+}
+
+function clampMint() {
+  form.mintVmus = Math.min(Math.max(1, form.mintVmus || 1), limits.value.generalMint)
+}
+function clampCreate() {
+  form.createVmus = Math.min(Math.max(1, form.createVmus || 1), limits.value.createEmptySlot)
+}
+function clampEmpty() {
+  const max = Math.min(limits.value.mintEmptySlot, emptySlotIds.value.length || 1)
+  form.emptyVmus = Math.min(Math.max(1, form.emptyVmus || 1), max)
+}
+
+const explorerAddrUrl = computed(() => {
+  if (!activeChain.value) return '#'
+  return `${CHAINS[activeChain.value].blockExplorerUrl}/address/${CONTRACTS[activeChain.value].factory}`
+})
+</script>
+
+<template>
+  <div class="container" style="padding-top: 24px; padding-bottom: 60px">
+    <!-- header -->
+    <header class="row between wrap" style="margin-bottom: 20px">
+      <div>
+        <h1 style="margin: 0; font-size: 22px">XENTurbo XEN Miner</h1>
+        <span class="dim">Pure frontend. No backend, no database. All state read from chain.</span>
+      </div>
+      <div class="row wrap">
+        <div class="gas-pill" :title="gweiLoading ? 'Fetching gas…' : 'Gas price'">
+          <span class="mono">{{ gweiLoading && gwei === '--' ? '…' : gwei }}</span>
+          <span class="dim">Gwei</span>
+        </div>
+        <select
+          v-if="wallet.isConnected"
+          class="input chain-select"
+          :value="activeChain ?? ''"
+          :disabled="wallet.switchingChain"
+          @change="onChainSelect"
+        >
+          <option v-for="k in CHAIN_KEYS" :key="k" :value="k">{{ CHAINS[k].name }}</option>
+        </select>
+        <RpcSettings v-if="activeChain" :chain="activeChain" @saved="store.refresh()" />
+        <WalletButton />
+      </div>
+    </header>
+    <p v-if="wallet.switchError" class="card warn-card" style="margin-bottom: 12px">
+      {{ wallet.switchError }}
+    </p>
+
+    <!-- warnings -->
+    <div v-if="wallet.isConnected && !wallet.isSupportedChain" class="card warn-card">
+      Unsupported network. Switch to Ethereum or Polygon in your wallet.
+    </div>
+    <div v-else-if="wallet.isContractWallet" class="card warn-card">
+      This looks like a smart-contract wallet. The miner contract requires an EOA
+      (tx.origin == msg.sender) and will reject contract wallets.
+    </div>
+    <div v-if="!wallet.isConnected" class="card connect-card">
+      <p>Connect an EOA wallet to start batch minting XEN.</p>
+      <WalletButton />
+      <p v-if="wallet.connectError" class="connect-err">{{ wallet.connectError }}</p>
+    </div>
+
+    <template v-else-if="wallet.isSupportedChain">
+      <PendingOpsPanel
+        :ops="pendingOps"
+        :pending-count="pendingCount"
+        :checking="pendingChecking"
+        @recheck="checkPending"
+        @track="onTrackHash"
+      />
+      <p v-if="trackError" class="card warn-card">{{ trackError }}</p>
+
+      <!-- operation tabs -->
+      <div class="card" style="margin-bottom: 16px">
+        <div class="row wrap tabs">
+          <button class="btn" :class="{ 'btn-primary': tab === 'GENERAL_MINT' }" @click="tab = 'GENERAL_MINT'">
+            General Mint
+          </button>
+          <button class="btn" :class="{ 'btn-primary': tab === 'MINT_EMPTY_SLOT' }" @click="tab = 'MINT_EMPTY_SLOT'">
+            Empty Slots Mint
+          </button>
+          <button class="btn" :class="{ 'btn-primary': tab === 'CREATE_EMPTY_SLOT' }" @click="tab = 'CREATE_EMPTY_SLOT'">
+            Slots Management
+          </button>
+        </div>
+        <hr class="hr" />
+
+        <!-- General Mint -->
+        <div v-if="tab === 'GENERAL_MINT'" class="form-grid">
+          <label>
+            <span class="dim">Mint VMUs (max {{ limits.generalMint }})</span>
+            <input class="input mono" type="number" v-model.number="form.mintVmus" min="1" :max="limits.generalMint" @blur="clampMint" />
+          </label>
+          <label>
+            <span class="dim">Term (days, max {{ DEFAULT_TERM_MAX }})</span>
+            <input class="input mono" type="number" v-model.number="form.mintTerm" min="1" :max="DEFAULT_TERM_MAX" @blur="form.mintTerm = clampTerm(form.mintTerm)" />
+          </label>
+          <button class="btn btn-primary tall" :disabled="!canOperate" @click="doGeneralMint">Confirm Mint</button>
+        </div>
+
+        <!-- Empty Slots Mint -->
+        <div v-else-if="tab === 'MINT_EMPTY_SLOT'" class="form-grid">
+          <label>
+            <span class="dim">Empty VMUs to mint (available {{ emptySlotIds.length }})</span>
+            <input class="input mono" type="number" v-model.number="form.emptyVmus" min="1" @blur="clampEmpty" />
+          </label>
+          <label>
+            <span class="dim">Term (days)</span>
+            <input class="input mono" type="number" v-model.number="form.emptyTerm" min="1" :max="DEFAULT_TERM_MAX" @blur="form.emptyTerm = clampTerm(form.emptyTerm)" />
+          </label>
+          <button class="btn btn-primary tall" :disabled="!canOperate || !emptySlotIds.length" @click="doMintEmpty">
+            Re-Mint Empty Slots
+          </button>
+        </div>
+
+        <!-- Slots Management -->
+        <div v-else class="form-grid">
+          <label>
+            <span class="dim">Create Empty Slots (max {{ limits.createEmptySlot }})</span>
+            <input class="input mono" type="number" v-model.number="form.createVmus" min="1" :max="limits.createEmptySlot" @blur="clampCreate" />
+          </label>
+          <div />
+          <button class="btn btn-primary tall" :disabled="!canOperate" @click="doCreateEmpty">Create Slots</button>
+          <p class="dim reuse-term-note" style="grid-column: 1 / -1; margin: 0">
+            Creates empty VMU proxies only (no mint term). Use Empty Slots Mint afterwards to start a term.
+          </p>
+        </div>
+
+        <p class="dim reuse-term-note">
+          Contract:
+          <a :href="explorerAddrUrl" target="_blank" rel="noreferrer">{{ activeChain ? CONTRACTS[activeChain].factory : '' }}</a>
+        </p>
+      </div>
+
+      <!-- mint list -->
+      <MintList
+        :busy="busy || hasPending"
+        :blocked-reason="hasPending ? `Blocked: ${pendingCount} pending tx on-chain` : null"
+        @claim="onClaim"
+        @claim-reuse="(ids, term) => onClaimReuse(ids, term)"
+      />
+    </template>
+
+    <TxModal
+      :visible="txVisible"
+      :state="txState"
+      :chain="activeChain"
+      :title="txTitle"
+      @close="txVisible = false"
+      @cancel="cancelTx"
+      @sign="signPrepared"
+    />
+  </div>
+</template>
+
+<style scoped>
+.gas-pill {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 12px;
+  background: var(--bg-elev);
+}
+.chain-select {
+  width: auto;
+  padding: 9px 12px;
+}
+.warn-card {
+  border-color: var(--warn);
+  color: var(--warn);
+  margin-bottom: 16px;
+}
+.connect-card {
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 48px 20px;
+}
+.connect-err {
+  color: var(--danger);
+  max-width: 480px;
+  font-size: 13px;
+}
+.tabs {
+  gap: 10px;
+}
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 16px;
+  align-items: end;
+}
+.form-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tall {
+  height: 42px;
+}
+.reuse-term-note {
+  margin: 16px 0 0;
+  font-size: 13px;
+}
+@media (max-width: 720px) {
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+}
+</style>

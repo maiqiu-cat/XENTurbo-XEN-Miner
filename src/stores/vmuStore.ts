@@ -1,0 +1,197 @@
+import { defineStore } from 'pinia'
+import type { ChainKey } from '@/config/chains'
+import type { Vmu, VmuGroup, VmuStatus } from '@/core/types'
+import { readWalletVmus, readGlobalRank, readVmuCount } from '@/core/chainReader'
+import { loadSnapshot, saveSnapshot, clearSnapshot } from '@/core/idb'
+import { broadcastLockedIds } from '@/core/localLock'
+import { estimateGroupXen } from '@/utils/rewards'
+
+interface State {
+  chain: ChainKey | null
+  wallet: string | null
+  vmuCount: number
+  vmus: Vmu[]
+  globalRank: number
+  syncedAt: number | null
+  loading: boolean
+  progress: { loaded: number; total: number }
+  error: string | null
+  /** Number of VMUs whose Multicall read failed (not EMPTY). */
+  readErrors: number
+  /** Monotonic token to discard stale refresh results after wallet/chain switch. */
+  refreshGen: number
+}
+
+const OPERABLE: VmuStatus[] = ['EMPTY', 'MINTING', 'CLAIMABLE']
+
+function normalizeVmu(v: Vmu): Vmu {
+  // Older IndexedDB snapshots may lack readOk — treat as ok.
+  if (typeof v.readOk !== 'boolean') {
+    return { ...v, readOk: v.status !== 'READ_ERROR' }
+  }
+  return v
+}
+
+export const useVmuStore = defineStore('vmu', {
+  state: (): State => ({
+    chain: null,
+    wallet: null,
+    vmuCount: 0,
+    vmus: [],
+    globalRank: 0,
+    syncedAt: null,
+    loading: false,
+    progress: { loaded: 0, total: 0 },
+    error: null,
+    readErrors: 0,
+    refreshGen: 0
+  }),
+  getters: {
+    emptyIds(state): number[] {
+      // Only hide ids that already have a broadcast tx (not soft pre-sign locks).
+      const locked =
+        state.chain && state.wallet ? broadcastLockedIds(state.chain, state.wallet) : new Set<number>()
+      return state.vmus
+        .filter((v) => v.status === 'EMPTY' && v.readOk && !locked.has(v.id))
+        .map((v) => v.id)
+    },
+    // Per-status VMU counts. Broadcast-pending ids are excluded so the header
+    // numbers stay consistent with the grouped Mint list below.
+    // READ_ERROR is tracked separately via readErrors.
+    counts(state): Record<'EMPTY' | 'MINTING' | 'CLAIMABLE', number> {
+      const locked =
+        state.chain && state.wallet ? broadcastLockedIds(state.chain, state.wallet) : new Set<number>()
+      const c = { EMPTY: 0, MINTING: 0, CLAIMABLE: 0 }
+      state.vmus.forEach((v) => {
+        if (locked.has(v.id)) return
+        if (v.status === 'EMPTY' || v.status === 'MINTING' || v.status === 'CLAIMABLE') c[v.status] += 1
+      })
+      return c
+    },
+    // Group non-empty VMUs by (term, maturityTs) - the same grouping the old
+    // backend produced for the Mint list.
+    groups(state): VmuGroup[] {
+      const locked =
+        state.chain && state.wallet ? broadcastLockedIds(state.chain, state.wallet) : new Set<number>()
+      const map = new Map<string, VmuGroup>()
+      for (const v of state.vmus) {
+        if (v.status === 'EMPTY' || v.status === 'READ_ERROR') continue
+        if (locked.has(v.id)) continue
+        if (!OPERABLE.includes(v.status)) continue
+        const key = `${v.term}-${v.maturityTs}`
+        let g = map.get(key)
+        if (!g) {
+          g = {
+            key,
+            term: v.term,
+            maturityTs: v.maturityTs,
+            status: v.status as 'MINTING' | 'CLAIMABLE',
+            rank: v.rank,
+            amplifier: v.amplifier,
+            eaaRate: v.eaaRate,
+            ids: [],
+            count: 0
+          }
+          map.set(key, g)
+        }
+        g.ids.push(v.id)
+        g.count += 1
+        if (v.rank < g.rank) g.rank = v.rank
+      }
+      const list = Array.from(map.values())
+      for (const g of list) {
+        g.estXen = estimateGroupXen({
+          globalRank: state.globalRank,
+          startRank: g.rank,
+          count: g.count,
+          term: g.term,
+          amplifier: g.amplifier,
+          eaaRate: g.eaaRate,
+          maturityMs: g.maturityTs
+        })
+      }
+      return list.sort((a, b) => b.maturityTs - a.maturityTs)
+    },
+    claimableGroups(): VmuGroup[] {
+      return (this.groups as VmuGroup[])
+        .filter((g) => g.status === 'CLAIMABLE')
+        .sort((a, b) => a.maturityTs - b.maturityTs)
+    },
+    mintingGroups(): VmuGroup[] {
+      return (this.groups as VmuGroup[]).filter((g) => g.status === 'MINTING')
+    }
+  },
+  actions: {
+    reset() {
+      this.vmuCount = 0
+      this.vmus = []
+      this.syncedAt = null
+      this.progress = { loaded: 0, total: 0 }
+      this.error = null
+      this.readErrors = 0
+    },
+
+    /** Load cached snapshot instantly, then refresh from chain in the background. */
+    async load(chain: ChainKey, wallet: string) {
+      this.chain = chain
+      this.wallet = wallet
+      this.reset()
+
+      const cached = await loadSnapshot(chain, wallet)
+      if (cached && this.chain === chain && this.wallet === wallet) {
+        this.vmuCount = cached.vmuCount
+        this.vmus = cached.vmus.map(normalizeVmu)
+        this.syncedAt = cached.syncedAt
+        this.readErrors = this.vmus.filter((v) => !v.readOk || v.status === 'READ_ERROR').length
+      }
+      await this.refresh()
+    },
+
+    /** Full re-read from chain (source of truth). */
+    async refresh() {
+      if (!this.chain || !this.wallet) return
+      const chain = this.chain
+      const wallet = this.wallet
+      const gen = ++this.refreshGen
+      this.loading = true
+      this.error = null
+      try {
+        const [count, gRank] = await Promise.all([
+          readVmuCount(chain, wallet),
+          readGlobalRank(chain).catch(() => this.globalRank)
+        ])
+        // Abort if wallet/chain changed while we were reading.
+        if (gen !== this.refreshGen || this.chain !== chain || this.wallet !== wallet) return
+
+        const vmus = await readWalletVmus(chain, wallet, {
+          vmuCount: count,
+          onProgress: (p) => {
+            if (gen === this.refreshGen) this.progress = p
+          }
+        })
+        if (gen !== this.refreshGen || this.chain !== chain || this.wallet !== wallet) return
+
+        this.globalRank = gRank || this.globalRank
+        this.vmuCount = count
+        this.vmus = vmus
+        this.readErrors = vmus.filter((v) => !v.readOk || v.status === 'READ_ERROR').length
+        this.syncedAt = Date.now()
+        if (this.readErrors > 0) {
+          this.error = `${this.readErrors} VMU(s) failed to read. Refresh or check RPC — do not treat them as empty.`
+        }
+        await saveSnapshot({ chain, wallet, vmuCount: count, vmus, syncedAt: this.syncedAt })
+      } catch (err: any) {
+        if (gen !== this.refreshGen) return
+        this.error = err?.shortMessage || err?.message || 'Failed to read chain'
+      } finally {
+        if (gen === this.refreshGen) this.loading = false
+      }
+    },
+
+    async hardRefresh() {
+      if (this.chain && this.wallet) await clearSnapshot(this.chain, this.wallet)
+      this.reset()
+      await this.refresh()
+    }
+  }
+})

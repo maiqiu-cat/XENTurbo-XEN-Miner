@@ -1,0 +1,142 @@
+:root {
+  --bg: #0b0e13;
+  --bg-elev: #141922;
+  --bg-elev-2: #1c2330;
+  --border: #262e3d;
+  --text: #e7ecf3;
+  --text-dim: #8b98ab;
+  --accent: #2afa7d;
+  --accent-dim: #1c8f4c;
+  --blue: #61a5fb;
+  --danger: #ff6a5f;
+  --warn: #fdd05f;
+  --radius: 12px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+a {
+  color: var(--blue);
+  text-decoration: none;
+}
+
+.container {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 0 16px;
+}
+
+.card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+}
+
+.btn {
+  border: 1px solid var(--border);
+  background: var(--bg-elev-2);
+  color: var(--text);
+  padding: 10px 16px;
+  border-radius: 10px;
+  font-weight: 600;
+  transition: 0.15s;
+}
+.btn:hover:not(:disabled) {
+  border-color: var(--accent-dim);
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.btn-primary {
+  background: var(--accent);
+  color: #04240f;
+  border-color: var(--accent);
+}
+.btn-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.btn-ghost {
+  background: transparent;
+}
+
+.input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  padding: 10px 12px;
+  width: 100%;
+  font-size: 15px;
+}
+.input:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.between {
+  justify-content: space-between;
+}
+.wrap {
+  flex-wrap: wrap;
+}
+.grow {
+  flex: 1;
+}
+.dim {
+  color: var(--text-dim);
+}
+.mono {
+  font-variant-numeric: tabular-nums;
+}
+.tag {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+.tag-warn {
+  background: rgba(255, 176, 32, 0.15);
+  color: var(--warn);
+}
+.tag-green {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+.tag-blue {
+  color: var(--blue);
+  border-color: #274b7a;
+}
+.tag-dim {
+  color: var(--text-dim);
+}
+
+.hr {
+  height: 1px;
+  background: var(--border);
+  border: 0;
+  margin: 16px 0;
+}
