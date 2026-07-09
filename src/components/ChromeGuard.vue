@@ -2,22 +2,62 @@
 import { onMounted, ref } from 'vue'
 
 const supported = ref(true)
-const browserName = ref('this browser')
+const message = ref('XENTurbo XEN Miner requires Google Chrome.')
 
-function detectChrome(): boolean {
+interface BrowserCheck {
+  supported: boolean
+  message: string
+}
+
+function checkBrowser(): BrowserCheck {
   const nav = navigator as Navigator & {
-    userAgentData?: { brands?: Array<{ brand: string; version: string }> }
+    userAgentData?: { brands?: Array<{ brand: string; version: string }>; mobile?: boolean }
     brave?: unknown
   }
+  const ua = nav.userAgent
+  const name = detectName(ua)
+
+  if (isMobileEnvironment(nav, ua)) {
+    return {
+      supported: false,
+      message: 'Mobile browsers are not supported. Open this site on a desktop or laptop with Google Chrome.'
+    }
+  }
+
+  if (isGoogleChrome(nav, ua)) {
+    return {
+      supported: true,
+      message: ''
+    }
+  }
+
+  return {
+    supported: false,
+    message: `XENTurbo XEN Miner requires PC Google Chrome. You are currently using ${name}.`
+  }
+}
+
+function isGoogleChrome(
+  nav: Navigator & { userAgentData?: { brands?: Array<{ brand: string; version: string }> }; brave?: unknown },
+  ua: string
+): boolean {
   const brands = nav.userAgentData?.brands ?? []
   if (brands.some((b) => b.brand === 'Google Chrome')) return true
 
-  const ua = nav.userAgent
-  browserName.value = detectName(ua)
   const looksLikeChrome = /Chrome\/|CriOS\//.test(ua)
   const excluded = /Edg\/|EdgiOS\/|OPR\/|Opera|SamsungBrowser|DuckDuckGo|YaBrowser|Firefox\/|FxiOS\//.test(ua)
   if (typeof nav.brave !== 'undefined') return false
   return looksLikeChrome && !excluded
+}
+
+function isMobileEnvironment(
+  nav: Navigator & { userAgentData?: { mobile?: boolean } },
+  ua: string
+): boolean {
+  if (nav.userAgentData?.mobile) return true
+  if (/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile|Tablet/i.test(ua)) return true
+  // iPadOS can present a desktop Safari UA.
+  return /Macintosh/i.test(ua) && nav.maxTouchPoints > 1
 }
 
 function detectName(ua: string): string {
@@ -30,16 +70,18 @@ function detectName(ua: string): string {
 }
 
 onMounted(() => {
-  supported.value = detectChrome()
+  const result = checkBrowser()
+  supported.value = result.supported
+  message.value = result.message
 })
 </script>
 
 <template>
   <div v-if="!supported" class="chrome-guard" role="alertdialog" aria-modal="true" aria-labelledby="chrome-guard-title">
     <div class="chrome-guard__panel">
-      <p id="chrome-guard-title" class="chrome-guard__title">Please use Chrome</p>
+      <p id="chrome-guard-title" class="chrome-guard__title">Please use PC Chrome</p>
       <p class="chrome-guard__body">
-        XENTurbo XEN Miner requires Google Chrome. You are currently using {{ browserName }}.
+        {{ message }}
       </p>
       <a class="btn btn-primary chrome-guard__action" href="https://www.google.com/chrome/" target="_blank" rel="noreferrer">
         Get Chrome
