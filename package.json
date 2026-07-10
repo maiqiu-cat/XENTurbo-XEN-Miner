@@ -10,9 +10,11 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:e2e": "npm run build && playwright test",
     "verify:create2": "node scripts/verify-create2.mjs",
     "typecheck": "vue-tsc --noEmit",
-    "check:bundle": "node scripts/check-bundle-size.mjs"
+    "check:bundle": "node scripts/check-bundle-size.mjs",
+    "verify": "npm test && npm run typecheck && npm run build && npm run check:bundle && npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org && playwright test"
   },
   "dependencies": {
     "ethers": "^6.13.2",
@@ -22,7 +24,7 @@
   "devDependencies": {
     "@types/node": "^24.13.3",
     "@vitejs/plugin-vue": "^6.0.7",
-    "playwright": "^1.61.1",
+    "@playwright/test": "1.61.1",
     "typescript": "^6.0.3",
     "vite": "^8.1.4",
     "vitest": "^4.1.10",

@@ -51,7 +51,8 @@ async function main() {
   console.log(`initCodeHash=${keccak256(concat([PROXY_PREFIX, getAddress(VMU_TEMPLATE), PROXY_SUFFIX]))}`)
 
   if (vmuCount === 0) {
-    console.log('wallet has no VMUs, pass a wallet that has minted as the first arg')
+    console.log('NOT_VERIFIED: wallet has no VMUs; pass a wallet that has minted as the first arg.')
+    process.exitCode = 2
     return
   }
 
@@ -60,20 +61,24 @@ async function main() {
   for (let id = 1; id <= n; id++) {
     const proxy = computeProxyAddress(id)
     const m = await xen.userMints(proxy)
-    const matches = m.user !== '0x0000000000000000000000000000000000000000'
+    const hasRecord = m.user !== '0x0000000000000000000000000000000000000000'
+    const active = hasRecord && m.rank > 0n && m.term > 0n
     console.log(
       `id=${id} proxy=${proxy} user=${m.user} rank=${m.rank} term=${m.term} maturityTs=${m.maturityTs} ${
-        matches ? 'ACTIVE' : 'empty/claimed'
+        active ? 'ACTIVE' : 'empty/claimed/inactive'
       }`
     )
     // The strongest correctness signal: the recorded minter equals the proxy.
-    if (matches && getAddress(m.user) === getAddress(proxy)) ok++
+    if (active && getAddress(m.user) === getAddress(proxy)) ok++
   }
   console.log(`\n${ok}/${n} active VMUs confirm the derived proxy is the on-chain minter.`)
   if (ok > 0) {
     console.log('CREATE2 derivation VERIFIED against on-chain data.')
   } else {
-    console.log('No active VMUs among the sampled ids (may all be empty/claimed). Try another wallet.')
+    console.log(
+      'NOT_VERIFIED: no sampled active VMU records the derived proxy as its on-chain minter. Try another wallet.'
+    )
+    process.exitCode = 2
   }
 }
 

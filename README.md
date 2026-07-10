@@ -74,9 +74,18 @@ npm run dev
 - `npm run dev` - dev server
 - `npm run build` - typecheck + production build
 - `npm run test` - unit and wallet integration tests
+- `npm run test:e2e` - build and run the production-preview Playwright suite
 - `npm run typecheck` - TypeScript and Vue type checking
 - `npm run check:bundle` - enforce gzip bundle budgets against `dist/`
+- `npm run verify` - run unit, type, build, bundle, audit, and browser release gates
 - `npm run verify:create2 [wallet] [rpcUrl]` - verify derivation against live chain
+
+## Security headers
+
+Vite development and preview responses include the release security headers so they
+can be validated locally. A matching Nginx snippet is prepared at
+`ops/nginx/security-headers.conf`; it has not been applied to the server. The CSP
+allows same-origin requests and HTTPS RPC endpoints, including user-configured RPCs.
 
 ## Bundle budget
 

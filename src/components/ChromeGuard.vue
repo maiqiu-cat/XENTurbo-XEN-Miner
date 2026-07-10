@@ -1,76 +1,12 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
+import { checkBrowserSupport, type BrowserNavigator } from '@/core/browserGuard'
 
 const supported = ref(true)
 const message = ref('XENTurbo XEN Miner requires Google Chrome.')
 
-interface BrowserCheck {
-  supported: boolean
-  message: string
-}
-
-function checkBrowser(): BrowserCheck {
-  const nav = navigator as Navigator & {
-    userAgentData?: { brands?: Array<{ brand: string; version: string }>; mobile?: boolean }
-    brave?: unknown
-  }
-  const ua = nav.userAgent
-  const name = detectName(ua)
-
-  if (isMobileEnvironment(nav, ua)) {
-    return {
-      supported: false,
-      message: 'Mobile browsers are not supported. Open this site on a desktop or laptop with Google Chrome.'
-    }
-  }
-
-  if (isGoogleChrome(nav, ua)) {
-    return {
-      supported: true,
-      message: ''
-    }
-  }
-
-  return {
-    supported: false,
-    message: `XENTurbo XEN Miner requires PC Google Chrome. You are currently using ${name}.`
-  }
-}
-
-function isGoogleChrome(
-  nav: Navigator & { userAgentData?: { brands?: Array<{ brand: string; version: string }> }; brave?: unknown },
-  ua: string
-): boolean {
-  const brands = nav.userAgentData?.brands ?? []
-  if (brands.some((b) => b.brand === 'Google Chrome')) return true
-
-  const looksLikeChrome = /Chrome\/|CriOS\//.test(ua)
-  const excluded = /Edg\/|EdgiOS\/|OPR\/|Opera|SamsungBrowser|DuckDuckGo|YaBrowser|Firefox\/|FxiOS\//.test(ua)
-  if (typeof nav.brave !== 'undefined') return false
-  return looksLikeChrome && !excluded
-}
-
-function isMobileEnvironment(
-  nav: Navigator & { userAgentData?: { mobile?: boolean } },
-  ua: string
-): boolean {
-  if (nav.userAgentData?.mobile) return true
-  if (/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile|Tablet/i.test(ua)) return true
-  // iPadOS can present a desktop Safari UA.
-  return /Macintosh/i.test(ua) && nav.maxTouchPoints > 1
-}
-
-function detectName(ua: string): string {
-  if (/Edg\/|EdgiOS\//.test(ua)) return 'Microsoft Edge'
-  if (/Firefox\/|FxiOS\//.test(ua)) return 'Firefox'
-  if (/OPR\/|Opera/.test(ua)) return 'Opera'
-  if (/SamsungBrowser/.test(ua)) return 'Samsung Browser'
-  if (/Safari\//.test(ua) && !/Chrome\/|CriOS\//.test(ua)) return 'Safari'
-  return 'this browser'
-}
-
 onMounted(() => {
-  const result = checkBrowser()
+  const result = checkBrowserSupport(navigator as unknown as BrowserNavigator)
   supported.value = result.supported
   message.value = result.message
 })

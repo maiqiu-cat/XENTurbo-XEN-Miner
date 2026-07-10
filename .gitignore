@@ -5,5 +5,7 @@ dist-ssr
 .env
 .DS_Store
 coverage
+playwright-report
+test-results
 DEPLOY-TENCENT.md
 RELEASE-FOR-CODEX.txt

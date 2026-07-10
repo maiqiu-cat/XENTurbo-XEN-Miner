@@ -1,6 +1,35 @@
 import { fileURLToPath, URL } from 'node:url'
-import { defineConfig } from 'vite'
+import { defineConfig } from 'vitest/config'
 import vue from '@vitejs/plugin-vue'
+
+function contentSecurityPolicy(includeDevWebSockets = false): string {
+  const connectSources = ["'self'", 'https:']
+  if (includeDevWebSockets) connectSources.push('ws://127.0.0.1:*', 'ws://localhost:*')
+
+  return [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "font-src 'self'",
+    `connect-src ${connectSources.join(' ')}`,
+    "object-src 'none'",
+    "base-uri 'self'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    "manifest-src 'self'",
+    "worker-src 'self' blob:"
+  ].join('; ')
+}
+
+const securityHeaders = {
+  'Content-Security-Policy': contentSecurityPolicy(),
+  'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+  'X-Content-Type-Options': 'nosniff',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=(), usb=()',
+  'X-Frame-Options': 'DENY'
+}
 
 export default defineConfig({
   plugins: [vue()],
@@ -10,6 +39,16 @@ export default defineConfig({
     }
   },
   server: {
-    port: 5300
+    port: 5300,
+    headers: {
+      ...securityHeaders,
+      'Content-Security-Policy': contentSecurityPolicy(true)
+    }
+  },
+  preview: {
+    headers: securityHeaders
+  },
+  test: {
+    include: ['tests/**/*.test.ts']
   }
 })
