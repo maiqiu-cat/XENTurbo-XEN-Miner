@@ -3,7 +3,7 @@ import type { ChainKey } from '@/config/chains'
 import { CHAINS } from '@/config/chains'
 import { CONTRACTS } from '@/config/contracts'
 import { getReadProvider } from './rpc'
-import { pendingLocks, releaseLock, releaseLocksByTxHash } from './localLock'
+import { attachTxHash, pendingLocks, releaseLock, releaseLocksByTxHash } from './localLock'
 import type { OpType } from './txManager'
 
 const KEY = 'sm.pendingOps'
@@ -154,11 +154,14 @@ function toView(
   r: PendingOpRecord,
   status: PendingOpView['status'] = statusForPhase(r.phase)
 ): PendingOpView {
+  const explorerUrl = r.txHash
+    ? `${CHAINS[r.chain].blockExplorerUrl}/tx/${r.txHash}`
+    : `${CHAINS[r.chain].blockExplorerUrl}/address/${r.wallet}`
   return {
     ...r,
     label: OP_LABELS[r.op] ?? r.op,
     detail: detailFor(r),
-    explorerUrl: `${CHAINS[r.chain].blockExplorerUrl}/tx/${r.txHash}`,
+    explorerUrl,
     status
   }
 }
@@ -180,11 +183,23 @@ export function recordPendingOp(params: {
 }): PendingOpRecord {
   const all = readAll()
   const normalizedHash = params.txHash.toLowerCase()
-  const existing = all.find(
+  const directMatch = all.find(
     (record) =>
       (params.id && record.id === params.id) ||
       (normalizedHash.length > 0 && record.txHash.toLowerCase() === normalizedHash)
   )
+  const awaitingNonceMatch =
+    normalizedHash.length > 0 && params.nonce != null
+      ? all.find(
+          (record) =>
+            record.chain === params.chain &&
+            record.wallet.toLowerCase() === params.wallet.toLowerCase() &&
+            record.nonce === params.nonce &&
+            record.phase === 'awaiting-wallet' &&
+            record.txHash.length === 0
+        )
+      : undefined
+  const existing = directMatch ?? awaitingNonceMatch
   const submittedAt = Math.min(
     existing?.submittedAt ?? Number.POSITIVE_INFINITY,
     params.submittedAt ?? Date.now()
@@ -212,7 +227,9 @@ export function recordPendingOp(params: {
   )
   list.push(rec)
   writeAll(list)
-  if (!isUnresolvedPending(rec)) {
+  if (rec.txHash && isUnresolvedPending(rec)) {
+    attachTxHash(rec.id, rec.txHash)
+  } else if (!isUnresolvedPending(rec)) {
     releaseLock(rec.id)
     if (rec.txHash) releaseLocksByTxHash(rec.txHash)
   }
@@ -223,13 +240,28 @@ export function isUnresolvedPending(record: Pick<PendingOpRecord, 'phase'>): boo
   return UNRESOLVED_PHASES.has(record.phase)
 }
 
-function transitionPendingOp(identifier: string, phase: PendingPhase): PendingOpRecord | null {
+export function canMarkPendingOpDropped(
+  record: Pick<PendingOpView, 'id' | 'phase' | 'status'>
+): boolean {
+  return (
+    record.id !== 'unknown-pending' &&
+    record.status === 'unknown' &&
+    isUnresolvedPending(record)
+  )
+}
+
+function transitionPendingOp(
+  identifier: string,
+  phase: PendingPhase,
+  canTransition: (record: PendingOpRecord) => boolean = () => true
+): PendingOpRecord | null {
   const normalized = identifier.toLowerCase()
   const list = readAll()
   const index = list.findIndex(
     (record) => record.id === identifier || record.txHash.toLowerCase() === normalized
   )
   if (index < 0) return null
+  if (!canTransition(list[index])) return null
   const updated: PendingOpRecord = { ...list[index], phase, updatedAt: Date.now() }
   list[index] = updated
   writeAll(list)
@@ -241,7 +273,7 @@ function transitionPendingOp(identifier: string, phase: PendingPhase): PendingOp
 }
 
 export function markPendingOpDropped(identifier: string): PendingOpRecord | null {
-  return transitionPendingOp(identifier, 'dropped')
+  return transitionPendingOp(identifier, 'dropped', isUnresolvedPending)
 }
 
 export function removePendingOp(txHash: string): void {

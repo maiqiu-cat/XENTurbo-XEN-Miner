@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
-import type { PendingOpView } from '@/core/pendingOps'
+import { canMarkPendingOpDropped, type PendingOpView } from '@/core/pendingOps'
 
 const props = defineProps<{
   ops: PendingOpView[]
@@ -10,6 +10,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'recheck'): void
   (e: 'track', payload: { hash: string; seenText?: string }): void
+  (e: 'mark-dropped', id: string): void
 }>()
 
 const pasteHash = ref('')
@@ -123,6 +124,14 @@ const needsHash =
           <a v-else :href="op.explorerUrl" target="_blank" rel="noreferrer" class="dim">
             View address on explorer
           </a>
+          <button
+            v-if="canMarkPendingOpDropped(op)"
+            class="btn drop-button"
+            title="Use only after verifying the transaction is not pending"
+            @click="emit('mark-dropped', op.id)"
+          >
+            Mark dropped
+          </button>
         </div>
       </li>
     </ul>
@@ -215,6 +224,11 @@ const needsHash =
 }
 .hash {
   font-size: 12px;
+}
+.drop-button {
+  margin-left: auto;
+  border-color: var(--danger);
+  color: var(--danger);
 }
 .paste-box {
   margin-top: 14px;

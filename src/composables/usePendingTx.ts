@@ -1,6 +1,12 @@
 import { computed, onUnmounted, ref, watch, type Ref } from 'vue'
 import type { ChainKey } from '@/config/chains'
-import { refreshPendingOps, trackPendingTxHash, type PendingOpView } from '@/core/pendingOps'
+import {
+  canMarkPendingOpDropped,
+  markPendingOpDropped,
+  refreshPendingOps,
+  trackPendingTxHash,
+  type PendingOpView
+} from '@/core/pendingOps'
 
 /**
  * Poll the chain for in-flight txs and surface decoded mint/claim/remint ops.
@@ -92,6 +98,16 @@ export function usePendingTx(
     await check()
   }
 
+  async function markDropped(id: string): Promise<void> {
+    const candidate = ops.value.find((op) => op.id === id)
+    if (!candidate || !canMarkPendingOpDropped(candidate)) {
+      throw new Error('Only an unresolved transaction with unknown chain status can be marked dropped')
+    }
+    const dropped = markPendingOpDropped(id)
+    if (!dropped) throw new Error('Pending transaction record no longer exists')
+    await check()
+  }
+
   return {
     pendingCount: pendingCount as Ref<number>,
     localUnresolvedCount: localUnresolvedCount as Ref<number>,
@@ -102,6 +118,7 @@ export function usePendingTx(
     error,
     check,
     trackHash,
+    markDropped,
     startPolling,
     stopPolling
   }

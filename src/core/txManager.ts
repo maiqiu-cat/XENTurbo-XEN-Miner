@@ -20,7 +20,7 @@ import {
   tryAcquireLock,
   clearSoftLocks
 } from './localLock'
-import { recordPendingOp } from './pendingOps'
+import { countUnresolvedPendingOps, recordPendingOp } from './pendingOps'
 import { operationKey, runWalletExclusive } from './operationGate'
 import {
   assertNonceAgreement,
@@ -408,6 +408,13 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
       async () => {
         // Keep the final safety check, nonce read, and wallet request in one
         // cross-tab critical section so two tabs cannot send concurrently.
+        const unresolvedLocal = countUnresolvedPendingOps(prepared.chain, prepared.wallet)
+        if (unresolvedLocal > 0) {
+          throw new Error(
+            `LOCAL_PENDING_UNRESOLVED: ${unresolvedLocal} local transaction record(s) still require reconciliation. Recheck pending operations before submitting another transaction.`
+          )
+        }
+
         const inflight = await getPendingTxCount(prepared.chain, prepared.wallet)
         if (inflight > 0) {
           throw new Error(
@@ -627,6 +634,8 @@ export function normalizeError(err: any): string {
     return 'Wallet and read RPC disagree about the pending nonce. Do not retry yet. Open MetaMask Activity, verify the selected network, then recheck.'
   if (/WALLET_ASLEEP/.test(msg))
     return 'Wallet did not respond (it may have gone idle). Click the MetaMask extension icon or reload the page, then retry.'
+  if (/LOCAL_PENDING_UNRESOLVED/i.test(msg))
+    return 'A previous local transaction record is unresolved. Recheck pending operations. If it remains unknown, verify MetaMask Activity and the block explorer before marking it dropped.'
   if (/PENDING_TX|in-flight transaction limit|delegated accounts/i.test(msg))
     return 'A previous transaction is still pending. Open MetaMask → Activity, wait for it to confirm (or Speed up / Cancel it), then retry. EIP-7702 smart accounts usually allow only 1 in-flight tx.'
   if (/WALLET_PENDING|already pending|Request is already pending/i.test(msg))

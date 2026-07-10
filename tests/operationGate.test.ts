@@ -102,7 +102,13 @@ describe('operation gate', () => {
       tryAcquireLock: vi.fn(),
       clearSoftLocks: vi.fn()
     }))
-    vi.doMock('../src/core/pendingOps', () => ({ recordPendingOp: vi.fn() }))
+    vi.doMock('../src/core/pendingOps', () => ({
+      countUnresolvedPendingOps: vi.fn(() => {
+        events.push('local:pending')
+        return 0
+      }),
+      recordPendingOp: vi.fn()
+    }))
     vi.stubGlobal('navigator', {
       locks: {
         request: async (_key: string, work: () => Promise<string>) => {
@@ -150,6 +156,7 @@ describe('operation gate', () => {
 
     expect(events).toEqual([
       'lock:start',
+      'local:pending',
       'nonce:latest',
       'nonce:pending',
       'wallet:eth_accounts',
@@ -161,5 +168,82 @@ describe('operation gate', () => {
       'lock:end',
       'confirm'
     ])
+  })
+
+  it('blocks a locally unresolved operation before any nonce read or wallet request', async () => {
+    vi.resetModules()
+    const events: string[] = []
+    const writeFactory = vi.fn()
+    const provider = {
+      getTransactionCount: vi.fn(),
+      getFeeData: vi.fn(),
+      waitForTransaction: vi.fn()
+    }
+
+    vi.doMock('../src/core/wallet', () => ({
+      warmUpInjected: vi.fn(),
+      writeFactory
+    }))
+    vi.doMock('../src/core/rpc', () => ({ getReadProvider: () => provider }))
+    vi.doMock('../src/core/chainReader', () => ({
+      readFee: vi.fn(),
+      readVmuStatuses: vi.fn()
+    }))
+    vi.doMock('../src/core/localLock', () => ({
+      attachTxHash: vi.fn(),
+      releaseLock: vi.fn(),
+      newBatchId: vi.fn(),
+      pendingLocks: vi.fn(),
+      tryAcquireLock: vi.fn(),
+      clearSoftLocks: vi.fn()
+    }))
+    const countUnresolvedPendingOps = vi.fn(() => {
+      events.push('local:pending')
+      return 1
+    })
+    vi.doMock('../src/core/pendingOps', () => ({
+      countUnresolvedPendingOps,
+      recordPendingOp: vi.fn()
+    }))
+    vi.stubGlobal('navigator', {
+      locks: {
+        request: async (_key: string, work: () => Promise<string>) => {
+          events.push('lock:start')
+          try {
+            return await work()
+          } finally {
+            events.push('lock:end')
+          }
+        }
+      }
+    })
+
+    const { sendPreparedOperation } = await import('../src/core/txManager')
+    const prepared = {
+      chain: 'eth' as const,
+      wallet: '0xAbC',
+      op: 'GENERAL_MINT' as const,
+      ids: [],
+      count: 1,
+      term: 100,
+      chainId: 1,
+      factoryAddress: '0x0000000000000000000000000000000000000001' as const,
+      gasLimit: 100_000n,
+      fnName: 'bulkClaimRank',
+      args: [100n, 1n],
+      batch: 'batch-1',
+      lockIds: [],
+      state: { estimate: 'done' as const, send: 'wait' as const, confirm: 'wait' as const },
+      nonce: 7,
+      maxFeePerGas: 2n,
+      maxPriorityFeePerGas: 1n
+    }
+
+    await expect(sendPreparedOperation(prepared)).rejects.toThrow('LOCAL_PENDING_UNRESOLVED')
+
+    expect(countUnresolvedPendingOps).toHaveBeenCalledWith('eth', '0xAbC')
+    expect(events).toEqual(['lock:start', 'local:pending', 'lock:end'])
+    expect(provider.getTransactionCount).not.toHaveBeenCalled()
+    expect(writeFactory).not.toHaveBeenCalled()
   })
 })

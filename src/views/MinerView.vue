@@ -57,7 +57,8 @@ const {
   ops: pendingOps,
   checking: pendingChecking,
   check: checkPending,
-  trackHash: trackPendingHash
+  trackHash: trackPendingHash,
+  markDropped: markPendingDropped
 } = usePendingTx(
   () => wallet.address,
   () => activeChain.value
@@ -76,6 +77,20 @@ async function onTrackHash(payload: { hash: string; seenText?: string }) {
   trackError.value = null
   try {
     await trackPendingHash(payload.hash, payload.seenText)
+  } catch (err: any) {
+    trackError.value = err?.message || String(err)
+  }
+}
+
+async function onMarkPendingDropped(id: string) {
+  const confirmed = window.confirm(
+    'WARNING: This does NOT cancel a blockchain transaction.\n\nOnly continue after checking MetaMask Activity and the block explorer and confirming that this transaction was never broadcast or is no longer pending. Marking a live transaction as dropped can allow a conflicting transaction.\n\nMark this record as dropped and unlock mining actions?'
+  )
+  if (!confirmed) return
+
+  trackError.value = null
+  try {
+    await markPendingDropped(id)
   } catch (err: any) {
     trackError.value = err?.message || String(err)
   }
@@ -340,6 +355,7 @@ const explorerAddrUrl = computed(() => {
         :checking="pendingChecking"
         @recheck="checkPending"
         @track="onTrackHash"
+        @mark-dropped="onMarkPendingDropped"
       />
       <p v-if="trackError" class="card warn-card">{{ trackError }}</p>
 

@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { Interface } from 'ethers'
+import { CHAINS } from '../src/config/chains'
+import { CONTRACTS } from '../src/config/contracts'
 
 const WALLET = '0x00000000000000000000000000000000000000ab'
 const HASH = `0x${'1'.repeat(64)}`
@@ -37,16 +40,18 @@ async function installPendingHarness(options: {
   }
   const releaseLocksByTxHash = vi.fn()
   const releaseLock = vi.fn()
+  const attachTxHash = vi.fn()
 
   vi.doMock('../src/core/rpc', () => ({ getReadProvider: () => provider }))
   vi.doMock('../src/core/localLock', () => ({
+    attachTxHash,
     pendingLocks: vi.fn(() => []),
     releaseLock,
     releaseLocksByTxHash
   }))
 
   const pending = await import('../src/core/pendingOps')
-  return { pending, provider, releaseLock, releaseLocksByTxHash }
+  return { pending, provider, attachTxHash, releaseLock, releaseLocksByTxHash }
 }
 
 function recordBroadcast(
@@ -110,6 +115,97 @@ describe('pending operation reconciliation', () => {
     expect(awaiting.phase).toBe('awaiting-wallet')
     expect(broadcast).toMatchObject({ id: 'batch-1', txHash: HASH, nonce: 7, phase: 'broadcast' })
     expect(pending.listPendingOps('eth', WALLET)).toHaveLength(1)
+  })
+
+  it('coalesces a tracked hash into the awaiting-wallet record with the same nonce', async () => {
+    const data = new Interface([
+      'function bulkClaimMintReward(uint256[] ids)'
+    ]).encodeFunctionData('bulkClaimMintReward', [[7n]])
+    const { pending, attachTxHash } = await installPendingHarness({
+      latestNonce: 7,
+      pendingNonce: 8,
+      receipt: null,
+      transaction: {
+        from: WALLET,
+        to: CONTRACTS.eth.factory,
+        data,
+        nonce: 7
+      }
+    })
+    pending.recordPendingOp({
+      id: 'batch-1',
+      chain: 'eth',
+      wallet: WALLET,
+      op: 'CLAIM',
+      ids: [7],
+      count: 0,
+      term: 0,
+      txHash: '',
+      nonce: 7,
+      phase: 'awaiting-wallet'
+    })
+
+    const tracked = await pending.trackPendingTxHash('eth', WALLET, HASH)
+    const stored = pending.listPendingOps('eth', WALLET)
+
+    expect(tracked).toMatchObject({ id: 'batch-1', txHash: HASH, nonce: 7, phase: 'broadcast' })
+    expect(stored).toHaveLength(1)
+    expect(stored[0]).toMatchObject({ id: 'batch-1', txHash: HASH, nonce: 7 })
+    expect(attachTxHash).toHaveBeenCalledWith('batch-1', HASH)
+  })
+
+  it('uses the wallet address explorer URL when a record has no transaction hash', async () => {
+    const { pending } = await installPendingHarness({ latestNonce: 7, pendingNonce: 7 })
+    pending.recordPendingOp({
+      id: 'batch-1',
+      chain: 'eth',
+      wallet: WALLET,
+      op: 'CLAIM',
+      ids: [7],
+      count: 0,
+      term: 0,
+      txHash: '',
+      nonce: 7,
+      phase: 'awaiting-wallet'
+    })
+
+    const result = await pending.refreshPendingOps('eth', WALLET)
+
+    expect(result.views[0].explorerUrl).toBe(`${CHAINS.eth.blockExplorerUrl}/address/${WALLET}`)
+    expect(result.views[0].explorerUrl).not.toContain('/tx/')
+  })
+
+  it('allows manual drop only for a real unresolved unknown record', async () => {
+    const { pending } = await installPendingHarness({ latestNonce: 7, pendingNonce: 7 })
+
+    expect(
+      pending.canMarkPendingOpDropped({
+        id: 'batch-1',
+        phase: 'awaiting-wallet',
+        status: 'unknown'
+      })
+    ).toBe(true)
+    expect(
+      pending.canMarkPendingOpDropped({
+        id: 'batch-1',
+        phase: 'awaiting-wallet',
+        status: 'pending'
+      })
+    ).toBe(false)
+    expect(
+      pending.canMarkPendingOpDropped({
+        id: 'unknown-pending',
+        phase: 'broadcast',
+        status: 'unknown'
+      })
+    ).toBe(false)
+    expect(
+      pending.canMarkPendingOpDropped({
+        id: 'batch-1',
+        phase: 'confirmed',
+        status: 'unknown'
+      })
+    ).toBe(false)
   })
 
   it('marks a successful receipt confirmed and releases its VMU lock', async () => {
@@ -247,6 +343,26 @@ describe('pending operation reconciliation', () => {
     expect(releaseLock).toHaveBeenCalledWith('batch-1')
     expect(releaseLocksByTxHash).toHaveBeenCalledWith(HASH)
   })
+
+  it('refuses to downgrade a record that another tab already resolved', async () => {
+    const { pending } = await installPendingHarness({ latestNonce: 8, pendingNonce: 8 })
+    recordBroadcast(pending, { id: 'batch-1' })
+    pending.recordPendingOp({
+      id: 'batch-1',
+      chain: 'eth',
+      wallet: WALLET,
+      op: 'CLAIM',
+      ids: [7],
+      count: 0,
+      term: 0,
+      txHash: HASH,
+      nonce: 7,
+      phase: 'confirmed'
+    })
+
+    expect(pending.markPendingOpDropped('batch-1')).toBeNull()
+    expect(pending.listPendingOps('eth', WALLET)[0].phase).toBe('confirmed')
+  })
 })
 
 describe('broadcast VMU locks', () => {
@@ -317,7 +433,10 @@ describe('transaction lock lifecycle', () => {
       tryAcquireLock: vi.fn(),
       clearSoftLocks: vi.fn()
     }))
-    vi.doMock('../src/core/pendingOps', () => ({ recordPendingOp }))
+    vi.doMock('../src/core/pendingOps', () => ({
+      countUnresolvedPendingOps: vi.fn(() => 0),
+      recordPendingOp
+    }))
 
     const { sendPreparedOperation } = await import('../src/core/txManager')
     const send = sendPreparedOperation({

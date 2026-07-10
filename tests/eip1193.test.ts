@@ -154,7 +154,10 @@ async function installSendHarness(options: {
     tryAcquireLock: vi.fn(),
     clearSoftLocks: vi.fn()
   }))
-  vi.doMock('../src/core/pendingOps', () => ({ recordPendingOp: vi.fn() }))
+  vi.doMock('../src/core/pendingOps', () => ({
+    countUnresolvedPendingOps: vi.fn(() => 0),
+    recordPendingOp: vi.fn()
+  }))
 
   const txManager = await import('../src/core/txManager')
   return { ...txManager, writeFactory, readProvider }
