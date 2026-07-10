@@ -6,7 +6,6 @@ import {
   GAS_LIMIT_RATIO,
   FREE_CHAINS,
   CONFIRM_TIMEOUT_MS,
-  SEND_TIMEOUT_MS,
   LIMITS,
   DEFAULT_TERM_MAX
 } from '@/config/miner'
@@ -23,6 +22,12 @@ import {
 } from './localLock'
 import { recordPendingOp } from './pendingOps'
 import { operationKey, runWalletExclusive } from './operationGate'
+import {
+  assertNonceAgreement,
+  getInjectedAccount,
+  getInjectedChainId,
+  getInjectedPendingNonce
+} from './eip1193'
 import type { VmuStatus } from './types'
 
 export type OpType =
@@ -405,10 +410,27 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
           )
         }
 
-        const freshNonce = await getReadProvider(prepared.chain).getTransactionCount(
-          prepared.wallet,
-          'pending'
-        )
+        const readProvider = getReadProvider(prepared.chain)
+        const [injectedAccount, injectedChainId] = await Promise.all([
+          getInjectedAccount(),
+          getInjectedChainId()
+        ])
+        if (!injectedAccount || injectedAccount.toLowerCase() !== prepared.wallet.toLowerCase()) {
+          throw new Error('Wallet account changed during the operation. Reconnect and retry.')
+        }
+        if (injectedChainId !== prepared.chainId) {
+          throw new Error('Wallet is on the wrong network. Switch networks and retry.')
+        }
+
+        const [walletNonce, rpcNonce, feeData] = await Promise.all([
+          getInjectedPendingNonce(prepared.wallet),
+          readProvider.getTransactionCount(prepared.wallet, 'pending'),
+          readProvider.getFeeData()
+        ])
+        const nonce = assertNonceAgreement(walletNonce, rpcNonce)
+        const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas ?? 1_000_000_000n
+        const maxFeePerGas =
+          feeData.maxFeePerGas ?? maxPriorityFeePerGas * 2n + (feeData.gasPrice ?? 0n)
 
         state.send = 'process'
         emit()
@@ -421,18 +443,14 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
           args: prepared.args,
           value: prepared.value,
           gas: prepared.gasLimit,
-          nonce: freshNonce,
-          maxFeePerGas: prepared.maxFeePerGas,
-          maxPriorityFeePerGas: prepared.maxPriorityFeePerGas,
+          nonce,
+          maxFeePerGas,
+          maxPriorityFeePerGas,
           expectedFrom: prepared.wallet
         })
       }
     )
-    const txHash = await withTimeout(
-      walletSend,
-      SEND_TIMEOUT_MS,
-      'Wallet signature'
-    )
+    const txHash = await walletSend
     state.txHash = txHash
     if (prepared.lockIds.length) attachTxHash(prepared.batch, txHash)
     // Persist for the Pending Ops panel (survives reload until mined).
@@ -527,6 +545,8 @@ export async function resumePendingLocks(chain: ChainKey, wallet: string): Promi
 
 export function normalizeError(err: any): string {
   const msg: string = err?.shortMessage || err?.reason || err?.message || String(err)
+  if (/PENDING_STATE_UNCERTAIN/i.test(msg))
+    return 'Wallet and read RPC disagree about the pending nonce. Do not retry yet. Open MetaMask Activity, verify the selected network, then recheck.'
   if (/WALLET_ASLEEP/.test(msg))
     return 'Wallet did not respond (it may have gone idle). Click the MetaMask extension icon or reload the page, then retry.'
   if (/PENDING_TX|in-flight transaction limit|delegated accounts/i.test(msg))
@@ -537,8 +557,6 @@ export function normalizeError(err: any): string {
     return 'Wallet connector error. Reload the page and reconnect MetaMask, then retry.'
   if (/No injected wallet found/i.test(msg))
     return 'No browser wallet detected. Open MetaMask and reconnect.'
-  if (/Wallet signature timed out/i.test(msg))
-    return 'Wallet did not respond in time. Open MetaMask, approve or reject, then retry.'
   if (/Transaction reverted on-chain/i.test(msg))
     return 'Transaction reverted on-chain. Refresh the list and try again.'
   if (/Wallet account changed|wrong network/i.test(msg)) return msg

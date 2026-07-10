@@ -72,6 +72,10 @@ describe('operation gate', () => {
         events.push(`nonce:${blockTag}`)
         return 7
       }),
+      getFeeData: vi.fn(async () => {
+        events.push('fees')
+        return { maxFeePerGas: 2n, maxPriorityFeePerGas: 1n, gasPrice: 1n }
+      }),
       waitForTransaction: vi.fn(async () => {
         events.push('confirm')
         return { status: 1 }
@@ -111,6 +115,17 @@ describe('operation gate', () => {
         }
       }
     })
+    vi.stubGlobal('window', {
+      ethereum: {
+        request: async ({ method }: { method: string }) => {
+          events.push(`wallet:${method}`)
+          if (method === 'eth_accounts') return ['0xAbC']
+          if (method === 'eth_chainId') return '0x1'
+          if (method === 'eth_getTransactionCount') return '0x7'
+          throw new Error(`Unexpected wallet method: ${method}`)
+        }
+      }
+    })
 
     const { sendPreparedOperation } = await import('../src/core/txManager')
     await sendPreparedOperation({
@@ -137,7 +152,11 @@ describe('operation gate', () => {
       'lock:start',
       'nonce:latest',
       'nonce:pending',
+      'wallet:eth_accounts',
+      'wallet:eth_chainId',
+      'wallet:eth_getTransactionCount',
       'nonce:pending',
+      'fees',
       'send',
       'lock:end',
       'confirm'

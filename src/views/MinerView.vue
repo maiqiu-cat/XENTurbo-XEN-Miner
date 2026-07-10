@@ -111,6 +111,7 @@ const txVisible = ref(false)
 const txState = ref<TxStepState | null>(null)
 const txTitle = ref('')
 const busy = ref(false)
+const waitingWallet = computed(() => txState.value?.send === 'process' && !txState.value?.txHash)
 
 const canOperate = computed(
   () =>
@@ -206,18 +207,22 @@ async function signPrepared() {
 }
 
 function cancelTx() {
+  if (waitingWallet.value) {
+    txVisible.value = false
+    return
+  }
   opSeq++
   abortPrepared(prepared.value)
   prepared.value = null
   busy.value = false
   if (activeChain.value && wallet.address) clearAbandonedSoftLocks(activeChain.value, wallet.address)
-  if (txState.value?.send === 'process' || txState.value?.readyToSign) {
+  if (txState.value?.readyToSign) {
     txState.value = {
       estimate: txState.value.estimate,
       send: 'error',
       confirm: 'wait',
       readyToSign: false,
-      error: 'Cancelled. If MetaMask still shows a request, reject it, then retry.'
+      error: 'Preparation cancelled. No transaction was submitted.'
     }
   } else {
     txVisible.value = false
@@ -298,6 +303,12 @@ const explorerAddrUrl = computed(() => {
     <p v-if="wallet.switchError" class="card warn-card" style="margin-bottom: 12px">
       {{ wallet.switchError }}
     </p>
+    <div v-if="waitingWallet" class="card warn-card wallet-wait-banner">
+      <span>
+        MetaMask is still processing this request. Mining actions remain locked until you approve or reject it.
+      </span>
+      <button v-if="!txVisible" class="btn" @click="txVisible = true">Show request</button>
+    </div>
 
     <!-- warnings -->
     <div v-if="wallet.isConnected && !wallet.isSupportedChain" class="card warn-card">
@@ -421,6 +432,13 @@ const explorerAddrUrl = computed(() => {
   border-color: var(--warn);
   color: var(--warn);
   margin-bottom: 16px;
+}
+.wallet-wait-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 .connect-card {
   text-align: center;

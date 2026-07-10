@@ -14,6 +14,14 @@ import { mainnet, polygon } from '@wagmi/core/chains'
 import { walletConnect, injected } from '@wagmi/connectors'
 import { BrowserProvider, JsonRpcSigner, Network, Interface } from 'ethers'
 import { CHAINS, getRpcUrls, type ChainKey } from '@/config/chains'
+import {
+  beginWalletSend,
+  getInjectedAccount,
+  getInjectedChainId,
+  getInjectedProvider
+} from './eip1193'
+
+export { getInjectedProvider } from './eip1193'
 
 const rawProjectId = (import.meta.env?.VITE_WALLETCONNECT_PROJECT_ID as string) || ''
 // A real WalletConnect project id is required for the WalletConnect/Web3Modal flow.
@@ -57,19 +65,6 @@ export function initWallet(): void {
 
 function hasInjectedProvider(): boolean {
   return !!getInjectedProvider()
-}
-
-/** Resolve the browser-injected EIP-1193 provider (MetaMask, etc.). */
-export function getInjectedProvider(): { request: (args: any) => Promise<any> } | undefined {
-  if (typeof window === 'undefined') return undefined
-  const eth = (window as any).ethereum
-  if (!eth) return undefined
-  // Multiple wallets (MetaMask + others): pick MetaMask when available.
-  if (Array.isArray(eth.providers)) {
-    const mm = eth.providers.find((p: any) => p.isMetaMask)
-    return (mm ?? eth.providers[0]) as { request: (args: any) => Promise<any> }
-  }
-  return eth as { request: (args: any) => Promise<any> }
 }
 
 /** Connect the browser-injected wallet (MetaMask, etc.) directly via wagmi. */
@@ -184,8 +179,7 @@ export async function writeFactory(params: {
   // Keep this path SHORT: it is called from a click handler. Prefer eth_accounts
   // (no popup) and skip wakeInjected when fees/nonce are already prefetched —
   // those round-trips alone can add seconds before MetaMask even opens.
-  const accounts = (await eth.request({ method: 'eth_accounts' })) as string[]
-  let from = accounts?.[0] ?? (getAccount(wagmiConfig).address as string | undefined)
+  let from = (await getInjectedAccount()) ?? (getAccount(wagmiConfig).address as string | undefined)
   if (!from) {
     const req = (await eth.request({ method: 'eth_requestAccounts' })) as string[]
     from = req?.[0]
@@ -195,12 +189,9 @@ export async function writeFactory(params: {
     throw new Error('Wallet account changed during the operation. Reconnect and retry.')
   }
 
-  const current = await eth.request({ method: 'eth_chainId' })
-  if (typeof current === 'string' && parseInt(current, 16) !== params.chainId) {
-    await eth.request({
-      method: 'wallet_switchEthereumChain',
-      params: [{ chainId: '0x' + params.chainId.toString(16) }]
-    })
+  const currentChainId = await getInjectedChainId()
+  if (currentChainId !== params.chainId) {
+    throw new Error('Wallet is on the wrong network. Switch networks and retry.')
   }
 
   const iface = new Interface(params.abi)
@@ -221,10 +212,14 @@ export async function writeFactory(params: {
   }
 
   try {
-    const hash: string = await eth.request({
-      method: 'eth_sendTransaction',
-      params: [txParams]
-    })
+    const send = beginWalletSend(() =>
+      eth.request({
+        method: 'eth_sendTransaction',
+        params: [txParams]
+      })
+    )
+    const hash = await send.result
+    if (typeof hash !== 'string') throw new Error('Wallet returned an invalid transaction hash')
     return hash as `0x${string}`
   } catch (err: any) {
     const msg = err?.message || String(err)

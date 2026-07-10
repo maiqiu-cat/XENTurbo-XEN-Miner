@@ -36,6 +36,11 @@ const failed = computed(
 const readyToSign = computed(() => !!props.state?.readyToSign && props.state?.estimate === 'done')
 const waitingWallet = computed(() => props.state?.send === 'process' && !props.state?.txHash)
 
+function dismiss(): void {
+  if (readyToSign.value) emit('cancel')
+  else emit('close')
+}
+
 function icon(status: string): string {
   if (status === 'done') return 'OK'
   if (status === 'process') return '...'
@@ -49,7 +54,7 @@ function icon(status: string): string {
     <div class="card modal-body">
       <div class="row between">
         <strong>{{ title }}</strong>
-        <button class="btn btn-ghost" @click="emit('close')">x</button>
+        <button class="btn btn-ghost" :title="waitingWallet ? 'Hide' : 'Close'" @click="dismiss">x</button>
       </div>
       <hr class="hr" />
       <ul class="steps">
@@ -80,7 +85,8 @@ function icon(status: string): string {
       <div class="row" style="margin-top: 14px">
         <a v-if="explorerTxUrl" :href="explorerTxUrl" target="_blank" rel="noreferrer">View on explorer</a>
         <span class="grow" />
-        <button v-if="readyToSign || waitingWallet" class="btn" @click="emit('cancel')">Cancel</button>
+        <button v-if="readyToSign" class="btn" @click="emit('cancel')">Cancel</button>
+        <button v-else-if="waitingWallet" class="btn" @click="emit('close')">Hide</button>
         <button v-if="readyToSign" class="btn btn-primary" @click="emit('sign')">Open MetaMask &amp; Sign</button>
         <button v-if="done || failed" class="btn btn-primary" @click="emit('close')">Close</button>
       </div>
