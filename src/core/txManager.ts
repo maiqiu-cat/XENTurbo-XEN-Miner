@@ -22,6 +22,7 @@ import {
   clearSoftLocks
 } from './localLock'
 import { recordPendingOp } from './pendingOps'
+import { operationKey, runWalletExclusive } from './operationGate'
 import type { VmuStatus } from './types'
 
 export type OpType =
@@ -392,38 +393,43 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
   let lockHeld = prepared.lockIds.length > 0
 
   try {
-    // Re-check right before broadcast — a tx may have been submitted elsewhere
-    // while the user was staring at the "Open MetaMask" button.
-    const inflight = await getPendingTxCount(prepared.chain, prepared.wallet)
-    if (inflight > 0) {
-      throw new Error(
-        `PENDING_TX: ${inflight} transaction(s) still pending on-chain. Wait for confirmation (or Speed up / Cancel in MetaMask) before submitting another.`
-      )
-    }
+    const walletSend = runWalletExclusive(
+      operationKey(prepared.chain, prepared.wallet),
+      async () => {
+        // Keep the final safety check, nonce read, and wallet request in one
+        // cross-tab critical section so two tabs cannot send concurrently.
+        const inflight = await getPendingTxCount(prepared.chain, prepared.wallet)
+        if (inflight > 0) {
+          throw new Error(
+            `PENDING_TX: ${inflight} transaction(s) still pending on-chain. Wait for confirmation (or Speed up / Cancel in MetaMask) before submitting another.`
+          )
+        }
 
-    // Refresh nonce in case another tx confirmed while we waited to sign.
-    const freshNonce = await getReadProvider(prepared.chain).getTransactionCount(
-      prepared.wallet,
-      'pending'
+        const freshNonce = await getReadProvider(prepared.chain).getTransactionCount(
+          prepared.wallet,
+          'pending'
+        )
+
+        state.send = 'process'
+        emit()
+
+        return writeFactory({
+          chainId: prepared.chainId,
+          address: prepared.factoryAddress,
+          abi: XENFactoryABI,
+          functionName: prepared.fnName,
+          args: prepared.args,
+          value: prepared.value,
+          gas: prepared.gasLimit,
+          nonce: freshNonce,
+          maxFeePerGas: prepared.maxFeePerGas,
+          maxPriorityFeePerGas: prepared.maxPriorityFeePerGas,
+          expectedFrom: prepared.wallet
+        })
+      }
     )
-
-    state.send = 'process'
-    emit()
-
     const txHash = await withTimeout(
-      writeFactory({
-        chainId: prepared.chainId,
-        address: prepared.factoryAddress,
-        abi: XENFactoryABI,
-        functionName: prepared.fnName,
-        args: prepared.args,
-        value: prepared.value,
-        gas: prepared.gasLimit,
-        nonce: freshNonce,
-        maxFeePerGas: prepared.maxFeePerGas,
-        maxPriorityFeePerGas: prepared.maxPriorityFeePerGas,
-        expectedFrom: prepared.wallet
-      }),
+      walletSend,
       SEND_TIMEOUT_MS,
       'Wallet signature'
     )
