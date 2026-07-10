@@ -29,7 +29,9 @@ function isGoogleChrome(nav: BrowserNavigator): boolean {
   if (typeof nav.brave !== 'undefined' || EXCLUDED_CHROMIUM_UA.test(nav.userAgent)) return false
 
   const brands = nav.userAgentData?.brands ?? []
-  if (brands.some((brand) => brand.brand === 'Google Chrome')) return true
+  if (brands.length > 0) {
+    return brands.some((brand) => brand.brand === 'Google Chrome')
+  }
 
   return /Chrome\//.test(nav.userAgent)
 }

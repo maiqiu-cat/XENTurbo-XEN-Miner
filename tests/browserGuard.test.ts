@@ -49,6 +49,19 @@ describe('browser support guard', () => {
     expect(result.message).toContain('Brave')
   })
 
+  it('blocks unbranded Chromium when client hints omit Google Chrome', () => {
+    const result = checkBrowserSupport(
+      navigatorSnapshot({
+        userAgentData: {
+          brands: [{ brand: 'Chromium', version: '140' }],
+          mobile: false
+        }
+      })
+    )
+
+    expect(result.supported).toBe(false)
+  })
+
   it('blocks Android Chrome', () => {
     const result = checkBrowserSupport(
       navigatorSnapshot({

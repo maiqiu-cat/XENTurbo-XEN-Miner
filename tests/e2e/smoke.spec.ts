@@ -109,6 +109,21 @@ async function mockSameOriginRpc(page: Page): Promise<void> {
   await page.route('**/rpc/{eth,polygon}', handleRpcRoute)
 }
 
+async function emulateDesktopGoogleChrome(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'userAgentData', {
+      configurable: true,
+      value: {
+        brands: [
+          { brand: 'Chromium', version: '140' },
+          { brand: 'Google Chrome', version: '140' }
+        ],
+        mobile: false
+      }
+    })
+  })
+}
+
 async function installInjectedWallet(page: Page): Promise<void> {
   await page.addInitScript(
     ({ accountA }) => {
@@ -190,6 +205,7 @@ test('production preview renders in desktop Chrome without console errors and se
     if (message.type() === 'error') consoleErrors.push(message.text())
   })
   page.on('pageerror', (error) => pageErrors.push(error.message))
+  await emulateDesktopGoogleChrome(page)
   await mockSameOriginRpc(page)
 
   const response = await page.goto('/')
@@ -239,6 +255,7 @@ test('mobile Chrome is blocked by the PC Chrome guard', async ({ browser, baseUR
 })
 
 test('wallet initialization, connect, account changes, and chain changes update the page', async ({ page }) => {
+  await emulateDesktopGoogleChrome(page)
   await mockSameOriginRpc(page)
   await installInjectedWallet(page)
   await page.goto('/')
@@ -256,6 +273,7 @@ test('wallet initialization, connect, account changes, and chain changes update 
 })
 
 test('a code-4001 wallet rejection reports failure without a successful broadcast', async ({ page }) => {
+  await emulateDesktopGoogleChrome(page)
   await mockSameOriginRpc(page)
   await installInjectedWallet(page)
   await page.goto('/')
