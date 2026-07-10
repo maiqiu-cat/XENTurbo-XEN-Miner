@@ -540,6 +540,15 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
         const maxFeePerGas =
           feeData.maxFeePerGas ?? maxPriorityFeePerGas * 2n + (feeData.gasPrice ?? 0n)
 
+        // Preparation can be seconds old by the time the user confirms. Re-read
+        // selected IDs inside the cross-tab lock at the actual send boundary.
+        await assertIdsStillValid(
+          prepared.chain,
+          prepared.wallet,
+          prepared.op,
+          prepared.ids
+        )
+
         state.send = 'process'
         emit()
 

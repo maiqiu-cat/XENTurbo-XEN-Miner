@@ -423,7 +423,7 @@ describe('transaction lock lifecycle', () => {
     vi.doMock('../src/core/rpc', () => ({ getReadProvider: () => provider }))
     vi.doMock('../src/core/chainReader', () => ({
       readFee: vi.fn(),
-      readVmuStatuses: vi.fn()
+      readVmuStatuses: vi.fn(async () => new Map([[7, 'CLAIMABLE']]))
     }))
     vi.doMock('../src/core/localLock', () => ({
       attachTxHash,

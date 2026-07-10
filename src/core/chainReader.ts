@@ -4,7 +4,11 @@ import type { ChainKey } from '@/config/chains'
 import { XENFactoryABI } from '@/abis/XENFactoryABI'
 import { XENCryptoABI } from '@/abis/XENCryptoABI'
 import { Multicall3ABI } from '@/abis/Multicall3ABI'
-import { computeProxyAddress, computeProxyAddressRange } from './create2'
+import {
+  computeProxyAddress,
+  computeProxyAddressRange,
+  minimalProxyRuntimeCode
+} from './create2'
 import { getReadProvider, withRetry } from './rpc'
 import type { Vmu, VmuStatus } from './types'
 
@@ -12,6 +16,9 @@ const xenIface = new Interface(XENCryptoABI as unknown as any[])
 
 // Multicall batch size: number of userMints calls per aggregate3 request.
 const BATCH_SIZE = 400
+const CODE_BATCH_SIZE = 32
+
+export type ProxyDeploymentStatus = 'DEPLOYED' | 'MISSING' | 'READ_ERROR'
 
 export interface ReadProgress {
   loaded: number
@@ -226,4 +233,45 @@ export async function readVmuStatuses(
     }
   }
   return new Map(list.map((v) => [v.id, v.status]))
+}
+
+/**
+ * Verify that each derived VMU address contains the exact EIP-1167 runtime
+ * bytecode expected for this chain's VMU implementation.
+ */
+export async function readVmuProxyDeployments(
+  chain: ChainKey,
+  wallet: string,
+  ids: number[]
+): Promise<Map<number, ProxyDeploymentStatus>> {
+  const results = new Map<number, ProxyDeploymentStatus>()
+  if (!ids.length) return results
+
+  const provider = getReadProvider(chain)
+  const { factory, vmuTemplate } = CONTRACTS[chain]
+  const expectedCode = minimalProxyRuntimeCode(vmuTemplate).toLowerCase()
+  const proxies = ids.map((id) => ({
+    id,
+    address: computeProxyAddress({ factory, vmuTemplate, wallet, vmuId: id })
+  }))
+
+  for (let start = 0; start < proxies.length; start += CODE_BATCH_SIZE) {
+    const slice = proxies.slice(start, start + CODE_BATCH_SIZE)
+    const codes = await Promise.all(
+      slice.map(async ({ address }) => {
+        try {
+          return (await withRetry(() => provider.getCode(address))).toLowerCase()
+        } catch {
+          return null
+        }
+      })
+    )
+
+    slice.forEach(({ id }, index) => {
+      const code = codes[index]
+      results.set(id, code === null ? 'READ_ERROR' : code === expectedCode ? 'DEPLOYED' : 'MISSING')
+    })
+  }
+
+  return results
 }

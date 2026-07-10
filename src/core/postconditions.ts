@@ -1,5 +1,10 @@
 import type { ChainKey } from '@/config/chains'
-import { readVmuStatuses } from './chainReader'
+import {
+  readVmuCount,
+  readVmuProxyDeployments,
+  readVmuStatuses,
+  type ProxyDeploymentStatus
+} from './chainReader'
 import type { OpType } from './txManager'
 import type { VmuStatus } from './types'
 
@@ -36,6 +41,12 @@ interface VerifyOutcomeDependencies {
     wallet: string,
     ids: number[]
   ) => Promise<Map<number, VmuStatus>>
+  readProxyDeployments?: (
+    chain: ChainKey,
+    wallet: string,
+    ids: number[]
+  ) => Promise<Map<number, ProxyDeploymentStatus>>
+  readCount?: (chain: ChainKey, wallet: string) => Promise<number>
 }
 
 function expectedStatusFor(op: OpType): ExpectedVmuStatus {
@@ -116,10 +127,28 @@ export async function verifyOperationOutcome(
   const expectedStatus = expectedStatusFor(prepared.op)
   const expectedIds = expectedIdsFor(prepared)
   const readStatuses = deps.readStatuses ?? readVmuStatuses
+  const readProxyDeployments = deps.readProxyDeployments ?? readVmuProxyDeployments
+  const readCount = deps.readCount ?? readVmuCount
 
   let statuses: Map<number, VmuStatus>
+  let deployments: Map<number, ProxyDeploymentStatus> | null = null
+  let actualVmuCount: number | null = null
   try {
-    statuses = await readStatuses(prepared.chain, prepared.wallet, expectedIds)
+    if (prepared.op === 'CREATE_EMPTY_SLOT') {
+      const [currentStatuses, currentDeployments, currentVmuCount] = await Promise.all([
+        readStatuses(prepared.chain, prepared.wallet, expectedIds),
+        readProxyDeployments(prepared.chain, prepared.wallet, expectedIds),
+        readCount(prepared.chain, prepared.wallet)
+      ])
+      statuses = currentStatuses
+      deployments = currentDeployments
+      actualVmuCount = currentVmuCount
+      if (!Number.isSafeInteger(actualVmuCount) || actualVmuCount < 0) {
+        return uncertainOperationOutcome(prepared)
+      }
+    } else {
+      statuses = await readStatuses(prepared.chain, prepared.wallet, expectedIds)
+    }
   } catch {
     return uncertainOperationOutcome(prepared)
   }
@@ -130,9 +159,28 @@ export async function verifyOperationOutcome(
 
   for (const id of expectedIds) {
     const status = statuses.get(id)
-    if (!status || status === 'READ_ERROR') readErrorIds.push(id)
-    else if (status === expectedStatus) matchingIds.push(id)
-    else unexpectedIds.push(id)
+    if (!status || status === 'READ_ERROR') {
+      readErrorIds.push(id)
+      continue
+    }
+    if (status !== expectedStatus) {
+      unexpectedIds.push(id)
+      continue
+    }
+
+    if (prepared.op === 'CREATE_EMPTY_SLOT') {
+      const deployment = deployments?.get(id)
+      if (!deployment || deployment === 'READ_ERROR') {
+        readErrorIds.push(id)
+        continue
+      }
+      if (deployment !== 'DEPLOYED' || actualVmuCount === null || id > actualVmuCount) {
+        unexpectedIds.push(id)
+        continue
+      }
+    }
+
+    matchingIds.push(id)
   }
 
   const classification: OperationOutcomeClassification = readErrorIds.length

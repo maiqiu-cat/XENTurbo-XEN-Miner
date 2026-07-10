@@ -1,4 +1,4 @@
-import { computed, onUnmounted, ref, watch, type Ref } from 'vue'
+import { computed, onScopeDispose, ref, watch, type Ref } from 'vue'
 import type { ChainKey } from '@/config/chains'
 import {
   canMarkPendingOpDropped,
@@ -30,6 +30,8 @@ export function usePendingTx(
     const addr = address()
     const key = chain()
     if (!addr || !key) {
+      gen += 1
+      checking.value = false
       pendingCount.value = 0
       localUnresolvedCount.value = 0
       ops.value = []
@@ -64,6 +66,8 @@ export function usePendingTx(
   }
 
   function stopPolling() {
+    gen += 1
+    checking.value = false
     if (timer) {
       clearInterval(timer)
       timer = null
@@ -84,7 +88,7 @@ export function usePendingTx(
     { immediate: true }
   )
 
-  onUnmounted(stopPolling)
+  onScopeDispose(stopPolling)
 
   const hasPending = computed(
     () => pendingCount.value > 0 || localUnresolvedCount.value > 0

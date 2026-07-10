@@ -6,16 +6,20 @@ import {
   solidityPackedKeccak256
 } from 'ethers'
 
-// EIP-1167 minimal proxy init code, split around the implementation address.
-// Matches the bytecode assembled on-chain in XENFactoryUpgradeableV2:
-//   bytes20(0x3D602d80600A3D3981F3363d3d373d3D3D363d73) ++ bytes20(_logic)
-//   ++ bytes15(0x5af43d82803e903d91602b57fd5bf3)
-const PROXY_PREFIX = '0x3d602d80600a3d3981f3363d3d373d3d3d363d73'
+// EIP-1167 minimal proxy bytecode, split around the implementation address.
+// The init prefix returns the runtime prefix + implementation + suffix.
+const PROXY_INIT_PREFIX = '0x3d602d80600a3d3981f3'
+const PROXY_RUNTIME_PREFIX = '0x363d3d373d3d3d363d73'
 const PROXY_SUFFIX = '0x5af43d82803e903d91602b57fd5bf3'
+
+/** Exact EIP-1167 bytecode stored at a deployed proxy address. */
+export function minimalProxyRuntimeCode(implementation: string): string {
+  return concat([PROXY_RUNTIME_PREFIX, getAddress(implementation), PROXY_SUFFIX])
+}
 
 /** Build the EIP-1167 minimal proxy init code for a given implementation (VMU template). */
 export function minimalProxyInitCode(implementation: string): string {
-  return concat([PROXY_PREFIX, getAddress(implementation), PROXY_SUFFIX])
+  return concat([PROXY_INIT_PREFIX, minimalProxyRuntimeCode(implementation)])
 }
 
 /** keccak256 of the minimal proxy init code - cached per implementation. */

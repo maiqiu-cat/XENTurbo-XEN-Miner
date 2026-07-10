@@ -3,7 +3,8 @@ import {
   computeProxyAddress,
   computeProxyAddressRange,
   proxyInitCodeHash,
-  minimalProxyInitCode
+  minimalProxyInitCode,
+  minimalProxyRuntimeCode
 } from '../src/core/create2'
 
 // Production contract addresses.
@@ -30,6 +31,14 @@ describe('CREATE2 proxy derivation', () => {
     expect(initCode.startsWith('0x3d602d80600a3d3981f3363d3d373d3d3d363d73')).toBe(true)
     expect(initCode.endsWith('5af43d82803e903d91602b57fd5bf3')).toBe(true)
     expect(initCode).toContain(VMU_TEMPLATE.slice(2).toLowerCase())
+  })
+
+  it('produces the exact EIP-1167 runtime code expected at a deployed VMU address', () => {
+    const runtimeCode = minimalProxyRuntimeCode(VMU_TEMPLATE).toLowerCase()
+    expect(runtimeCode).toBe(
+      `0x363d3d373d3d3d363d73${VMU_TEMPLATE.slice(2).toLowerCase()}5af43d82803e903d91602b57fd5bf3`
+    )
+    expect(minimalProxyInitCode(VMU_TEMPLATE).toLowerCase().endsWith(runtimeCode.slice(2))).toBe(true)
   })
 
   it('matches the production init code hash', () => {
