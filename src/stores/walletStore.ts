@@ -4,7 +4,6 @@ import {
   initWallet,
   smartConnect,
   onAccountChange,
-  currentAccount,
   switchToChain,
   chainIdToKey
 } from '@/core/wallet'
@@ -21,6 +20,21 @@ interface State {
   switchError: string | null
   /** Monotonic token that invalidates wallet-scoped asynchronous work. */
   contextGen: number
+}
+
+interface WalletStoreLifecycle {
+  initializing?: Promise<void>
+  unsubscribe?: () => void
+}
+
+const walletStoreLifecycles = new WeakMap<object, WalletStoreLifecycle>()
+
+function getWalletStoreLifecycle(store: object): WalletStoreLifecycle {
+  const existing = walletStoreLifecycles.get(store)
+  if (existing) return existing
+  const lifecycle: WalletStoreLifecycle = {}
+  walletStoreLifecycles.set(store, lifecycle)
+  return lifecycle
 }
 
 /**
@@ -55,16 +69,29 @@ export const useWalletStore = defineStore('wallet', {
   },
   actions: {
     async init() {
+      const lifecycle = getWalletStoreLifecycle(this)
       if (this.ready) return
-      onAccountChange((address, chainId) => this.applyAccount(address, chainId))
+      if (lifecycle.initializing) return lifecycle.initializing
+      if (!lifecycle.unsubscribe) {
+        lifecycle.unsubscribe = onAccountChange((address, chainId) =>
+          this.applyAccount(address, chainId)
+        )
+      }
+
+      const initializing = (async () => {
+        try {
+          await initWallet()
+        } catch (err: any) {
+          this.connectError = err?.message || String(err)
+        } finally {
+          this.ready = true
+        }
+      })()
+      lifecycle.initializing = initializing
       try {
-        await initWallet()
-        const acc = currentAccount()
-        await this.applyAccount(acc.address, acc.chainId)
-      } catch (err: any) {
-        this.connectError = err?.message || String(err)
+        await initializing
       } finally {
-        this.ready = true
+        if (lifecycle.initializing === initializing) lifecycle.initializing = undefined
       }
     },
 
@@ -103,15 +130,13 @@ export const useWalletStore = defineStore('wallet', {
     },
 
     async connect() {
+      if (!this.ready) await this.init()
       this.connectError = null
       try {
         const result = await smartConnect()
         if (result === 'no-wallet') {
           this.connectError =
             'No injected wallet detected. Open this page in desktop Chrome with MetaMask (or another injected extension wallet) installed.'
-        } else {
-          const account = currentAccount()
-          await this.applyAccount(account.address, account.chainId)
         }
       } catch (err: any) {
         const msg: string = err?.shortMessage || err?.message || String(err)
@@ -120,6 +145,12 @@ export const useWalletStore = defineStore('wallet', {
     },
 
     async switchChain(key: ChainKey) {
+      const lifecycle = getWalletStoreLifecycle(this)
+      if (!lifecycle.unsubscribe) {
+        lifecycle.unsubscribe = onAccountChange((address, chainId) =>
+          this.applyAccount(address, chainId)
+        )
+      }
       if (this.chainKey === key || this.switchingChain) return
       const gen = this.contextGen
       const address = this.address
@@ -130,10 +161,6 @@ export const useWalletStore = defineStore('wallet', {
       this.switchingChain = true
       try {
         await switchToChain(key)
-        if (isCurrent()) {
-          const account = currentAccount()
-          await this.applyAccount(account.address, account.chainId)
-        }
       } catch (err: any) {
         if (isCurrent()) {
           const msg: string = err?.shortMessage || err?.message || String(err)

@@ -26,6 +26,17 @@ let accountState: WalletAccount = {}
 let addressVersion = 0
 let chainVersion = 0
 
+type WalletStateListener = (
+  address?: string,
+  chainId?: number
+) => void | Promise<void>
+
+const walletStateListeners = new Set<WalletStateListener>()
+const pendingNotifications = new Set<Promise<void>>()
+let observedProvider: InjectedProvider | undefined
+let providerListenerGeneration = 0
+let removeObservedProviderListeners: (() => void) | undefined
+
 function setAddressState(address?: string): void {
   accountState = { ...accountState, address }
   addressVersion += 1
@@ -64,18 +75,115 @@ function parseChainId(value: unknown): number {
   return chainId
 }
 
+function publishWalletState(): Promise<void> {
+  const { address, chainId } = accountState
+  const notifications = [...walletStateListeners].map((listener) => {
+    try {
+      return Promise.resolve(listener(address, chainId))
+    } catch {
+      return Promise.resolve()
+    }
+  })
+  const pending = Promise.allSettled(notifications).then(() => undefined)
+  pendingNotifications.add(pending)
+  void pending.finally(() => pendingNotifications.delete(pending))
+  return pending
+}
+
+async function waitForWalletStateNotifications(): Promise<void> {
+  while (pendingNotifications.size > 0) {
+    await Promise.all([...pendingNotifications])
+  }
+}
+
+function detachObservedProvider(): void {
+  providerListenerGeneration += 1
+  const remove = removeObservedProviderListeners
+  removeObservedProviderListeners = undefined
+  observedProvider = undefined
+  try {
+    remove?.()
+  } catch {
+    // A broken provider cleanup must not leave the replacement listener stale-active.
+  }
+}
+
+function ensureObservedProvider(provider = getInjectedProvider()): void {
+  if (walletStateListeners.size === 0) {
+    if (observedProvider) detachObservedProvider()
+    return
+  }
+  if (observedProvider === provider) return
+
+  detachObservedProvider()
+  observedProvider = provider
+  if (!provider?.on) return
+
+  const generation = providerListenerGeneration
+  const isCurrent = () =>
+    generation === providerListenerGeneration && observedProvider === provider
+  const handleAccountsChanged = (value: unknown) => {
+    if (!isCurrent()) return
+    setAddressState(firstAccount(value))
+    void publishWalletState()
+  }
+  const handleChainChanged = (value: unknown) => {
+    if (!isCurrent()) return
+    setChainState(parseChainId(value))
+    void publishWalletState()
+  }
+  const handleDisconnect = () => {
+    if (!isCurrent()) return
+    clearAccountState()
+    void publishWalletState()
+  }
+
+  provider.on('accountsChanged', handleAccountsChanged)
+  provider.on('chainChanged', handleChainChanged)
+  provider.on('disconnect', handleDisconnect)
+
+  removeObservedProviderListeners = () => {
+    provider.removeListener?.('accountsChanged', handleAccountsChanged)
+    provider.removeListener?.('chainChanged', handleChainChanged)
+    provider.removeListener?.('disconnect', handleDisconnect)
+  }
+}
+
 /** Read the wallet's initial non-interactive state without opening a prompt. */
 export async function initWallet(): Promise<void> {
-  if (!getInjectedProvider()) {
+  const provider = getInjectedProvider()
+  ensureObservedProvider(provider)
+  if (!provider) {
     clearAccountState()
+    await publishWalletState()
     return
   }
 
   const initialAddressVersion = addressVersion
   const initialChainVersion = chainVersion
-  const [address, chainId] = await Promise.all([getInjectedAccount(), getInjectedChainId()])
-  if (addressVersion === initialAddressVersion) setAddressState(address)
-  if (chainVersion === initialChainVersion) setChainState(chainId)
+  const [accounts, rawChainId] = await Promise.all([
+    provider.request({ method: 'eth_accounts' }),
+    provider.request({ method: 'eth_chainId' })
+  ])
+  if (getInjectedProvider() !== provider) {
+    ensureObservedProvider()
+    await waitForWalletStateNotifications()
+    return
+  }
+
+  const address = firstAccount(accounts)
+  const chainId = parseChainId(rawChainId)
+  let updated = false
+  if (addressVersion === initialAddressVersion) {
+    setAddressState(address)
+    updated = true
+  }
+  if (chainVersion === initialChainVersion) {
+    setChainState(chainId)
+    updated = true
+  }
+  if (updated) await publishWalletState()
+  else await waitForWalletStateNotifications()
 }
 
 export function currentAccount(): WalletAccount {
@@ -85,14 +193,29 @@ export function currentAccount(): WalletAccount {
 export async function connectInjected(): Promise<void> {
   const provider = getInjectedProvider()
   if (!provider) throw new Error('No injected wallet found')
+  ensureObservedProvider(provider)
   const initialAddressVersion = addressVersion
   const initialChainVersion = chainVersion
   const accounts = await provider.request({ method: 'eth_requestAccounts' })
   const address = firstAccount(accounts)
   if (!address) throw new Error('No wallet account available. Reconnect your wallet.')
-  const chainId = await getInjectedChainId()
-  if (addressVersion === initialAddressVersion) setAddressState(address)
-  if (chainVersion === initialChainVersion) setChainState(chainId)
+  const chainId = parseChainId(await provider.request({ method: 'eth_chainId' }))
+  if (getInjectedProvider() !== provider) {
+    ensureObservedProvider()
+    throw new Error('Wallet provider changed during connection. Retry the connection.')
+  }
+
+  let updated = false
+  if (addressVersion === initialAddressVersion) {
+    setAddressState(address)
+    updated = true
+  }
+  if (chainVersion === initialChainVersion) {
+    setChainState(chainId)
+    updated = true
+  }
+  if (updated) await publishWalletState()
+  else await waitForWalletStateNotifications()
 }
 
 export async function smartConnect(): Promise<ConnectResult> {
@@ -101,46 +224,38 @@ export async function smartConnect(): Promise<ConnectResult> {
   return 'connected'
 }
 
-export function onAccountChange(cb: (address?: string, chainId?: number) => void): () => void {
-  const provider = getInjectedProvider()
-  if (!provider?.on) return () => undefined
-
-  const handleAccountsChanged = (value: unknown) => {
-    const address = firstAccount(value)
-    setAddressState(address)
-    cb(accountState.address, accountState.chainId)
-  }
-  const handleChainChanged = (value: unknown) => {
-    const chainId = parseChainId(value)
-    setChainState(chainId)
-    cb(accountState.address, accountState.chainId)
-  }
-  const handleDisconnect = () => {
-    clearAccountState()
-    cb(undefined, undefined)
-  }
-
-  provider.on('accountsChanged', handleAccountsChanged)
-  provider.on('chainChanged', handleChainChanged)
-  provider.on('disconnect', handleDisconnect)
-
+export function onAccountChange(cb: WalletStateListener): () => void {
+  walletStateListeners.add(cb)
+  ensureObservedProvider()
+  let active = true
   return () => {
-    provider.removeListener?.('accountsChanged', handleAccountsChanged)
-    provider.removeListener?.('chainChanged', handleChainChanged)
-    provider.removeListener?.('disconnect', handleDisconnect)
+    if (!active) return
+    active = false
+    walletStateListeners.delete(cb)
+    if (walletStateListeners.size === 0) detachObservedProvider()
   }
 }
 
 export async function switchToChain(key: ChainKey): Promise<void> {
   const provider = getInjectedProvider()
   if (!provider) throw new Error('No injected wallet found')
+  ensureObservedProvider(provider)
   const chainId = CHAINS[key].chainId
   const initialChainVersion = chainVersion
   await provider.request({
     method: 'wallet_switchEthereumChain',
     params: [{ chainId: `0x${chainId.toString(16)}` }]
   })
-  if (chainVersion === initialChainVersion) setChainState(chainId)
+  if (getInjectedProvider() !== provider) {
+    ensureObservedProvider()
+    throw new Error('Wallet provider changed during the chain switch. Retry the switch.')
+  }
+  if (chainVersion === initialChainVersion) {
+    setChainState(chainId)
+    await publishWalletState()
+  } else {
+    await waitForWalletStateNotifications()
+  }
 }
 
 const toHex = (value: bigint) => `0x${value.toString(16)}`

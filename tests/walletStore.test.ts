@@ -35,10 +35,85 @@ function deferred<T>() {
 }
 
 describe('wallet store request invalidation', () => {
+  let stateListener: ((address?: string, chainId?: number) => void | Promise<void>) | undefined
+
   beforeEach(() => {
     setActivePinia(createPinia())
-    vi.clearAllMocks()
+    vi.resetAllMocks()
+    walletApi.initWallet.mockResolvedValue(undefined)
+    walletApi.smartConnect.mockResolvedValue('connected')
+    walletApi.switchToChain.mockResolvedValue(undefined)
     walletApi.currentAccount.mockReturnValue({})
+    rpc.getCode.mockResolvedValue('0x')
+    stateListener = undefined
+    walletApi.onAccountChange.mockImplementation((listener) => {
+      stateListener = listener
+      return vi.fn()
+    })
+  })
+
+  it('reflects authorized state published by init without reading a stale snapshot', async () => {
+    rpc.getCode.mockResolvedValue('0x')
+    walletApi.initWallet.mockImplementation(async () => {
+      await stateListener?.(walletA, 137)
+    })
+    const store = useWalletStore()
+
+    await store.init()
+
+    expect(store.address).toBe(walletA)
+    expect(store.chainId).toBe(137)
+    expect(store.ready).toBe(true)
+    expect(walletApi.currentAccount).not.toHaveBeenCalled()
+  })
+
+  it('updates connected state from the wallet notification without an emitted event', async () => {
+    rpc.getCode.mockResolvedValue('0x')
+    walletApi.smartConnect.mockImplementation(async () => {
+      await stateListener?.(walletA, 1)
+      return 'connected'
+    })
+    const store = useWalletStore()
+    await store.init()
+
+    await store.connect()
+
+    expect(store.address).toBe(walletA)
+    expect(store.chainId).toBe(1)
+    expect(walletApi.currentAccount).not.toHaveBeenCalled()
+  })
+
+  it('updates switched chain state from the wallet notification without an emitted event', async () => {
+    rpc.getCode.mockResolvedValue('0x')
+    walletApi.switchToChain.mockImplementation(async () => {
+      await stateListener?.(walletA, 137)
+    })
+    const store = useWalletStore()
+    await store.init()
+    await store.applyAccount(walletA, 1)
+
+    await store.switchChain('polygon')
+
+    expect(store.address).toBe(walletA)
+    expect(store.chainId).toBe(137)
+    expect(store.switchingChain).toBe(false)
+    expect(walletApi.currentAccount).not.toHaveBeenCalled()
+  })
+
+  it('coalesces concurrent initialization and installs one state subscription', async () => {
+    const initialization = deferred<void>()
+    walletApi.initWallet.mockReturnValue(initialization.promise)
+    const store = useWalletStore()
+
+    const first = store.init()
+    const second = store.init()
+
+    expect(walletApi.onAccountChange).toHaveBeenCalledTimes(1)
+    expect(walletApi.initWallet).toHaveBeenCalledTimes(1)
+
+    initialization.resolve()
+    await Promise.all([first, second])
+    expect(store.ready).toBe(true)
   })
 
   it('ignores stale contract-wallet detection after account and chain change', async () => {

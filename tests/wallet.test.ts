@@ -82,6 +82,21 @@ describe('injected wallet integration', () => {
     expect(provider.request).toHaveBeenCalledWith({ method: 'eth_chainId' })
   })
 
+  it('notifies subscribers after initialization without provider events', async () => {
+    const provider = new MockInjectedProvider()
+    provider.chainId = '0x89'
+    installProvider(provider)
+    const { initWallet, onAccountChange } = await loadWallet()
+    const changed = vi.fn()
+    const unsubscribe = onAccountChange(changed)
+
+    await initWallet()
+
+    expect(changed).toHaveBeenCalledTimes(1)
+    expect(changed).toHaveBeenLastCalledWith(ACCOUNT_A, 137)
+    unsubscribe()
+  })
+
   it('merges a chain event that arrives while initial account state is loading', async () => {
     const provider = new MockInjectedProvider()
     const accounts = deferred<string[]>()
@@ -114,6 +129,20 @@ describe('injected wallet integration', () => {
     expect(currentAccount()).toEqual({ address: ACCOUNT_A, chainId: 1 })
   })
 
+  it('notifies subscribers after connecting without provider events', async () => {
+    const provider = new MockInjectedProvider()
+    installProvider(provider)
+    const { onAccountChange, smartConnect } = await loadWallet()
+    const changed = vi.fn()
+    const unsubscribe = onAccountChange(changed)
+
+    await smartConnect()
+
+    expect(changed).toHaveBeenCalledTimes(1)
+    expect(changed).toHaveBeenLastCalledWith(ACCOUNT_A, 1)
+    unsubscribe()
+  })
+
   it('reports no wallet without attempting a remote connector', async () => {
     vi.stubGlobal('window', {})
     const { smartConnect } = await loadWallet()
@@ -142,6 +171,21 @@ describe('injected wallet integration', () => {
     expect(provider.removeListener).toHaveBeenCalledTimes(3)
   })
 
+  it('shares one provider listener set across subscribers and cleans it up once', async () => {
+    const provider = new MockInjectedProvider()
+    installProvider(provider)
+    const { onAccountChange } = await loadWallet()
+
+    const unsubscribeA = onAccountChange(vi.fn())
+    const unsubscribeB = onAccountChange(vi.fn())
+
+    expect(provider.on).toHaveBeenCalledTimes(3)
+    unsubscribeA()
+    expect(provider.removeListener).not.toHaveBeenCalled()
+    unsubscribeB()
+    expect(provider.removeListener).toHaveBeenCalledTimes(3)
+  })
+
   it('preserves a rejected connect request', async () => {
     const provider = new MockInjectedProvider()
     provider.failures.set('eth_requestAccounts', Object.assign(new Error('User rejected'), { code: 4001 }))
@@ -167,6 +211,21 @@ describe('injected wallet integration', () => {
       Object.assign(new Error('Switch rejected'), { code: 4001 })
     )
     await expect(switchToChain('eth')).rejects.toThrow('Switch rejected')
+  })
+
+  it('notifies subscribers after switching chains without provider events', async () => {
+    const provider = new MockInjectedProvider()
+    installProvider(provider)
+    const { initWallet, onAccountChange, switchToChain } = await loadWallet()
+    await initWallet()
+    const changed = vi.fn()
+    const unsubscribe = onAccountChange(changed)
+
+    await switchToChain('polygon')
+
+    expect(changed).toHaveBeenCalledTimes(1)
+    expect(changed).toHaveBeenLastCalledWith(ACCOUNT_A, 137)
+    unsubscribe()
   })
 
   it('encodes and sends transaction parameters directly through eth_sendTransaction', async () => {
