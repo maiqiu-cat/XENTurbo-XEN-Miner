@@ -11,6 +11,7 @@ export function usePendingTx(
   chain: () => ChainKey | null | undefined
 ) {
   const pendingCount = ref(0)
+  const localUnresolvedCount = ref(0)
   const ops = ref<PendingOpView[]>([])
   const checking = ref(false)
   const lastCheckedAt = ref<number | null>(null)
@@ -24,6 +25,7 @@ export function usePendingTx(
     const key = chain()
     if (!addr || !key) {
       pendingCount.value = 0
+      localUnresolvedCount.value = 0
       ops.value = []
       return 0
     }
@@ -31,9 +33,10 @@ export function usePendingTx(
     checking.value = true
     error.value = null
     try {
-      const { views, pendingNonceGap } = await refreshPendingOps(key, addr)
+      const { views, pendingNonceGap, unresolvedCount } = await refreshPendingOps(key, addr)
       if (myGen !== gen) return pendingCount.value
       pendingCount.value = pendingNonceGap
+      localUnresolvedCount.value = unresolvedCount
       ops.value = views
       lastCheckedAt.value = Date.now()
       return pendingNonceGap
@@ -68,6 +71,7 @@ export function usePendingTx(
       else {
         stopPolling()
         pendingCount.value = 0
+        localUnresolvedCount.value = 0
         ops.value = []
       }
     },
@@ -76,7 +80,9 @@ export function usePendingTx(
 
   onUnmounted(stopPolling)
 
-  const hasPending = computed(() => pendingCount.value > 0 || ops.value.length > 0)
+  const hasPending = computed(
+    () => pendingCount.value > 0 || localUnresolvedCount.value > 0
+  )
 
   async function trackHash(txHash: string, seenText?: string): Promise<void> {
     const addr = address()
@@ -88,6 +94,7 @@ export function usePendingTx(
 
   return {
     pendingCount: pendingCount as Ref<number>,
+    localUnresolvedCount: localUnresolvedCount as Ref<number>,
     ops: ops as Ref<PendingOpView[]>,
     hasPending,
     checking,

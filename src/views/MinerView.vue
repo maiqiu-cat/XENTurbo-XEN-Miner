@@ -53,6 +53,7 @@ async function onChainSelect(ev: Event) {
 const {
   hasPending,
   pendingCount,
+  localUnresolvedCount,
   ops: pendingOps,
   checking: pendingChecking,
   check: checkPending,
@@ -61,6 +62,14 @@ const {
   () => wallet.address,
   () => activeChain.value
 )
+
+const pendingBlockedReason = computed(() => {
+  if (!hasPending.value) return null
+  if (pendingCount.value > 0) {
+    return `Blocked: ${pendingCount.value} pending tx on-chain`
+  }
+  return `Blocked: ${localUnresolvedCount.value} unresolved transaction awaiting reconciliation`
+})
 
 const trackError = ref<string | null>(null)
 async function onTrackHash(payload: { hash: string; seenText?: string }) {
@@ -399,7 +408,7 @@ const explorerAddrUrl = computed(() => {
       <!-- mint list -->
       <MintList
         :busy="busy || hasPending"
-        :blocked-reason="hasPending ? `Blocked: ${pendingCount} pending tx on-chain` : null"
+        :blocked-reason="pendingBlockedReason"
         @claim="onClaim"
         @claim-reuse="(ids, term) => onClaimReuse(ids, term)"
       />

@@ -3,11 +3,20 @@ import type { ChainKey } from '@/config/chains'
 import { CHAINS } from '@/config/chains'
 import { CONTRACTS } from '@/config/contracts'
 import { getReadProvider } from './rpc'
-import { pendingLocks } from './localLock'
+import { pendingLocks, releaseLock, releaseLocksByTxHash } from './localLock'
 import type { OpType } from './txManager'
 
 const KEY = 'sm.pendingOps'
-const TTL_MS = 60 * 60 * 1000 // 1 hour
+
+export type PendingPhase =
+  | 'awaiting-wallet'
+  | 'broadcast'
+  | 'confirmed'
+  | 'reverted'
+  | 'replaced'
+  | 'dropped'
+
+const UNRESOLVED_PHASES = new Set<PendingPhase>(['awaiting-wallet', 'broadcast'])
 
 export interface PendingOpRecord {
   id: string
@@ -18,15 +27,18 @@ export interface PendingOpRecord {
   count: number
   term: number
   txHash: string
+  /** Transaction nonce. Null means an older record that must be reconciled conservatively. */
+  nonce: number | null
+  phase: PendingPhase
   submittedAt: number
+  updatedAt: number
 }
 
 export interface PendingOpView extends PendingOpRecord {
   label: string
   detail: string
   explorerUrl: string
-  /** still in mempool / not yet mined */
-  status: 'pending' | 'mined' | 'reverted' | 'unknown'
+  status: 'pending' | 'confirmed' | 'reverted' | 'replaced' | 'dropped' | 'unknown'
 }
 
 const OP_LABELS: Record<OpType, string> = {
@@ -45,10 +57,10 @@ const factoryIface = new Interface([
   'function bulkClaimMintRewardAndClaimRank(uint256[] ids, uint256 term)'
 ])
 
-function isValid(r: unknown): r is PendingOpRecord {
-  if (!r || typeof r !== 'object') return false
+function normalizeRecord(r: unknown): PendingOpRecord | null {
+  if (!r || typeof r !== 'object') return null
   const o = r as Record<string, unknown>
-  return (
+  const valid =
     typeof o.id === 'string' &&
     typeof o.chain === 'string' &&
     typeof o.wallet === 'string' &&
@@ -56,6 +68,35 @@ function isValid(r: unknown): r is PendingOpRecord {
     typeof o.txHash === 'string' &&
     typeof o.submittedAt === 'number' &&
     Array.isArray(o.ids)
+  if (!valid) return null
+
+  const phase = isPendingPhase(o.phase)
+    ? o.phase
+    : (o.txHash as string).length > 0
+      ? 'broadcast'
+      : 'awaiting-wallet'
+  const nonce =
+    typeof o.nonce === 'number' && Number.isSafeInteger(o.nonce) && o.nonce >= 0 ? o.nonce : null
+
+  return {
+    ...(o as unknown as PendingOpRecord),
+    nonce,
+    phase,
+    updatedAt:
+      typeof o.updatedAt === 'number' && Number.isFinite(o.updatedAt)
+        ? o.updatedAt
+        : (o.submittedAt as number)
+  }
+}
+
+function isPendingPhase(value: unknown): value is PendingPhase {
+  return (
+    value === 'awaiting-wallet' ||
+    value === 'broadcast' ||
+    value === 'confirmed' ||
+    value === 'reverted' ||
+    value === 'replaced' ||
+    value === 'dropped'
   )
 }
 
@@ -64,9 +105,13 @@ function readAll(): PendingOpRecord[] {
     const raw = localStorage.getItem(KEY)
     const list = raw ? (JSON.parse(raw) as unknown[]) : []
     if (!Array.isArray(list)) return []
-    const now = Date.now()
-    const valid = list.filter(isValid).filter((r) => now - r.submittedAt < TTL_MS)
-    if (valid.length !== list.length) writeAll(valid)
+    const valid = list.map(normalizeRecord).filter((r): r is PendingOpRecord => r !== null)
+    const needsMigration = list.some((record) => {
+      if (!record || typeof record !== 'object') return true
+      const value = record as Record<string, unknown>
+      return !('nonce' in value) || !isPendingPhase(value.phase) || typeof value.updatedAt !== 'number'
+    })
+    if (valid.length !== list.length || needsMigration) writeAll(valid)
     return valid
   } catch {
     return []
@@ -100,7 +145,15 @@ function formatIds(ids: number[]): string {
   return `${ids.slice(0, 5).join(', ')}… (+${ids.length - 5})`
 }
 
-function toView(r: PendingOpRecord, status: PendingOpView['status'] = 'pending'): PendingOpView {
+function statusForPhase(phase: PendingPhase): PendingOpView['status'] {
+  if (phase === 'awaiting-wallet' || phase === 'broadcast') return 'pending'
+  return phase
+}
+
+function toView(
+  r: PendingOpRecord,
+  status: PendingOpView['status'] = statusForPhase(r.phase)
+): PendingOpView {
   return {
     ...r,
     label: OP_LABELS[r.op] ?? r.op,
@@ -111,6 +164,8 @@ function toView(r: PendingOpRecord, status: PendingOpView['status'] = 'pending')
 }
 
 export function recordPendingOp(params: {
+  /** Stable client operation id, normally the local VMU lock batch id. */
+  id?: string
   chain: ChainKey
   wallet: string
   op: OpType
@@ -118,16 +173,24 @@ export function recordPendingOp(params: {
   count: number
   term: number
   txHash: string
+  nonce?: number | null
+  phase?: PendingPhase
   /** First-seen / broadcast time. Preserved across rediscovery so "pending for" stays accurate. */
   submittedAt?: number
 }): PendingOpRecord {
-  const existing = readAll().find((r) => r.txHash.toLowerCase() === params.txHash.toLowerCase())
+  const all = readAll()
+  const normalizedHash = params.txHash.toLowerCase()
+  const existing = all.find(
+    (record) =>
+      (params.id && record.id === params.id) ||
+      (normalizedHash.length > 0 && record.txHash.toLowerCase() === normalizedHash)
+  )
   const submittedAt = Math.min(
     existing?.submittedAt ?? Number.POSITIVE_INFINITY,
     params.submittedAt ?? Date.now()
   )
   const rec: PendingOpRecord = {
-    id: existing?.id ?? `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    id: existing?.id ?? params.id ?? `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     chain: params.chain,
     wallet: params.wallet,
     op: params.op,
@@ -135,18 +198,58 @@ export function recordPendingOp(params: {
     count: params.count || existing?.count || 0,
     term: params.term || existing?.term || 0,
     txHash: params.txHash,
+    nonce: params.nonce ?? existing?.nonce ?? null,
+    phase: params.phase ?? existing?.phase ?? (params.txHash ? 'broadcast' : 'awaiting-wallet'),
     // Earliest known time ≈ when the tx entered the mempool from our perspective.
     // Pending txs have no on-chain block timestamp until mined.
-    submittedAt: Number.isFinite(submittedAt) ? submittedAt : Date.now()
+    submittedAt: Number.isFinite(submittedAt) ? submittedAt : Date.now(),
+    updatedAt: Date.now()
   }
-  const list = readAll().filter((r) => r.txHash.toLowerCase() !== params.txHash.toLowerCase())
+  const list = readAll().filter(
+    (record) =>
+      record.id !== rec.id &&
+      (normalizedHash.length === 0 || record.txHash.toLowerCase() !== normalizedHash)
+  )
   list.push(rec)
   writeAll(list)
+  if (!isUnresolvedPending(rec)) {
+    releaseLock(rec.id)
+    if (rec.txHash) releaseLocksByTxHash(rec.txHash)
+  }
   return rec
 }
 
+export function isUnresolvedPending(record: Pick<PendingOpRecord, 'phase'>): boolean {
+  return UNRESOLVED_PHASES.has(record.phase)
+}
+
+function transitionPendingOp(identifier: string, phase: PendingPhase): PendingOpRecord | null {
+  const normalized = identifier.toLowerCase()
+  const list = readAll()
+  const index = list.findIndex(
+    (record) => record.id === identifier || record.txHash.toLowerCase() === normalized
+  )
+  if (index < 0) return null
+  const updated: PendingOpRecord = { ...list[index], phase, updatedAt: Date.now() }
+  list[index] = updated
+  writeAll(list)
+  if (!isUnresolvedPending(updated)) {
+    releaseLock(updated.id)
+    if (updated.txHash) releaseLocksByTxHash(updated.txHash)
+  }
+  return updated
+}
+
+export function markPendingOpDropped(identifier: string): PendingOpRecord | null {
+  return transitionPendingOp(identifier, 'dropped')
+}
+
 export function removePendingOp(txHash: string): void {
-  writeAll(readAll().filter((r) => r.txHash.toLowerCase() !== txHash.toLowerCase()))
+  const normalized = txHash.toLowerCase()
+  const list = readAll()
+  const removed = list.some((record) => record.txHash.toLowerCase() === normalized)
+  writeAll(list.filter((record) => record.txHash.toLowerCase() !== normalized))
+  if (removed) releaseLocksByTxHash(txHash)
 }
 
 const EXPLORER_DATE_RE =
@@ -246,6 +349,8 @@ export async function trackPendingTxHash(
     count: decoded.count,
     term: decoded.term,
     txHash: hash,
+    nonce: tx.nonce ?? null,
+    phase: 'broadcast',
     submittedAt: pastedMs ?? undefined
   })
   return toView(rec, 'pending')
@@ -255,6 +360,57 @@ export function listPendingOps(chain: ChainKey, wallet: string): PendingOpRecord
   return readAll().filter(
     (r) => r.chain === chain && r.wallet.toLowerCase() === wallet.toLowerCase()
   )
+}
+
+export function countUnresolvedPendingOps(chain: ChainKey, wallet: string): number {
+  return listPendingOps(chain, wallet).filter(isUnresolvedPending).length
+}
+
+export interface PendingObservation {
+  receipt: { status?: number | null } | null
+  transactionFound: boolean
+  observedNonce?: number | null
+  latestNonce: number
+  pendingNonce: number
+}
+
+/** Resolve only from affirmative chain evidence; absence alone stays blocking. */
+export function reconcilePendingOp(
+  record: PendingOpRecord,
+  observation: PendingObservation,
+  now = Date.now()
+): PendingOpRecord {
+  if (!isUnresolvedPending(record)) return record
+
+  const observedNonce = normalizeNonce(observation.observedNonce)
+  const nonce = record.nonce ?? observedNonce
+  let phase = record.phase
+
+  if (observation.receipt) {
+    phase = observation.receipt.status === 0 ? 'reverted' : 'confirmed'
+  } else if (
+    !observation.transactionFound &&
+    nonce !== null &&
+    observation.latestNonce > nonce
+  ) {
+    // A confirmed account nonce beyond this nonce proves another transaction
+    // consumed it. A lower pending nonce alone is not enough evidence.
+    phase = 'replaced'
+  } else if (record.txHash && phase === 'awaiting-wallet') {
+    phase = 'broadcast'
+  }
+
+  if (phase === record.phase && nonce === record.nonce) return record
+  return { ...record, nonce, phase, updatedAt: now }
+}
+
+function normalizeNonce(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return value
+  if (typeof value === 'string' && /^0x[0-9a-f]+$/i.test(value)) {
+    const parsed = Number.parseInt(value, 16)
+    return Number.isSafeInteger(parsed) ? parsed : null
+  }
+  return null
 }
 
 export function decodeFactoryCalldata(data: string): {
@@ -390,13 +546,12 @@ async function discoverPendingFactoryTxs(
       const blk = await rpc.send('eth_getBlockByNumber', ['pending', true])
       const txs: any[] = blk?.transactions ?? []
       for (const tx of txs) {
-        if (!tx || typeof tx !== 'object') continue
         // pending block may return hashes only
         let full = tx
         if (typeof tx === 'string') {
           full = await rpc.send('eth_getTransactionByHash', [tx]).catch(() => null)
         }
-        if (!full) continue
+        if (!full || typeof full !== 'object') continue
         const from = (full.from || '').toLowerCase()
         const to = (full.to || '').toLowerCase()
         const hash = (full.hash || '') as string
@@ -411,7 +566,9 @@ async function discoverPendingFactoryTxs(
           ids: decoded.ids,
           count: decoded.count,
           term: decoded.term,
-          txHash: hash
+          txHash: hash,
+          nonce: normalizeNonce(full.nonce),
+          phase: 'broadcast'
         })
         found.push(rec)
       }
@@ -443,6 +600,8 @@ function hydrateFromLocks(chain: ChainKey, wallet: string): void {
       count: lock.count ?? 0,
       term: lock.term ?? 0,
       txHash: lock.txHash,
+      nonce: null,
+      phase: 'broadcast',
       submittedAt: lock.lockedAt
     })
   }
@@ -454,7 +613,7 @@ function hydrateFromLocks(chain: ChainKey, wallet: string): void {
 export async function refreshPendingOps(
   chain: ChainKey,
   wallet: string
-): Promise<{ views: PendingOpView[]; pendingNonceGap: number }> {
+): Promise<{ views: PendingOpView[]; pendingNonceGap: number; unresolvedCount: number }> {
   const provider = getReadProvider(chain)
   const injected = getInjected()
   const factory = CONTRACTS[chain].factory.toLowerCase()
@@ -472,59 +631,69 @@ export async function refreshPendingOps(
     await discoverPendingFactoryTxs(chain, wallet, injected)
   }
 
-  const local = listPendingOps(chain, wallet)
-  const views: PendingOpView[] = []
-
-  await Promise.all(
-    local.map(async (r) => {
-      try {
-        const receipt = await provider.getTransactionReceipt(r.txHash)
-        if (receipt) {
-          removePendingOp(r.txHash)
-          return
+  const local = listPendingOps(chain, wallet).filter(isUnresolvedPending)
+  const outcomes = await Promise.all(
+    local.map(async (record) => {
+      let receipt: { status?: number | null } | null = null
+      if (record.txHash) {
+        try {
+          receipt = await provider.getTransactionReceipt(record.txHash)
+        } catch {
+          // An RPC failure is not resolution evidence.
         }
-      } catch {
-        /* keep */
       }
 
-      // Enrich / correct op details from the actual calldata when possible.
-      let enriched = r
-      const tx = await fetchTxByHash(r.txHash, provider, injected)
+      const tx = record.txHash
+        ? await fetchTxByHash(record.txHash, provider, injected)
+        : null
+      let enriched = record
       if (tx?.input && tx.to?.toLowerCase() === factory) {
         const decoded = decodeFactoryCalldata(tx.input)
         if (decoded) {
           enriched = {
-            ...r,
+            ...record,
             op: decoded.op,
-            ids: decoded.ids.length ? decoded.ids : r.ids,
-            count: decoded.count || r.count,
-            term: decoded.term || r.term
+            ids: decoded.ids.length ? decoded.ids : record.ids,
+            count: decoded.count || record.count,
+            term: decoded.term || record.term
           }
         }
       }
-      // Do NOT scrape explorer on every poll — proxy/TLS failures spam 500s in the console.
-      // Explorer time is set once via Track (paste Seen text or one-shot scrape).
-      if (enriched !== r) {
-        const all = readAll().map((x) =>
-          x.txHash.toLowerCase() === r.txHash.toLowerCase() ? { ...x, ...enriched } : x
-        )
-        writeAll(all)
+
+      const reconciled = reconcilePendingOp(enriched, {
+        receipt,
+        transactionFound: tx !== null,
+        observedNonce: tx?.nonce,
+        latestNonce: latest,
+        pendingNonce
+      })
+      const uncertain =
+        isUnresolvedPending(reconciled) &&
+        tx === null &&
+        (reconciled.nonce === null || pendingNonce <= reconciled.nonce)
+
+      return {
+        record: reconciled,
+        status: uncertain ? ('unknown' as const) : statusForPhase(reconciled.phase)
       }
-
-      // If nonce gap is 0 and we still have no receipt, tx was likely dropped —
-      // keep briefly as unknown, or drop if older than soft window.
-      const status: PendingOpView['status'] =
-        pendingNonceGap > 0 ? 'pending' : Date.now() - r.submittedAt > 120_000 ? 'unknown' : 'pending'
-
-      if (status === 'unknown' && pendingNonceGap === 0) {
-        // Drop stale entries once chain has no in-flight nonces.
-        removePendingOp(r.txHash)
-        return
-      }
-
-      views.push(toView(enriched, status))
     })
   )
+
+  if (outcomes.length) {
+    const updates = new Map(outcomes.map(({ record }) => [record.id, record]))
+    writeAll(readAll().map((record) => updates.get(record.id) ?? record))
+  }
+
+  for (const { record } of outcomes) {
+    if (!isUnresolvedPending(record)) {
+      releaseLock(record.id)
+      if (record.txHash) releaseLocksByTxHash(record.txHash)
+    }
+  }
+
+  const unresolved = outcomes.filter(({ record }) => isUnresolvedPending(record))
+  const views = unresolved.map(({ record, status }) => toView(record, status))
+  const unresolvedCount = unresolved.length
 
   // If we still have a nonce gap but zero decoded rows, surface a synthetic row
   // so the panel is never an empty "details unavailable" dead-end.
@@ -538,7 +707,10 @@ export async function refreshPendingOps(
       count: 0,
       term: 0,
       txHash: '',
+      nonce: null,
+      phase: 'broadcast',
       submittedAt: Date.now(),
+      updatedAt: Date.now(),
       label: 'Pending transaction',
       detail: `${pendingNonceGap} in-flight nonce(s) — open MetaMask → Activity for type / hash`,
       explorerUrl: `${CHAINS[chain].blockExplorerUrl}/address/${wallet}`,
@@ -547,5 +719,5 @@ export async function refreshPendingOps(
   }
 
   views.sort((a, b) => b.submittedAt - a.submittedAt)
-  return { views, pendingNonceGap }
+  return { views, pendingNonceGap, unresolvedCount }
 }

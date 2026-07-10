@@ -395,7 +395,12 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
     readyToSign: false
   }
   const emit = () => cb.onStep?.({ ...state })
-  let lockHeld = prepared.lockIds.length > 0
+  const lockHeld = prepared.lockIds.length > 0
+  let broadcasted = false
+  let resolved = false
+  let broadcastNonce = prepared.nonce
+  let awaitingWalletRecorded = false
+  let awaitingWalletResolved = false
 
   try {
     const walletSend = runWalletExclusive(
@@ -428,12 +433,27 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
           readProvider.getFeeData()
         ])
         const nonce = assertNonceAgreement(walletNonce, rpcNonce)
+        broadcastNonce = nonce
         const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas ?? 1_000_000_000n
         const maxFeePerGas =
           feeData.maxFeePerGas ?? maxPriorityFeePerGas * 2n + (feeData.gasPrice ?? 0n)
 
         state.send = 'process'
         emit()
+
+        recordPendingOp({
+          id: prepared.batch,
+          chain: prepared.chain,
+          wallet: prepared.wallet,
+          op: prepared.op,
+          ids: prepared.ids,
+          count: prepared.count,
+          term: prepared.term,
+          txHash: '',
+          nonce,
+          phase: 'awaiting-wallet'
+        })
+        awaitingWalletRecorded = true
 
         return writeFactory({
           chainId: prepared.chainId,
@@ -451,17 +471,21 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
       }
     )
     const txHash = await walletSend
+    broadcasted = true
     state.txHash = txHash
     if (prepared.lockIds.length) attachTxHash(prepared.batch, txHash)
     // Persist for the Pending Ops panel (survives reload until mined).
     recordPendingOp({
+      id: prepared.batch,
       chain: prepared.chain,
       wallet: prepared.wallet,
       op: prepared.op,
       ids: prepared.ids,
       count: prepared.count,
       term: prepared.term,
-      txHash
+      txHash,
+      nonce: broadcastNonce,
+      phase: 'broadcast'
     })
     state.send = 'done'
     emit()
@@ -479,26 +503,80 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
         state.error =
           'Confirmation timed out. The transaction may still be pending — do not retry the same VMUs. Refresh later or check the explorer.'
         emit()
-        lockHeld = false
         throw err
       }
       throw err
     }
 
     if (!receipt) throw new Error('Transaction receipt missing')
-    if (receipt.status === 0) throw new Error('Transaction reverted on-chain')
+    if (receipt.status === 0) {
+      recordPendingOp({
+        id: prepared.batch,
+        chain: prepared.chain,
+        wallet: prepared.wallet,
+        op: prepared.op,
+        ids: prepared.ids,
+        count: prepared.count,
+        term: prepared.term,
+        txHash,
+        nonce: broadcastNonce,
+        phase: 'reverted'
+      })
+      resolved = true
+      throw new Error('Transaction reverted on-chain')
+    }
+    recordPendingOp({
+      id: prepared.batch,
+      chain: prepared.chain,
+      wallet: prepared.wallet,
+      op: prepared.op,
+      ids: prepared.ids,
+      count: prepared.count,
+      term: prepared.term,
+      txHash,
+      nonce: broadcastNonce,
+      phase: 'confirmed'
+    })
+    resolved = true
     state.confirm = 'done'
     emit()
     return state
   } catch (err: any) {
+    if (!broadcasted && awaitingWalletRecorded && isDefinitiveWalletRejection(err)) {
+      recordPendingOp({
+        id: prepared.batch,
+        chain: prepared.chain,
+        wallet: prepared.wallet,
+        op: prepared.op,
+        ids: prepared.ids,
+        count: prepared.count,
+        term: prepared.term,
+        txHash: '',
+        nonce: broadcastNonce,
+        phase: 'dropped'
+      })
+      awaitingWalletResolved = true
+    }
     if (state.send === 'process') state.send = 'error'
     else if (state.confirm === 'process') state.confirm = 'error'
     if (!state.error) state.error = normalizeError(err)
     emit()
     throw err
   } finally {
-    if (lockHeld && prepared.lockIds.length) releaseLock(prepared.batch)
+    if (
+      lockHeld &&
+      prepared.lockIds.length &&
+      ((!broadcasted && (!awaitingWalletRecorded || awaitingWalletResolved)) || resolved)
+    ) {
+      releaseLock(prepared.batch)
+    }
   }
+}
+
+function isDefinitiveWalletRejection(err: any): boolean {
+  const code = err?.code ?? err?.info?.error?.code
+  const message = err?.shortMessage || err?.message || ''
+  return code === 4001 || /user rejected|user denied|rejected the request/i.test(message)
 }
 
 /** Abort a prepared op that was never sent (user soft lock). */

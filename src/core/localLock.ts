@@ -27,8 +27,6 @@ interface LockRecord {
 }
 
 const KEY = 'sm.vmuLocks'
-// Broadcast locks (have txHash): kept until receipt / this TTL.
-const LOCK_TTL_MS = 30 * 60 * 1000
 // Soft locks (pre-signature, no txHash): expire quickly so a hung Send cannot
 // block Claim forever after the user closes the modal / refreshes.
 const SOFT_LOCK_TTL_MS = 2 * 60 * 1000
@@ -48,8 +46,9 @@ function isValidLock(l: unknown): l is LockRecord {
 
 function isAlive(l: LockRecord, now: number): boolean {
   const hasTx = typeof l.txHash === 'string' && l.txHash.length > 0
-  const ttl = hasTx ? LOCK_TTL_MS : SOFT_LOCK_TTL_MS
-  return now - l.lockedAt < ttl
+  // A broadcast lock is released only by receipt/nonce reconciliation. Age is
+  // not evidence that a transaction stopped competing for its nonce.
+  return hasTx || now - l.lockedAt < SOFT_LOCK_TTL_MS
 }
 
 function readAll(): LockRecord[] {
@@ -141,6 +140,15 @@ export function attachTxHash(batch: string, txHash: string): void {
 
 export function releaseLock(batch: string): void {
   writeAll(readAll().filter((l) => l.batch !== batch))
+}
+
+export function releaseLocksByTxHash(txHash: string): void {
+  const normalized = txHash.toLowerCase()
+  writeAll(
+    readAll().filter(
+      (l) => typeof l.txHash !== 'string' || l.txHash.toLowerCase() !== normalized
+    )
+  )
 }
 
 export function newBatchId(): string {
