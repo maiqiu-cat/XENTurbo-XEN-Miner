@@ -54,13 +54,18 @@ export const useWalletStore = defineStore('wallet', {
     }
   },
   actions: {
-    init() {
+    async init() {
       if (this.ready) return
-      initWallet()
-      const acc = currentAccount()
-      this.applyAccount(acc.address, acc.chainId)
       onAccountChange((address, chainId) => this.applyAccount(address, chainId))
-      this.ready = true
+      try {
+        await initWallet()
+        const acc = currentAccount()
+        await this.applyAccount(acc.address, acc.chainId)
+      } catch (err: any) {
+        this.connectError = err?.message || String(err)
+      } finally {
+        this.ready = true
+      }
     },
 
     async applyAccount(address?: string, chainId?: number) {
@@ -103,7 +108,10 @@ export const useWalletStore = defineStore('wallet', {
         const result = await smartConnect()
         if (result === 'no-wallet') {
           this.connectError =
-            'No injected wallet detected. Open this page in a normal browser (Chrome/Brave/Firefox) with MetaMask (or another extension wallet) installed. If you are viewing inside the IDE preview pane, open http://localhost:5300 in your system browser instead. Alternatively, set VITE_WALLETCONNECT_PROJECT_ID in .env to enable WalletConnect (mobile QR).'
+            'No injected wallet detected. Open this page in desktop Chrome with MetaMask (or another injected extension wallet) installed.'
+        } else {
+          const account = currentAccount()
+          await this.applyAccount(account.address, account.chainId)
         }
       } catch (err: any) {
         const msg: string = err?.shortMessage || err?.message || String(err)
@@ -122,6 +130,10 @@ export const useWalletStore = defineStore('wallet', {
       this.switchingChain = true
       try {
         await switchToChain(key)
+        if (isCurrent()) {
+          const account = currentAccount()
+          await this.applyAccount(account.address, account.chainId)
+        }
       } catch (err: any) {
         if (isCurrent()) {
           const msg: string = err?.shortMessage || err?.message || String(err)

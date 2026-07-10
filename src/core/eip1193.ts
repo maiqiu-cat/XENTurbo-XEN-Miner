@@ -6,6 +6,12 @@ export interface Eip1193Request {
 export interface InjectedProvider {
   request(args: Eip1193Request): Promise<unknown>
   isMetaMask?: boolean
+  providers?: InjectedProvider[]
+  on?(event: 'accountsChanged' | 'chainChanged' | 'disconnect', listener: (...args: unknown[]) => void): void
+  removeListener?(
+    event: 'accountsChanged' | 'chainChanged' | 'disconnect',
+    listener: (...args: unknown[]) => void
+  ): void
 }
 
 export type WalletSendState = 'awaiting-wallet' | 'broadcast' | 'failed'
@@ -18,8 +24,7 @@ export interface WalletSend<T> {
 /** Resolve the browser-injected provider, preferring MetaMask when several exist. */
 export function getInjectedProvider(): InjectedProvider | undefined {
   if (typeof window === 'undefined') return undefined
-  const ethereum = (window as Window & { ethereum?: InjectedProvider & { providers?: InjectedProvider[] } })
-    .ethereum
+  const ethereum = (window as Window & { ethereum?: InjectedProvider }).ethereum
   if (!ethereum) return undefined
   if (Array.isArray(ethereum.providers)) {
     return ethereum.providers.find((provider: InjectedProvider) => provider.isMetaMask) ?? ethereum.providers[0]

@@ -38,6 +38,7 @@ describe('wallet store request invalidation', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     vi.clearAllMocks()
+    walletApi.currentAccount.mockReturnValue({})
   })
 
   it('ignores stale contract-wallet detection after account and chain change', async () => {
@@ -65,6 +66,7 @@ describe('wallet store request invalidation', () => {
     walletApi.switchToChain
       .mockReturnValueOnce(oldSwitch.promise)
       .mockReturnValueOnce(newSwitch.promise)
+    walletApi.currentAccount.mockReturnValue({ address: walletB, chainId: 1 })
     const store = useWalletStore()
     await store.applyAccount(walletA, 1)
 

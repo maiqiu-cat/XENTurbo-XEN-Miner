@@ -320,19 +320,8 @@ export function parseExplorerSeenTime(html: string): number | null {
 }
 
 /**
- * Explorer HTML scrape disabled — MITM/proxy TLS failures caused console 500 spam.
- * Use pasted "Time Last Seen" text on Track instead.
- */
-export async function fetchExplorerPendingTime(
-  _chain: ChainKey,
-  _txHash: string
-): Promise<number | null> {
-  return null
-}
-
-/**
  * Manually track a pending tx by hash (from MetaMask / Etherscan).
- * Decodes calldata, pulls explorer First/Last Seen time when available.
+ * Decodes calldata and accepts a manually pasted explorer First/Last Seen time.
  */
 export async function trackPendingTxHash(
   chain: ChainKey,

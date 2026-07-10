@@ -22,6 +22,13 @@ per-VMU mint state, and locks. All of that is reconstructible from the chain:
 The miner contract (`XENFactoryUpgradeable`) is reused as-is; users' wallets call
 it directly. The app never holds keys or sends transactions on the user's behalf.
 
+## Browser and wallet requirements
+
+- Desktop Google Chrome is the supported browser.
+- Install MetaMask or another injected EIP-1193 extension wallet.
+- Mobile browsers, WalletConnect, Web3Modal, Reown, and Wagmi are not supported.
+- Wallet requests go directly through `window.ethereum`; no wallet relay or QR service is used.
+
 ## How the mining works
 
 Minting happens entirely on-chain. The factory uses CREATE2 to deploy EIP-1167
@@ -58,7 +65,7 @@ Add more chains in `src/config/chains.ts` + `src/config/contracts.ts`.
 
 ```bash
 npm install
-cp .env.example .env   # set VITE_WALLETCONNECT_PROJECT_ID (from cloud.walletconnect.com)
+cp .env.example .env   # optional: set custom Ethereum or Polygon RPC URLs
 npm run dev
 ```
 
@@ -66,8 +73,21 @@ npm run dev
 
 - `npm run dev` - dev server
 - `npm run build` - typecheck + production build
-- `npm run test` - unit tests (CREATE2 derivation)
+- `npm run test` - unit and wallet integration tests
+- `npm run typecheck` - TypeScript and Vue type checking
+- `npm run check:bundle` - enforce gzip bundle budgets against `dist/`
 - `npm run verify:create2 [wallet] [rpcUrl]` - verify derivation against live chain
+
+## Bundle budget
+
+Before removing the unused WalletConnect/Web3Modal/Wagmi stack, the main application
+bundle measured **674.61 KiB gzip**. The enforced production budgets are:
+
+- largest JavaScript chunk: at most **400 KiB gzip**
+- all JavaScript files in `dist/`: at most **550 KiB gzip**
+
+Run `npm run build && npm run check:bundle` before publishing. The check prints every
+measured JavaScript chunk and exits non-zero when either limit is exceeded.
 
 ## Notes / limitations
 

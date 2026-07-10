@@ -116,20 +116,6 @@ export function tryAcquireLock(params: {
   return true
 }
 
-export function acquireLock(params: {
-  chain: ChainKey
-  wallet: string
-  ids: number[]
-  batch: string
-  op?: LockOp
-  count?: number
-  term?: number
-}): void {
-  const list = readAll()
-  list.push({ ...params, lockedAt: Date.now() })
-  writeAll(list)
-}
-
 export function attachTxHash(batch: string, txHash: string): void {
   const list = readAll()
   list.forEach((l) => {

@@ -11,8 +11,5 @@ export default defineConfig({
   },
   server: {
     port: 5300
-    // Explorer HTML scrape proxy removed: many networks MITM etherscan.io
-    // (TLS altname mismatch → Vite 500 spam). Pending age uses pasted
-    // "Time Last Seen" text or local first-seen instead.
   }
 })
