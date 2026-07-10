@@ -92,6 +92,7 @@ describe('operation gate', () => {
     vi.doMock('../src/core/rpc', () => ({ getReadProvider: () => provider }))
     vi.doMock('../src/core/chainReader', () => ({
       readFee: vi.fn(),
+      readVmuCount: vi.fn(async () => 0),
       readVmuStatuses: vi.fn()
     }))
     vi.doMock('../src/core/localLock', () => ({

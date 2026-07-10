@@ -10,7 +10,7 @@ import {
   DEFAULT_TERM_MAX
 } from '@/config/miner'
 import { writeFactory, warmUpInjected } from './wallet'
-import { readFee, readVmuStatuses } from './chainReader'
+import { readFee, readVmuCount, readVmuStatuses } from './chainReader'
 import { getReadProvider } from './rpc'
 import {
   attachTxHash,
@@ -28,6 +28,11 @@ import {
   getInjectedChainId,
   getInjectedPendingNonce
 } from './eip1193'
+import {
+  uncertainOperationOutcome,
+  verifyOperationOutcome,
+  type OperationOutcome
+} from './postconditions'
 import type { VmuStatus } from './types'
 
 export type OpType =
@@ -45,6 +50,7 @@ export interface TxStepState {
   readyToSign?: boolean
   txHash?: string
   error?: string
+  outcome?: OperationOutcome
 }
 
 export interface TxCallbacks {
@@ -63,7 +69,87 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 
 const ESTIMATE_TIMEOUT_MS = 40_000
 const PROBE_UNITS = 32
-const BLOCK_GAS_CAP = 55_000_000n
+const GAS_RATIO_SCALE = 10_000n
+/** Keep 10% of the latest block gas limit free for block assembly variance. */
+const BLOCK_GAS_SAFETY_BPS = 9_000n
+
+function collectErrorDetails(error: unknown, seen = new Set<unknown>(), depth = 0): string[] {
+  if (error == null || depth > 4 || seen.has(error)) return []
+  if (typeof error === 'string' || typeof error === 'number' || typeof error === 'boolean') {
+    return [String(error)]
+  }
+  if (typeof error !== 'object') return []
+
+  seen.add(error)
+  const value = error as Record<string, unknown>
+  const fields = ['name', 'code', 'message', 'shortMessage', 'reason', 'data', 'error', 'info', 'cause']
+  return fields.flatMap((field) => collectErrorDetails(value[field], seen, depth + 1))
+}
+
+/** Only provider-capacity failures may use a smaller probe estimation. */
+export function isRetryableEstimateError(error: unknown): boolean {
+  const details = collectErrorDetails(error).join(' ')
+
+  // These failures describe transaction semantics, so probing must not hide them.
+  if (
+    /CALL_EXCEPTION|CALL_FAILED|execution reverted|\brevert(?:ed)?\b|insufficient (?:funds|value)|INVALID_ARGUMENT|invalid (?:argument|params?)|intrinsic gas|user (?:rejected|denied)/i.test(
+      details
+    )
+  ) {
+    return false
+  }
+
+  return (
+    /\bTIMEOUT\b|timed? out|deadline exceeded|ETIMEDOUT/i.test(details) ||
+    /response (?:size|body).*?(?:too large|exceed)|payload too large|content length.*?exceed|max(?:imum)? response size|(?:^|\s)413(?:\s|$)/i.test(
+      details
+    ) ||
+    /gas required exceeds allowance|(?:transaction|tx|rpc) gas (?:limit|cap).*?(?:exceed|too high)|gas (?:limit|cap) exceeded|exceeds (?:the )?(?:provider|block) gas (?:limit|cap)/i.test(
+      details
+    )
+  )
+}
+
+function applyGasRatio(gas: bigint, ratio: number): bigint {
+  if (gas < 0n || !Number.isFinite(ratio) || ratio <= 0) {
+    throw new Error('Invalid gas estimate or safety ratio')
+  }
+  const ratioUnits = BigInt(Math.ceil(ratio * Number(GAS_RATIO_SCALE)))
+  return (gas * ratioUnits + GAS_RATIO_SCALE - 1n) / GAS_RATIO_SCALE
+}
+
+/** Estimate the full call, using a fixed-size probe only for explicit provider limits. */
+export async function estimateWithProbe(
+  full: () => Promise<bigint>,
+  probe: () => Promise<bigint>,
+  units: number,
+  ratio: number,
+  probeUnits = PROBE_UNITS
+): Promise<bigint> {
+  try {
+    return applyGasRatio(await full(), ratio)
+  } catch (error) {
+    if (units <= probeUnits || !isRetryableEstimateError(error)) throw error
+  }
+
+  // Let a probe failure propagate unchanged; it may contain useful revert data.
+  const probeGas = await probe()
+  const projected =
+    (probeGas * BigInt(units) + BigInt(probeUnits) - 1n) / BigInt(probeUnits)
+  return applyGasRatio(projected, ratio)
+}
+
+/** Reject unsafe batches against the current block limit; never clip the gas value. */
+export function assertFitsBlockGasLimit(estimatedGas: bigint, blockGasLimit: bigint): bigint {
+  if (blockGasLimit <= 0n) throw new Error('Latest block returned an invalid gas limit')
+  const safeBlockGas = (blockGasLimit * BLOCK_GAS_SAFETY_BPS) / GAS_RATIO_SCALE
+  if (estimatedGas > safeBlockGas) {
+    throw new Error(
+      `BATCH_GAS_LIMIT_EXCEEDED: Estimated gas ${estimatedGas.toLocaleString()} exceeds safe maximum ${safeBlockGas.toLocaleString()} (90% of current block gas limit ${blockGasLimit.toLocaleString()}). Reduce the VMU count.`
+    )
+  }
+  return estimatedGas
+}
 
 function getReadFactory(chain: ChainKey) {
   return new Contract(
@@ -114,18 +200,15 @@ async function estimateGasLimit(params: {
   const units = op === 'GENERAL_MINT' || op === 'CREATE_EMPTY_SLOT' ? count : ids.length
   const valueFor = (u: number) => (feeApplies ? fee * BigInt(u) : undefined)
 
-  try {
-    const est = await withTimeout(
-      buildEstimateCall(readFactory, op, { term, count, ids, from, value: valueFor(units) }),
-      ESTIMATE_TIMEOUT_MS,
-      'Gas estimation'
-    )
-    return BigInt(Math.ceil(Number(est) * ratio))
-  } catch (err) {
-    if (units <= PROBE_UNITS) throw err
-    let probeGas: bigint
-    try {
-      probeGas = await withTimeout(
+  return estimateWithProbe(
+    () =>
+      withTimeout(
+        buildEstimateCall(readFactory, op, { term, count, ids, from, value: valueFor(units) }),
+        ESTIMATE_TIMEOUT_MS,
+        'Gas estimation'
+      ),
+    () =>
+      withTimeout(
         buildEstimateCall(readFactory, op, {
           term,
           count: PROBE_UNITS,
@@ -135,14 +218,10 @@ async function estimateGasLimit(params: {
         }),
         ESTIMATE_TIMEOUT_MS,
         'Gas estimation'
-      )
-    } catch {
-      throw err
-    }
-    const perUnit = Number(probeGas) / PROBE_UNITS
-    const projected = BigInt(Math.ceil(perUnit * units * ratio))
-    return projected < BLOCK_GAS_CAP ? projected : BLOCK_GAS_CAP
-  }
+      ),
+    units,
+    ratio
+  )
 }
 
 interface RunParams {
@@ -158,6 +237,10 @@ function expectedStatus(op: OpType): VmuStatus | null {
   if (op === 'MINT_EMPTY_SLOT') return 'EMPTY'
   if (op === 'CLAIM' || op === 'CLAIM_REUSE') return 'CLAIMABLE'
   return null
+}
+
+function allocatesVmuIds(op: OpType): boolean {
+  return op === 'GENERAL_MINT' || op === 'CREATE_EMPTY_SLOT'
 }
 
 function validateParams(params: {
@@ -264,6 +347,9 @@ export interface PreparedOp {
   nonce: number
   maxFeePerGas: bigint
   maxPriorityFeePerGas: bigint
+
+  /** VMU count immediately before an allocating transaction is sent. */
+  preVmuCount?: number
 }
 
 /**
@@ -329,7 +415,7 @@ export async function prepareOperation(params: RunParams, cb: TxCallbacks = {}):
     // Prefetch nonce + fees from OUR RPC in parallel with gas estimation.
     // MetaMask otherwise fetches these via its own (often slow/broken) endpoint
     // before showing the signature popup — that alone can take 1–2 minutes.
-    const [gasLimit, nonce, feeData] = await Promise.all([
+    const [estimatedGas, nonce, feeData, latestBlock, preVmuCount] = await Promise.all([
       estimateGasLimit({
         readFactory,
         op,
@@ -342,8 +428,12 @@ export async function prepareOperation(params: RunParams, cb: TxCallbacks = {}):
         ratio
       }),
       readProvider.getTransactionCount(wallet, 'pending'),
-      readProvider.getFeeData()
+      readProvider.getFeeData(),
+      readProvider.getBlock('latest'),
+      allocatesVmuIds(op) ? readVmuCount(chain, wallet) : Promise.resolve(undefined)
     ])
+    if (!latestBlock) throw new Error('Latest block is unavailable; cannot validate the gas limit')
+    const gasLimit = assertFitsBlockGasLimit(estimatedGas, latestBlock.gasLimit)
     const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas ?? 1_000_000_000n // 1 gwei fallback
     const maxFeePerGas =
       feeData.maxFeePerGas ?? maxPriorityFeePerGas * 2n + (feeData.gasPrice ?? 0n)
@@ -371,7 +461,8 @@ export async function prepareOperation(params: RunParams, cb: TxCallbacks = {}):
       state,
       nonce,
       maxFeePerGas,
-      maxPriorityFeePerGas
+      maxPriorityFeePerGas,
+      preVmuCount
     }
   } catch (err: any) {
     if (lockIds.length) releaseLock(batch)
@@ -434,11 +525,15 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
           throw new Error('Wallet is on the wrong network. Switch networks and retry.')
         }
 
-        const [walletNonce, rpcNonce, feeData] = await Promise.all([
+        const [walletNonce, rpcNonce, feeData, preVmuCount] = await Promise.all([
           getInjectedPendingNonce(prepared.wallet),
           readProvider.getTransactionCount(prepared.wallet, 'pending'),
-          readProvider.getFeeData()
+          readProvider.getFeeData(),
+          allocatesVmuIds(prepared.op)
+            ? readVmuCount(prepared.chain, prepared.wallet)
+            : Promise.resolve(undefined)
         ])
+        prepared.preVmuCount = preVmuCount
         const nonce = assertNonceAgreement(walletNonce, rpcNonce)
         broadcastNonce = nonce
         const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas ?? 1_000_000_000n
@@ -545,6 +640,13 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
       phase: 'confirmed'
     })
     resolved = true
+    try {
+      state.outcome = await verifyOperationOutcome(prepared)
+    } catch {
+      // The outer receipt is confirmed. A verifier failure only makes the
+      // result uncertain and must not keep the operation or VMU locks pending.
+      state.outcome = uncertainOperationOutcome(prepared)
+    }
     state.confirm = 'done'
     emit()
     return state

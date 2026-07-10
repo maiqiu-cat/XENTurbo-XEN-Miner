@@ -36,6 +36,35 @@ const failed = computed(
 const readyToSign = computed(() => !!props.state?.readyToSign && props.state?.estimate === 'done')
 const waitingWallet = computed(() => props.state?.send === 'process' && !props.state?.txHash)
 
+function formatAffected(ids: number[], count: number): string {
+  if (!count) return '0'
+  if (!ids.length) return `${count} (ids unavailable)`
+  const shown = ids.slice(0, 8)
+  const remaining = count - shown.length
+  return `${count} (VMU${count === 1 ? '' : 's'} ${shown.join(', ')}${remaining > 0 ? `, +${remaining} more` : ''})`
+}
+
+const outcomeMessage = computed(() => {
+  const outcome = props.state?.outcome
+  if (!outcome) return null
+  if (outcome.classification === 'full') {
+    return `Verified full result: ${outcome.matchingCount}/${outcome.expectedCount} VMUs are ${outcome.expectedStatus}.`
+  }
+
+  const details = [`${outcome.matchingCount}/${outcome.expectedCount} matched`]
+  if (outcome.unexpectedCount) {
+    details.push(`unexpected ${formatAffected(outcome.unexpectedIds, outcome.unexpectedCount)}`)
+  }
+  if (outcome.readErrorCount) {
+    details.push(`read failed for ${formatAffected(outcome.readErrorIds, outcome.readErrorCount)}`)
+  }
+  const prefix =
+    outcome.classification === 'partial'
+      ? 'Confirmed with partial result'
+      : 'Confirmed, result uncertain'
+  return `${prefix}: ${details.join('; ')}.`
+})
+
 function dismiss(): void {
   if (readyToSign.value) emit('cancel')
   else emit('close')
@@ -80,7 +109,14 @@ function icon(status: string): string {
         Waiting for MetaMask… If no popup after ~10s, click the MetaMask extension icon (it may be simulating in the background).
       </p>
       <p v-if="state?.error" class="err-text">{{ state.error }}</p>
-      <p v-if="done" class="ok-text">Transaction confirmed.</p>
+      <p
+        v-if="done && outcomeMessage"
+        class="outcome-text"
+        :class="state?.outcome?.classification"
+      >
+        {{ outcomeMessage }}
+      </p>
+      <p v-else-if="done" class="ok-text">Transaction confirmed.</p>
 
       <div class="row" style="margin-top: 14px">
         <a v-if="explorerTxUrl" :href="explorerTxUrl" target="_blank" rel="noreferrer">View on explorer</a>
@@ -142,5 +178,14 @@ function icon(status: string): string {
 .ok-text {
   color: var(--accent);
   margin-top: 14px;
+}
+.outcome-text {
+  color: var(--accent);
+  margin-top: 14px;
+  line-height: 1.45;
+}
+.outcome-text.partial,
+.outcome-text.uncertain {
+  color: var(--warn);
 }
 </style>

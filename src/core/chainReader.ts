@@ -98,7 +98,7 @@ function decodeUserMint(
   }
 }
 
-/** Re-read a small set of VMU ids (used to retry READ_ERROR entries). */
+/** Re-read selected VMU ids in bounded multicall batches. */
 async function readVmuIds(chain: ChainKey, wallet: string, ids: number[]): Promise<Vmu[]> {
   if (!ids.length) return []
   const provider = getReadProvider(chain)
@@ -108,16 +108,27 @@ async function readVmuIds(chain: ChainKey, wallet: string, ids: number[]): Promi
     id,
     address: computeProxyAddress({ factory, vmuTemplate, wallet, vmuId: id })
   }))
-  const calls = proxies.map((p) => ({
-    target: xenCrypto,
-    allowFailure: true,
-    callData: xenIface.encodeFunctionData('userMints', [p.address])
-  }))
-  const results = (await withRetry(() => multicall.aggregate3(calls))) as {
-    success: boolean
-    returnData: string
-  }[]
-  return proxies.map((p, i) => decodeUserMint(p.id, p.address, results[i]))
+  const vmus: Vmu[] = []
+  for (let start = 0; start < proxies.length; start += BATCH_SIZE) {
+    const slice = proxies.slice(start, start + BATCH_SIZE)
+    const calls = slice.map((proxy) => ({
+      target: xenCrypto,
+      allowFailure: true,
+      callData: xenIface.encodeFunctionData('userMints', [proxy.address])
+    }))
+    try {
+      const results = (await withRetry(() => multicall.aggregate3(calls))) as {
+        success: boolean
+        returnData: string
+      }[]
+      slice.forEach((proxy, index) => {
+        vmus.push(decodeUserMint(proxy.id, proxy.address, results[index]))
+      })
+    } catch {
+      slice.forEach((proxy) => vmus.push(emptyVmu(proxy.id, proxy.address, false)))
+    }
+  }
+  return vmus
 }
 
 /**
@@ -193,7 +204,8 @@ export async function readWalletVmus(
 
 /**
  * Re-read specific VMU ids and return a map id -> status.
- * Used to validate selected ids right before sending a transaction.
+ * Used both before a send and after a receipt; retry failed entries once so a
+ * transient multicall miss does not immediately make an outcome uncertain.
  */
 export async function readVmuStatuses(
   chain: ChainKey,
@@ -201,5 +213,17 @@ export async function readVmuStatuses(
   ids: number[]
 ): Promise<Map<number, VmuStatus>> {
   const list = await readVmuIds(chain, wallet, ids)
+  const failedIds = list.filter((vmu) => !vmu.readOk).map((vmu) => vmu.id)
+  if (failedIds.length) {
+    try {
+      const retried = await readVmuIds(chain, wallet, failedIds)
+      const byId = new Map(retried.map((vmu) => [vmu.id, vmu]))
+      for (let index = 0; index < list.length; index++) {
+        list[index] = byId.get(list[index].id) ?? list[index]
+      }
+    } catch {
+      // Preserve the first READ_ERROR markers for the caller to classify.
+    }
+  }
   return new Map(list.map((v) => [v.id, v.status]))
 }
