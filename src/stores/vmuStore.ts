@@ -12,6 +12,8 @@ interface State {
   vmuCount: number
   vmus: Vmu[]
   globalRank: number
+  rankAvailable: boolean
+  rankError: string | null
   syncedAt: number | null
   loading: boolean
   progress: { loaded: number; total: number }
@@ -39,6 +41,8 @@ export const useVmuStore = defineStore('vmu', {
     vmuCount: 0,
     vmus: [],
     globalRank: 0,
+    rankAvailable: false,
+    rankError: null,
     syncedAt: null,
     loading: false,
     progress: { loaded: 0, total: 0 },
@@ -99,16 +103,18 @@ export const useVmuStore = defineStore('vmu', {
         if (v.rank < g.rank) g.rank = v.rank
       }
       const list = Array.from(map.values())
-      for (const g of list) {
-        g.estXen = estimateGroupXen({
-          globalRank: state.globalRank,
-          startRank: g.rank,
-          count: g.count,
-          term: g.term,
-          amplifier: g.amplifier,
-          eaaRate: g.eaaRate,
-          maturityMs: g.maturityTs
-        })
+      if (state.rankAvailable) {
+        for (const g of list) {
+          g.estXen = estimateGroupXen({
+            globalRank: state.globalRank,
+            startRank: g.rank,
+            count: g.count,
+            term: g.term,
+            amplifier: g.amplifier,
+            eaaRate: g.eaaRate,
+            maturityMs: g.maturityTs
+          })
+        }
       }
       return list.sort((a, b) => b.maturityTs - a.maturityTs)
     },
@@ -125,25 +131,42 @@ export const useVmuStore = defineStore('vmu', {
     reset() {
       this.vmuCount = 0
       this.vmus = []
+      this.globalRank = 0
+      this.rankAvailable = false
+      this.rankError = null
       this.syncedAt = null
+      this.loading = false
       this.progress = { loaded: 0, total: 0 }
       this.error = null
       this.readErrors = 0
     },
 
+    detach() {
+      this.refreshGen += 1
+      this.chain = null
+      this.wallet = null
+      this.reset()
+    },
+
     /** Load cached snapshot instantly, then refresh from chain in the background. */
     async load(chain: ChainKey, wallet: string) {
+      const gen = ++this.refreshGen
       this.chain = chain
       this.wallet = wallet
       this.reset()
 
+      const isCurrent = () =>
+        gen === this.refreshGen && this.chain === chain && this.wallet === wallet
+
       const cached = await loadSnapshot(chain, wallet)
-      if (cached && this.chain === chain && this.wallet === wallet) {
+      if (!isCurrent()) return
+      if (cached) {
         this.vmuCount = cached.vmuCount
         this.vmus = cached.vmus.map(normalizeVmu)
         this.syncedAt = cached.syncedAt
         this.readErrors = this.vmus.filter((v) => !v.readOk || v.status === 'READ_ERROR').length
       }
+      if (!isCurrent()) return
       await this.refresh()
     },
 
@@ -153,25 +176,41 @@ export const useVmuStore = defineStore('vmu', {
       const chain = this.chain
       const wallet = this.wallet
       const gen = ++this.refreshGen
+      const isCurrent = () =>
+        gen === this.refreshGen && this.chain === chain && this.wallet === wallet
       this.loading = true
       this.error = null
+      this.globalRank = 0
+      this.rankAvailable = false
+      this.rankError = null
       try {
-        const [count, gRank] = await Promise.all([
+        const [count, rankResult] = await Promise.all([
           readVmuCount(chain, wallet),
-          readGlobalRank(chain).catch(() => this.globalRank)
+          readGlobalRank(chain).then(
+            (rank) => ({ ok: true as const, rank }),
+            (error: unknown) => ({ ok: false as const, error })
+          )
         ])
         // Abort if wallet/chain changed while we were reading.
-        if (gen !== this.refreshGen || this.chain !== chain || this.wallet !== wallet) return
+        if (!isCurrent()) return
+
+        if (rankResult.ok) {
+          this.globalRank = rankResult.rank
+          this.rankAvailable = true
+        } else {
+          const err = rankResult.error as any
+          this.rankError =
+            err?.shortMessage || err?.message || 'Global rank is unavailable on the active chain'
+        }
 
         const vmus = await readWalletVmus(chain, wallet, {
           vmuCount: count,
           onProgress: (p) => {
-            if (gen === this.refreshGen) this.progress = p
+            if (isCurrent()) this.progress = p
           }
         })
-        if (gen !== this.refreshGen || this.chain !== chain || this.wallet !== wallet) return
+        if (!isCurrent()) return
 
-        this.globalRank = gRank || this.globalRank
         this.vmuCount = count
         this.vmus = vmus
         this.readErrors = vmus.filter((v) => !v.readOk || v.status === 'READ_ERROR').length
@@ -181,16 +220,21 @@ export const useVmuStore = defineStore('vmu', {
         }
         await saveSnapshot({ chain, wallet, vmuCount: count, vmus, syncedAt: this.syncedAt })
       } catch (err: any) {
-        if (gen !== this.refreshGen) return
+        if (!isCurrent()) return
         this.error = err?.shortMessage || err?.message || 'Failed to read chain'
       } finally {
-        if (gen === this.refreshGen) this.loading = false
+        if (isCurrent()) this.loading = false
       }
     },
 
     async hardRefresh() {
-      if (this.chain && this.wallet) await clearSnapshot(this.chain, this.wallet)
+      if (!this.chain || !this.wallet) return
+      const chain = this.chain
+      const wallet = this.wallet
+      const gen = ++this.refreshGen
       this.reset()
+      await clearSnapshot(chain, wallet)
+      if (gen !== this.refreshGen || this.chain !== chain || this.wallet !== wallet) return
       await this.refresh()
     }
   }

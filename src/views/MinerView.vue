@@ -122,7 +122,7 @@ watch(
         .catch(() => {})
       void checkPending()
     } else {
-      store.reset()
+      store.detach()
     }
   },
   { immediate: true }

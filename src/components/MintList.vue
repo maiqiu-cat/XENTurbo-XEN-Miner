@@ -113,6 +113,9 @@ function doClaimReuse() {
     </div>
 
     <p v-if="store.error" class="err-banner">{{ store.error }}</p>
+    <p v-if="store.rankError" class="rank-banner">
+      Global rank unavailable. Reward estimates are disabled until the next successful refresh.
+    </p>
 
     <div class="row" style="margin: 14px 0">
       <button class="btn" :class="{ 'btn-primary': filter === 'ALL' }" @click="filter = 'ALL'">All</button>
@@ -162,7 +165,7 @@ function doClaimReuse() {
             {{ formatDate(g.maturityTs) }}
             <span class="dim">({{ countdownTo(g.maturityTs) }})</span>
           </td>
-          <td class="mono">{{ thousands(g.estXen ?? 0) }}</td>
+          <td class="mono">{{ g.estXen === undefined ? 'Unavailable' : thousands(g.estXen) }}</td>
         </tr>
       </tbody>
     </table>
@@ -225,6 +228,11 @@ function doClaimReuse() {
   border: 1px solid var(--danger);
   border-radius: 8px;
   color: var(--danger);
+  font-size: 13px;
+}
+.rank-banner {
+  margin: 12px 0 0;
+  color: var(--warn);
   font-size: 13px;
 }
 .tbl {

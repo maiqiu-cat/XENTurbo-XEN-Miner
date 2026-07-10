@@ -19,6 +19,8 @@ interface State {
   /** True while waiting for the wallet to approve / finish a chain switch. */
   switchingChain: boolean
   switchError: string | null
+  /** Monotonic token that invalidates wallet-scoped asynchronous work. */
+  contextGen: number
 }
 
 /**
@@ -40,7 +42,8 @@ export const useWalletStore = defineStore('wallet', {
     ready: false,
     connectError: null,
     switchingChain: false,
-    switchError: null
+    switchError: null,
+    contextGen: 0
   }),
   getters: {
     isConnected: (s): boolean => !!s.address,
@@ -61,29 +64,36 @@ export const useWalletStore = defineStore('wallet', {
     },
 
     async applyAccount(address?: string, chainId?: number) {
+      const gen = ++this.contextGen
       this.address = address ?? null
       this.chainId = chainId ?? null
       this.isContractWallet = false
+      this.switchingChain = false
       this.switchError = null
       if (address && chainId) {
-        await this.detectContractWallet(address, chainId)
+        await this.detectContractWallet(address, chainId, gen)
       }
     },
 
     // The factory enforces tx.origin == msg.sender (ONLY_EOA); smart-contract
     // wallets cannot use it, so detect and warn. Read code via OUR reliable RPC
     // (not the wallet RPC, which may be broken and cause false positives).
-    async detectContractWallet(_address: string, chainId: number) {
+    async detectContractWallet(_address: string, chainId: number, requestedGen?: number) {
+      const gen = requestedGen ?? this.contextGen
+      const isCurrent = () =>
+        gen === this.contextGen &&
+        this.address?.toLowerCase() === _address.toLowerCase() &&
+        this.chainId === chainId
       const key = chainIdToKey[chainId]
       if (!key) {
-        this.isContractWallet = false
+        if (isCurrent()) this.isContractWallet = false
         return
       }
       try {
         const code = await getReadProvider(key).getCode(_address)
-        this.isContractWallet = isContractCode(code)
+        if (isCurrent()) this.isContractWallet = isContractCode(code)
       } catch {
-        this.isContractWallet = false
+        if (isCurrent()) this.isContractWallet = false
       }
     },
 
@@ -103,18 +113,25 @@ export const useWalletStore = defineStore('wallet', {
 
     async switchChain(key: ChainKey) {
       if (this.chainKey === key || this.switchingChain) return
+      const gen = this.contextGen
+      const address = this.address
+      const chainId = this.chainId
+      const isCurrent = () =>
+        gen === this.contextGen && this.address === address && this.chainId === chainId
       this.switchError = null
       this.switchingChain = true
       try {
         await switchToChain(key)
       } catch (err: any) {
-        const msg: string = err?.shortMessage || err?.message || String(err)
-        this.switchError = /rejected|denied|cancel/i.test(msg)
-          ? 'Chain switch rejected in wallet.'
-          : msg
+        if (isCurrent()) {
+          const msg: string = err?.shortMessage || err?.message || String(err)
+          this.switchError = /rejected|denied|cancel/i.test(msg)
+            ? 'Chain switch rejected in wallet.'
+            : msg
+        }
         throw err
       } finally {
-        this.switchingChain = false
+        if (isCurrent()) this.switchingChain = false
       }
     },
 
