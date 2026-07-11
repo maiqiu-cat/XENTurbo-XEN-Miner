@@ -221,7 +221,9 @@ test('production preview renders in desktop Chrome without console errors and se
   expect(headers['content-security-policy']).toContain("default-src 'self'")
   expect(headers['content-security-policy']).toContain("script-src 'self'")
   expect(headers['content-security-policy']).toContain("style-src 'self' 'unsafe-inline'")
-  expect(headers['content-security-policy']).toContain("img-src 'self' data:")
+  expect(headers['content-security-policy']).toContain(
+    "img-src 'self' data: chrome-extension:"
+  )
   expect(headers['content-security-policy']).toContain("font-src 'self'")
   expect(headers['content-security-policy']).toContain("object-src 'none'")
   expect(headers['content-security-policy']).toContain("base-uri 'self'")

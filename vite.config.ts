@@ -1,26 +1,7 @@
 import { fileURLToPath, URL } from 'node:url'
 import { defineConfig } from 'vitest/config'
 import vue from '@vitejs/plugin-vue'
-
-function contentSecurityPolicy(includeDevWebSockets = false): string {
-  const connectSources = ["'self'", 'https:']
-  if (includeDevWebSockets) connectSources.push('ws://127.0.0.1:*', 'ws://localhost:*')
-
-  return [
-    "default-src 'self'",
-    "script-src 'self'",
-    "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data:",
-    "font-src 'self'",
-    `connect-src ${connectSources.join(' ')}`,
-    "object-src 'none'",
-    "base-uri 'self'",
-    "frame-ancestors 'none'",
-    "form-action 'self'",
-    "manifest-src 'self'",
-    "worker-src 'self' blob:"
-  ].join('; ')
-}
+import { contentSecurityPolicy } from './src/config/security'
 
 const securityHeaders = {
   'Content-Security-Policy': contentSecurityPolicy(),
