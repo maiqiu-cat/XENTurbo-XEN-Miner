@@ -4,8 +4,8 @@ import { pathToFileURL } from 'node:url'
 import { gzipSync } from 'node:zlib'
 
 const KIB = 1024
-export const MAX_CHUNK_GZIP_BYTES = 400 * KIB
-export const MAX_TOTAL_GZIP_BYTES = 550 * KIB
+export const MAX_CHUNK_GZIP_BYTES = 180 * KIB
+export const MAX_TOTAL_GZIP_BYTES = 220 * KIB
 
 async function listJavaScriptFiles(directory) {
   const entries = await readdir(directory, { withFileTypes: true })
@@ -63,7 +63,9 @@ async function main() {
   const measurements = await measureJavaScriptBundles()
   console.log('JavaScript bundle measurements:')
   for (const item of measurements) {
-    console.log(`- ${item.path}: ${formatKiB(item.gzipBytes)} (${(item.rawBytes / KIB).toFixed(2)} KiB raw)`)
+    console.log(
+      `- ${item.path}: ${formatKiB(item.gzipBytes)} (${(item.rawBytes / KIB).toFixed(2)} KiB raw)`
+    )
   }
 
   const result = evaluateBundleBudget(measurements)

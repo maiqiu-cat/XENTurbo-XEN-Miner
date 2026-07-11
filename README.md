@@ -9,15 +9,15 @@ so the app is a single static site you can host anywhere.
 The original platform used a Java service + MySQL to store VMU proxy addresses,
 per-VMU mint state, and locks. All of that is reconstructible from the chain:
 
-| Original backend responsibility | Replacement here |
-| --- | --- |
-| VMU proxy addresses (`xm_wallet_proxy_contract`) | Computed locally via CREATE2 (`src/core/create2.ts`) |
-| VMU count (`xm_wallet.vmu_count`) | `factory.vmuCount(wallet)` |
-| Per-VMU rank/term/maturity | `XENCrypto.userMints(proxy)`, batched via Multicall3 |
-| Mint-list grouping | Grouped client-side by `(term, maturityTs)` |
-| VMU concurrency lock (`xm_vmu_lock`) | Best-effort `localStorage` lock + re-read before send |
-| Pending-tx monitor (Puppeteer scraper) | Session tx tracking + resume-on-reload |
-| Cache | Browser IndexedDB (safe to clear anytime) |
+| Original backend responsibility                  | Replacement here                                      |
+| ------------------------------------------------ | ----------------------------------------------------- |
+| VMU proxy addresses (`xm_wallet_proxy_contract`) | Computed locally via CREATE2 (`src/core/create2.ts`)  |
+| VMU count (`xm_wallet.vmu_count`)                | `factory.vmuCount(wallet)`                            |
+| Per-VMU rank/term/maturity                       | `XENCrypto.userMints(proxy)`, batched via Multicall3  |
+| Mint-list grouping                               | Grouped client-side by `(term, maturityTs)`           |
+| VMU concurrency lock (`xm_vmu_lock`)             | Best-effort `localStorage` lock + re-read before send |
+| Pending-tx monitor (Puppeteer scraper)           | Session tx tracking + resume-on-reload                |
+| Cache                                            | Browser IndexedDB (safe to clear anytime)             |
 
 The miner contract (`XENFactoryUpgradeable`) is reused as-is; users' wallets call
 it directly. The app never holds keys or sends transactions on the user's behalf.
@@ -74,11 +74,20 @@ npm run dev
 - `npm run dev` - dev server
 - `npm run build` - typecheck + production build
 - `npm run test` - unit and wallet integration tests
+- `npm run test:coverage` - run tests with the release coverage threshold gate
 - `npm run test:e2e` - build and run the production-preview Playwright suite
 - `npm run typecheck` - TypeScript and Vue type checking
+- `npm run lint` - ESLint checks for Vue and TypeScript
+- `npm run format:check` - Prettier formatting check
 - `npm run check:bundle` - enforce gzip bundle budgets against `dist/`
+- `npm run check:rpc-health` - check every script-configured default RPC for HTTPS, chain ID, and factory `FEE()`
 - `npm run verify` - run unit, type, build, bundle, audit, and browser release gates
-- `npm run verify:create2 [wallet] [rpcUrl]` - verify derivation against live chain
+- `npm run verify:create2 -- --chain eth --wallet 0x...` - verify derivation against the selected live chain
+
+`verify:create2` requires an explicit witness address for the selected chain: pass
+`--wallet 0x...`, or set `CREATE2_WITNESS_ETH` / `CREATE2_WITNESS_POLYGON`. It scans
+successive VMU batches until it finds an active derived proxy. Use `--rpc https://...`
+to override the script's default RPC for the selected chain.
 
 ## Security headers
 
@@ -92,8 +101,8 @@ allows same-origin requests and HTTPS RPC endpoints, including user-configured R
 Before removing the unused WalletConnect/Web3Modal/Wagmi stack, the main application
 bundle measured **674.61 KiB gzip**. The enforced production budgets are:
 
-- largest JavaScript chunk: at most **400 KiB gzip**
-- all JavaScript files in `dist/`: at most **550 KiB gzip**
+- largest JavaScript chunk: at most **180 KiB gzip**
+- all JavaScript files in `dist/`: at most **220 KiB gzip**
 
 Run `npm run build && npm run check:bundle` before publishing. The check prints every
 measured JavaScript chunk and exits non-zero when either limit is exceeded.

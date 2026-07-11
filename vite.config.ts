@@ -30,6 +30,24 @@ export default defineConfig({
     headers: securityHeaders
   },
   test: {
-    include: ['tests/**/*.test.ts']
+    include: ['tests/**/*.test.ts'],
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'json', 'html'],
+      thresholds: {
+        lines: 75,
+        functions: 75,
+        statements: 75,
+        branches: 65,
+        'src/core/txManager.ts': {
+          lines: 85,
+          branches: 75
+        },
+        'src/core/pendingOps.ts': {
+          lines: 85,
+          branches: 75
+        }
+      }
+    }
   }
 })

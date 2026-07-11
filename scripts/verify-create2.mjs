@@ -1,88 +1,118 @@
-// Verifies the local CREATE2 derivation against real on-chain state.
-//
-// Strategy: pick a wallet that has minted, read factory.vmuCount(wallet), then
-// for id in [1..min(vmuCount, N)] compute the proxy address locally and read
-// XENCrypto.userMints(proxy). If the derivation is correct, `user` on the mint
-// record equals the proxy address itself (each VMU proxy is its own minter),
-// and rank/term are non-zero for active VMUs.
+// Verifies local CREATE2 proxy derivation against the selected chain's on-chain state.
 //
 // Usage:
-//   node scripts/verify-create2.mjs [wallet] [rpcUrl]
+//   node scripts/verify-create2.mjs --chain eth --wallet 0x... [--rpc https://...]
+//   CREATE2_WITNESS_POLYGON=0x... node scripts/verify-create2.mjs --chain polygon
 
-import {
-  JsonRpcProvider,
-  Contract,
-  concat,
-  getAddress,
-  getCreate2Address,
-  keccak256,
-  solidityPackedKeccak256
-} from 'ethers'
+import { Contract, JsonRpcProvider, getAddress } from 'ethers'
+import { computeProxyAddress } from '../src/core/create2.ts'
+import { getChainConfig } from './chain-config.mjs'
 
-const FACTORY = '0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2'
-const XEN = '0x06450dEe7FD2Fb8E39061434BAbCFC05599a6Fb8'
-const VMU_TEMPLATE = '0x1D65d25b1D90Ef6Dd9F64b10d6B079a015085855'
-
-const PROXY_PREFIX = '0x3d602d80600a3d3981f3363d3d373d3d3d363d73'
-const PROXY_SUFFIX = '0x5af43d82803e903d91602b57fd5bf3'
-
-const wallet = getAddress(process.argv[2] || '0x50d30cdae2ec9384eb890e0906e54f709cc02c16')
-const rpcUrl = process.argv[3] || 'https://ethereum-rpc.publicnode.com'
-
-function computeProxyAddress(id) {
-  const initHash = keccak256(concat([PROXY_PREFIX, getAddress(VMU_TEMPLATE), PROXY_SUFFIX]))
-  const salt = solidityPackedKeccak256(['address', 'uint256'], [wallet, id])
-  return getCreate2Address(getAddress(FACTORY), salt, initHash)
-}
-
+const SCAN_BATCH_SIZE = 5
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
 const factoryAbi = ['function vmuCount(address) view returns (uint256)']
 const xenAbi = [
   'function userMints(address) view returns (address user, uint256 term, uint256 maturityTs, uint256 rank, uint256 amplifier, uint256 eaaRate)'
 ]
 
-async function main() {
-  const provider = new JsonRpcProvider(rpcUrl)
-  const factory = new Contract(FACTORY, factoryAbi, provider)
-  const xen = new Contract(XEN, xenAbi, provider)
+export function parseVerificationArgs(argv, env = process.env) {
+  let chain
+  let rpcUrl
+  let wallet
 
-  const vmuCount = Number(await factory.vmuCount(wallet))
-  console.log(`wallet=${wallet}`)
-  console.log(`vmuCount=${vmuCount}`)
-  console.log(`initCodeHash=${keccak256(concat([PROXY_PREFIX, getAddress(VMU_TEMPLATE), PROXY_SUFFIX]))}`)
-
-  if (vmuCount === 0) {
-    console.log('NOT_VERIFIED: wallet has no VMUs; pass a wallet that has minted as the first arg.')
-    process.exitCode = 2
-    return
+  for (let index = 0; index < argv.length; index += 1) {
+    const value = argv[index]
+    if (value === '--chain') chain = argv[++index]
+    else if (value === '--wallet') wallet = argv[++index]
+    else if (value === '--rpc') rpcUrl = argv[++index]
+    else
+      throw new Error(
+        `Unknown argument ${JSON.stringify(value)}. Use --chain, --wallet, and --rpc.`
+      )
   }
 
-  const n = Math.min(vmuCount, 5)
-  let ok = 0
-  for (let id = 1; id <= n; id++) {
-    const proxy = computeProxyAddress(id)
-    const m = await xen.userMints(proxy)
-    const hasRecord = m.user !== '0x0000000000000000000000000000000000000000'
-    const active = hasRecord && m.rank > 0n && m.term > 0n
-    console.log(
-      `id=${id} proxy=${proxy} user=${m.user} rank=${m.rank} term=${m.term} maturityTs=${m.maturityTs} ${
-        active ? 'ACTIVE' : 'empty/claimed/inactive'
-      }`
+  if (!chain) throw new Error('CHAIN_REQUIRED: pass --chain eth or --chain polygon.')
+  const config = getChainConfig(chain)
+  const witnessVariable = `CREATE2_WITNESS_${config.key.toUpperCase()}`
+  const witness = wallet ?? env[witnessVariable]
+  if (!witness) {
+    throw new Error(
+      `WITNESS_REQUIRED: pass --wallet for ${config.key} or set ${witnessVariable}; no default wallet is used.`
     )
-    // The strongest correctness signal: the recorded minter equals the proxy.
-    if (active && getAddress(m.user) === getAddress(proxy)) ok++
   }
-  console.log(`\n${ok}/${n} active VMUs confirm the derived proxy is the on-chain minter.`)
-  if (ok > 0) {
-    console.log('CREATE2 derivation VERIFIED against on-chain data.')
-  } else {
-    console.log(
-      'NOT_VERIFIED: no sampled active VMU records the derived proxy as its on-chain minter. Try another wallet.'
-    )
-    process.exitCode = 2
-  }
+
+  return { config, rpcUrl: rpcUrl ?? config.rpcUrls[0], wallet: getAddress(witness) }
 }
 
-main().catch((e) => {
-  console.error(e)
-  process.exit(1)
-})
+export async function verifyCreate2({ config, provider, wallet, log = console.log }) {
+  const network = await provider.getNetwork()
+  if (network.chainId !== BigInt(config.chainId)) {
+    throw new Error(
+      `CHAIN_ID_MISMATCH: selected ${config.key} expects ${config.chainId}, RPC returned ${network.chainId}.`
+    )
+  }
+
+  const factory = new Contract(config.factory, factoryAbi, provider)
+  const xen = new Contract(config.xenCrypto, xenAbi, provider)
+  const vmuCount = await factory.vmuCount(wallet)
+  log(`chain=${config.key} chainId=${config.chainId}`)
+  log(`wallet=${wallet}`)
+  log(`vmuCount=${vmuCount}`)
+
+  if (vmuCount === 0n) {
+    log('NOT_VERIFIED: wallet has no VMUs.')
+    return false
+  }
+
+  for (let fromId = 1n; fromId <= vmuCount; fromId += BigInt(SCAN_BATCH_SIZE)) {
+    const toId =
+      fromId + BigInt(SCAN_BATCH_SIZE - 1) > vmuCount
+        ? vmuCount
+        : fromId + BigInt(SCAN_BATCH_SIZE - 1)
+    log(`batch=${fromId}-${toId}`)
+
+    const records = await Promise.all(
+      Array.from({ length: Number(toId - fromId + 1n) }, async (_, offset) => {
+        const id = fromId + BigInt(offset)
+        const proxy = computeProxyAddress({
+          factory: config.factory,
+          vmuTemplate: config.vmuTemplate,
+          wallet,
+          vmuId: id
+        })
+        const mint = await xen.userMints(proxy)
+        return { id, mint, proxy }
+      })
+    )
+
+    for (const { id, mint, proxy } of records) {
+      const active = mint.user !== ZERO_ADDRESS && mint.rank > 0n && mint.term > 0n
+      log(
+        `id=${id} proxy=${proxy} user=${mint.user} rank=${mint.rank} term=${mint.term} maturityTs=${mint.maturityTs} ${
+          active ? 'ACTIVE' : 'empty/claimed/inactive'
+        }`
+      )
+      if (active && getAddress(mint.user) === getAddress(proxy)) {
+        log('CREATE2 derivation VERIFIED against on-chain data.')
+        return true
+      }
+    }
+  }
+
+  log('NOT_VERIFIED: no active VMU records a derived proxy as its on-chain minter.')
+  return false
+}
+
+async function main() {
+  const { config, rpcUrl, wallet } = parseVerificationArgs(process.argv.slice(2))
+  const provider = new JsonRpcProvider(rpcUrl)
+  const verified = await verifyCreate2({ config, provider, wallet })
+  if (!verified) process.exitCode = 2
+}
+
+if (import.meta.url === new URL(process.argv[1], 'file:').href) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error))
+    process.exitCode = 1
+  })
+}
