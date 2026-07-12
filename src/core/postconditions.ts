@@ -7,6 +7,7 @@ import {
 } from './chainReader'
 import type { OpType } from './txManager'
 import type { VmuStatus } from './types'
+import { ensureHealthyReadProvider } from './rpc'
 
 type ExpectedVmuStatus = Exclude<VmuStatus, 'READ_ERROR' | 'CLAIMABLE'> | 'MINTING'
 
@@ -36,11 +37,7 @@ export interface OperationOutcome {
 }
 
 interface VerifyOutcomeDependencies {
-  readStatuses?: (
-    chain: ChainKey,
-    wallet: string,
-    ids: number[]
-  ) => Promise<Map<number, VmuStatus>>
+  readStatuses?: (chain: ChainKey, wallet: string, ids: number[]) => Promise<Map<number, VmuStatus>>
   readProxyDeployments?: (
     chain: ChainKey,
     wallet: string,
@@ -70,13 +67,13 @@ function expectedIdsFor(prepared: OutcomeOperation): number[] {
     throw new Error('POSTCONDITION_INPUT_MISSING: pre-operation VMU count is required')
   }
 
-  return Array.from(
-    { length: prepared.count },
-    (_, index) => prepared.preVmuCount! + index + 1
-  )
+  return Array.from({ length: prepared.count }, (_, index) => prepared.preVmuCount! + index + 1)
 }
 
-function uncertainReadResult(expectedStatus: ExpectedVmuStatus, expectedIds: number[]): OperationOutcome {
+function uncertainReadResult(
+  expectedStatus: ExpectedVmuStatus,
+  expectedIds: number[]
+): OperationOutcome {
   return {
     classification: 'uncertain',
     expectedStatus,
@@ -201,4 +198,43 @@ export async function verifyOperationOutcome(
     readErrorCount: readErrorIds.length,
     readErrorIds
   }
+}
+
+const POSTCONDITION_RETRY_DELAYS_MS = [500, 1_500, 3_000] as const
+
+/** Retry latest-state reads after a receipt so lagging RPCs do not create false partial results. */
+export async function verifyOperationOutcomeWithRetry(
+  prepared: OutcomeOperation,
+  options: {
+    verify?: (operation: OutcomeOperation) => Promise<OperationOutcome>
+    sleep?: (delayMs: number) => Promise<void>
+  } = {}
+): Promise<OperationOutcome> {
+  const verify = options.verify ?? ((operation) => verifyOperationOutcome(operation))
+  const sleep =
+    options.sleep ?? ((delayMs) => new Promise<void>((resolve) => setTimeout(resolve, delayMs)))
+
+  const verifyWithHealthyRpc = async (): Promise<OperationOutcome> => {
+    await ensureHealthyReadProvider(prepared.chain)
+    return verify(prepared)
+  }
+
+  let result: OperationOutcome
+  try {
+    result = await verifyWithHealthyRpc()
+  } catch {
+    result = uncertainOperationOutcome(prepared)
+  }
+  if (result.classification === 'full') return result
+
+  for (const delayMs of POSTCONDITION_RETRY_DELAYS_MS) {
+    await sleep(delayMs)
+    try {
+      result = await verifyWithHealthyRpc()
+    } catch {
+      result = uncertainOperationOutcome(prepared)
+    }
+    if (result.classification === 'full') return result
+  }
+  return result
 }

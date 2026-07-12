@@ -1,6 +1,6 @@
 import { ref, watch, onMounted, onUnmounted, type Ref } from 'vue'
 import { formatUnits } from 'ethers'
-import { getReadProvider } from '@/core/rpc'
+import { ensureHealthyReadProvider } from '@/core/rpc'
 import type { ChainKey } from '@/config/chains'
 
 // Reads native gas price directly from RPC (no platform price API).
@@ -21,7 +21,8 @@ export function useGasPrice(getChain: () => ChainKey | null) {
     }
     loading.value = true
     try {
-      const fee = await getReadProvider(chain).getFeeData()
+      const provider = await ensureHealthyReadProvider(chain)
+      const fee = await provider.getFeeData()
       if (seq !== reqSeq || getChain() !== chain) return
       const price = fee.gasPrice ?? fee.maxFeePerGas
       gwei.value = price ? formatGwei(Number(formatUnits(price, 'gwei'))) : '--'

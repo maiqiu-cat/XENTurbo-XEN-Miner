@@ -1,6 +1,8 @@
 .worktrees/
 coverage/
 dist/
+docs/
 node_modules/
+src/abis/
 playwright-report/
 test-results/

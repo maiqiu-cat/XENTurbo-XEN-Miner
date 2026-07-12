@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onScopeDispose, ref, watch } from 'vue'
 import { useVmuStore } from '@/stores/vmuStore'
 import { useWalletStore } from '@/stores/walletStore'
 import type { VmuGroup } from '@/core/types'
@@ -20,6 +20,11 @@ const store = useVmuStore()
 const wallet = useWalletStore()
 type Filter = 'ALL' | 'CLAIMABLE' | 'MINTING'
 const filter = ref<Filter>('ALL')
+const now = ref(Date.now())
+const clock = setInterval(() => {
+  now.value = Date.now()
+}, 30_000)
+onScopeDispose(() => clearInterval(clock))
 
 /** Term used for the next Claim & Re-Mint — edited next to the action button. */
 const reuseTerm = ref(DEFAULT_TERM)
@@ -86,6 +91,11 @@ function clearSel() {
   selected.value = new Set()
 }
 
+watch(
+  [() => wallet.address, () => wallet.chainKey, () => wallet.contextGen, () => store.syncedAt],
+  clearSel
+)
+
 function doClaim() {
   if (overClaim.value) return
   emit('claim', selectedIds.value)
@@ -106,7 +116,11 @@ function doClaimReuse() {
         <span class="tag tag-blue">Maturing {{ store.counts.MINTING }}</span>
         <span class="tag tag-green">Claimable {{ store.counts.CLAIMABLE }}</span>
         <span v-if="store.readErrors" class="tag tag-warn">Read err {{ store.readErrors }}</span>
-        <button class="btn btn-ghost" :disabled="props.busy || store.loading" @click="store.hardRefresh()">
+        <button
+          class="btn btn-ghost"
+          :disabled="props.busy || store.loading"
+          @click="store.hardRefresh()"
+        >
           Refresh
         </button>
       </div>
@@ -118,18 +132,30 @@ function doClaimReuse() {
     </p>
 
     <div class="row" style="margin: 14px 0">
-      <button class="btn" :class="{ 'btn-primary': filter === 'ALL' }" @click="filter = 'ALL'">All</button>
-      <button class="btn" :class="{ 'btn-primary': filter === 'CLAIMABLE' }" @click="filter = 'CLAIMABLE'">
+      <button class="btn" :class="{ 'btn-primary': filter === 'ALL' }" @click="filter = 'ALL'">
+        All
+      </button>
+      <button
+        class="btn"
+        :class="{ 'btn-primary': filter === 'CLAIMABLE' }"
+        @click="filter = 'CLAIMABLE'"
+      >
         Claimable
       </button>
-      <button class="btn" :class="{ 'btn-primary': filter === 'MINTING' }" @click="filter = 'MINTING'">
+      <button
+        class="btn"
+        :class="{ 'btn-primary': filter === 'MINTING' }"
+        @click="filter = 'MINTING'"
+      >
         Maturing
       </button>
     </div>
 
     <div v-if="store.loading && !store.vmus.length" class="dim loading-box">
       Reading on-chain state...
-      <span v-if="store.progress.total"> {{ store.progress.loaded }}/{{ store.progress.total }}</span>
+      <span v-if="store.progress.total">
+        {{ store.progress.loaded }}/{{ store.progress.total }}</span
+      >
     </div>
 
     <div v-else-if="!list.length" class="dim loading-box">No VMUs in this category.</div>
@@ -153,7 +179,12 @@ function doClaimReuse() {
           @click="toggle(g)"
         >
           <td>
-            <input v-if="g.status === 'CLAIMABLE'" type="checkbox" :checked="selected.has(g.key)" @click.stop="toggle(g)" />
+            <input
+              v-if="g.status === 'CLAIMABLE'"
+              type="checkbox"
+              :checked="selected.has(g.key)"
+              @click.stop="toggle(g)"
+            />
           </td>
           <td>
             <span v-if="g.status === 'CLAIMABLE'" class="tag tag-green">Claimable</span>
@@ -163,7 +194,7 @@ function doClaimReuse() {
           <td class="mono">{{ g.term }}d</td>
           <td class="mono">
             {{ formatDate(g.maturityTs) }}
-            <span class="dim">({{ countdownTo(g.maturityTs) }})</span>
+            <span class="dim">({{ countdownTo(g.maturityTs, now) }})</span>
           </td>
           <td class="mono">{{ g.estXen === undefined ? 'Unavailable' : thousands(g.estXen) }}</td>
         </tr>
@@ -171,7 +202,10 @@ function doClaimReuse() {
     </table>
 
     <p v-if="list.length" class="dim group-note">
-      {{ list.length }} group{{ list.length > 1 ? 's' : '' }} · {{ vmuTotal }} VMU{{ vmuTotal > 1 ? 's' : '' }} total
+      {{ list.length }} group{{ list.length > 1 ? 's' : '' }} · {{ vmuTotal }} VMU{{
+        vmuTotal > 1 ? 's' : ''
+      }}
+      total
       <span v-if="vmuTotal !== list.length">(rows are grouped by term &amp; maturity)</span>
     </p>
 
@@ -199,6 +233,7 @@ function doClaimReuse() {
             type="number"
             v-model.number="reuseTerm"
             min="1"
+            step="1"
             :max="DEFAULT_TERM_MAX"
             :disabled="props.busy"
             @blur="clampReuseTerm"
@@ -210,8 +245,8 @@ function doClaimReuse() {
         </button>
       </div>
       <p class="dim reuse-hint">
-        Claim only → withdraw XEN and leave slots empty.
-        Claim &amp; Re-Mint → withdraw XEN and start a new {{ reuseTerm }}-day mint on the same VMUs.
+        Claim only → withdraw XEN and leave slots empty. Claim &amp; Re-Mint → withdraw XEN and
+        start a new {{ reuseTerm }}-day mint on the same VMUs.
       </p>
     </div>
   </div>

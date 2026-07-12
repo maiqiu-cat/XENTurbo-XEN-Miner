@@ -188,7 +188,10 @@ describe('injected wallet integration', () => {
 
   it('preserves a rejected connect request', async () => {
     const provider = new MockInjectedProvider()
-    provider.failures.set('eth_requestAccounts', Object.assign(new Error('User rejected'), { code: 4001 }))
+    provider.failures.set(
+      'eth_requestAccounts',
+      Object.assign(new Error('User rejected'), { code: 4001 })
+    )
     installProvider(provider)
     const { smartConnect } = await loadWallet()
 
@@ -233,6 +236,13 @@ describe('injected wallet integration', () => {
     installProvider(provider)
     const { writeFactory } = await loadWallet()
     const abi = ['function bulkClaimRank(uint256 term, uint256 count)']
+    const onRequestStart = vi.fn(() => {
+      expect(
+        provider.request.mock.calls.some(
+          ([request]) => (request as Eip1193Request).method === 'eth_sendTransaction'
+        )
+      ).toBe(false)
+    })
 
     await expect(
       writeFactory({
@@ -246,10 +256,12 @@ describe('injected wallet integration', () => {
         nonce: 9,
         maxFeePerGas: 30n,
         maxPriorityFeePerGas: 4n,
-        expectedFrom: ACCOUNT_A
+        expectedFrom: ACCOUNT_A,
+        onRequestStart
       })
     ).resolves.toBe(TX_HASH)
 
+    expect(onRequestStart).toHaveBeenCalledOnce()
     const data = new Interface(abi).encodeFunctionData('bulkClaimRank', [100n, 2n])
     expect(provider.request).toHaveBeenLastCalledWith({
       method: 'eth_sendTransaction',
@@ -266,5 +278,35 @@ describe('injected wallet integration', () => {
         }
       ]
     })
+  })
+
+  it('reports a synchronous provider throw after the request boundary opens', async () => {
+    const provider = new MockInjectedProvider()
+    provider.request.mockImplementation(({ method }: Eip1193Request) => {
+      if (method === 'eth_accounts') return Promise.resolve([ACCOUNT_A])
+      if (method === 'eth_chainId') return Promise.resolve('0x1')
+      if (method === 'eth_sendTransaction') throw new Error('synchronous provider failure')
+      return Promise.reject(new Error(`Unexpected method: ${method}`))
+    })
+    installProvider(provider)
+    const { writeFactory } = await loadWallet()
+    const onRequestStart = vi.fn()
+    const onRequestSyncError = vi.fn()
+
+    await expect(
+      writeFactory({
+        chainId: 1,
+        address: FACTORY,
+        abi: ['function createVMUs(uint256 count)'],
+        functionName: 'createVMUs',
+        args: [1n],
+        expectedFrom: ACCOUNT_A,
+        onRequestStart,
+        onRequestSyncError
+      })
+    ).rejects.toThrow('synchronous provider failure')
+
+    expect(onRequestStart).toHaveBeenCalledOnce()
+    expect(onRequestSyncError).toHaveBeenCalledOnce()
   })
 })

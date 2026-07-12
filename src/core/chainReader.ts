@@ -4,11 +4,7 @@ import type { ChainKey } from '@/config/chains'
 import { XENFactoryABI } from '@/abis/XENFactoryABI'
 import { XENCryptoABI } from '@/abis/XENCryptoABI'
 import { Multicall3ABI } from '@/abis/Multicall3ABI'
-import {
-  computeProxyAddress,
-  computeProxyAddressRange,
-  minimalProxyRuntimeCode
-} from './create2'
+import { computeProxyAddress, computeProxyAddressRange, minimalProxyRuntimeCode } from './create2'
 import { getReadProvider, withRetry } from './rpc'
 import type { Vmu, VmuStatus } from './types'
 
@@ -28,7 +24,11 @@ export interface ReadProgress {
 /** Read factory.vmuCount(wallet) - the on-chain source of truth for VMU count. */
 export async function readVmuCount(chain: ChainKey, wallet: string): Promise<number> {
   const provider = getReadProvider(chain)
-  const factory = new Contract(CONTRACTS[chain].factory, XENFactoryABI as unknown as any[], provider)
+  const factory = new Contract(
+    CONTRACTS[chain].factory,
+    XENFactoryABI as unknown as any[],
+    provider
+  )
   const count = await withRetry(() => factory.vmuCount(wallet))
   return Number(count)
 }
@@ -44,15 +44,33 @@ export async function readGlobalRank(chain: ChainKey): Promise<number> {
 /** Read the per-VMU service fee (wei) charged by the factory. */
 export async function readFee(chain: ChainKey): Promise<bigint> {
   const provider = getReadProvider(chain)
-  const factory = new Contract(CONTRACTS[chain].factory, XENFactoryABI as unknown as any[], provider)
+  const factory = new Contract(
+    CONTRACTS[chain].factory,
+    XENFactoryABI as unknown as any[],
+    provider
+  )
   return (await withRetry(() => factory.FEE())) as bigint
 }
 
-function classify(rank: number, maturityMs: number): VmuStatus {
+/** Latest block timestamp is the authoritative clock for maturity decisions. */
+export async function readChainTimestamp(chain: ChainKey): Promise<number> {
+  const block = await withRetry(() => getReadProvider(chain).getBlock('latest'))
+  const timestamp = block?.timestamp
+  if (!Number.isSafeInteger(timestamp) || timestamp! <= 0) {
+    throw new Error('Latest block returned an invalid timestamp')
+  }
+  return timestamp! * 1_000
+}
+
+export function classifyVmuStatus(
+  rank: number,
+  maturityMs: number,
+  chainTimestampMs: number
+): VmuStatus {
   if (rank === 0) return 'EMPTY'
   // Match on-chain: claimable only when block.timestamp > maturityTs.
   // Use +1s buffer so UI does not show Claimable one second early.
-  if (maturityMs + 1000 > Date.now()) return 'MINTING'
+  if (maturityMs + 1_000 > chainTimestampMs) return 'MINTING'
   return 'CLAIMABLE'
 }
 
@@ -77,7 +95,8 @@ function emptyVmu(id: number, address: string, readOk: boolean): Vmu {
 function decodeUserMint(
   id: number,
   address: string,
-  res: { success: boolean; returnData: string } | undefined
+  res: { success: boolean; returnData: string } | undefined,
+  chainTimestampMs: number
 ): Vmu {
   if (!res?.success || !res.returnData || res.returnData === '0x') {
     return emptyVmu(id, address, false)
@@ -92,7 +111,7 @@ function decodeUserMint(
     return {
       id,
       address,
-      status: classify(rank, maturityTs),
+      status: classifyVmuStatus(rank, maturityTs, chainTimestampMs),
       rank,
       term,
       maturityTs,
@@ -106,7 +125,12 @@ function decodeUserMint(
 }
 
 /** Re-read selected VMU ids in bounded multicall batches. */
-async function readVmuIds(chain: ChainKey, wallet: string, ids: number[]): Promise<Vmu[]> {
+async function readVmuIds(
+  chain: ChainKey,
+  wallet: string,
+  ids: number[],
+  chainTimestampMs: number
+): Promise<Vmu[]> {
   if (!ids.length) return []
   const provider = getReadProvider(chain)
   const { factory, vmuTemplate, xenCrypto, multicall3 } = CONTRACTS[chain]
@@ -129,7 +153,7 @@ async function readVmuIds(chain: ChainKey, wallet: string, ids: number[]): Promi
         returnData: string
       }[]
       slice.forEach((proxy, index) => {
-        vmus.push(decodeUserMint(proxy.id, proxy.address, results[index]))
+        vmus.push(decodeUserMint(proxy.id, proxy.address, results[index], chainTimestampMs))
       })
     } catch {
       slice.forEach((proxy) => vmus.push(emptyVmu(proxy.id, proxy.address, false)))
@@ -147,7 +171,11 @@ async function readVmuIds(chain: ChainKey, wallet: string, ids: number[]): Promi
 export async function readWalletVmus(
   chain: ChainKey,
   wallet: string,
-  opts: { vmuCount?: number; onProgress?: (p: ReadProgress) => void } = {}
+  opts: {
+    vmuCount?: number
+    chainTimestampMs?: number
+    onProgress?: (p: ReadProgress) => void
+  } = {}
 ): Promise<Vmu[]> {
   const { factory, vmuTemplate, xenCrypto, multicall3 } = CONTRACTS[chain]
 
@@ -156,6 +184,7 @@ export async function readWalletVmus(
     opts.onProgress?.({ loaded: 0, total: 0 })
     return []
   }
+  const chainTimestampMs = opts.chainTimestampMs ?? (await readChainTimestamp(chain))
 
   const multicall = new Contract(
     multicall3,
@@ -185,7 +214,7 @@ export async function readWalletVmus(
     }[]
 
     slice.forEach((p, i) => {
-      vmus.push(decodeUserMint(p.id, p.address, results[i]))
+      vmus.push(decodeUserMint(p.id, p.address, results[i], chainTimestampMs))
     })
 
     opts.onProgress?.({ loaded: Math.min(start + BATCH_SIZE, proxies.length), total })
@@ -195,7 +224,7 @@ export async function readWalletVmus(
   const failedIds = vmus.filter((v) => !v.readOk).map((v) => v.id)
   if (failedIds.length) {
     try {
-      const retried = await readVmuIds(chain, wallet, failedIds)
+      const retried = await readVmuIds(chain, wallet, failedIds, chainTimestampMs)
       const byId = new Map(retried.map((v) => [v.id, v]))
       for (let i = 0; i < vmus.length; i++) {
         const fix = byId.get(vmus[i].id)
@@ -219,11 +248,12 @@ export async function readVmuStatuses(
   wallet: string,
   ids: number[]
 ): Promise<Map<number, VmuStatus>> {
-  const list = await readVmuIds(chain, wallet, ids)
+  const chainTimestampMs = await readChainTimestamp(chain)
+  const list = await readVmuIds(chain, wallet, ids, chainTimestampMs)
   const failedIds = list.filter((vmu) => !vmu.readOk).map((vmu) => vmu.id)
   if (failedIds.length) {
     try {
-      const retried = await readVmuIds(chain, wallet, failedIds)
+      const retried = await readVmuIds(chain, wallet, failedIds, chainTimestampMs)
       const byId = new Map(retried.map((vmu) => [vmu.id, vmu]))
       for (let index = 0; index < list.length; index++) {
         list[index] = byId.get(list[index].id) ?? list[index]

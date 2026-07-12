@@ -1,7 +1,7 @@
 // XEN reward estimation, ported from the original ManualBatch.vue logic.
 
-function getOverTimeDays(maturityMs: number): number {
-  const diff = Date.now() - maturityMs
+function getOverTimeDays(maturityMs: number, currentTimeMs: number): number {
+  const diff = currentTimeMs - maturityMs
   const dayMs = 86_400_000
   if (diff < 0) return -1
   if (diff === 0) return 0
@@ -9,8 +9,8 @@ function getOverTimeDays(maturityMs: number): number {
 }
 
 /** Late-claim penalty multiplier based on how long past maturity we are. */
-export function getRewardsPenalty(maturityMs: number): number {
-  const days = getOverTimeDays(maturityMs)
+export function getRewardsPenalty(maturityMs: number, currentTimeMs = Date.now()): number {
+  const days = getOverTimeDays(maturityMs, currentTimeMs)
   if (days <= 0) return 1
   if (days > 7) return 1 - 0.99
   if (days > 6) return 1 - 0.72
@@ -23,24 +23,24 @@ export function getRewardsPenalty(maturityMs: number): number {
 }
 
 /**
- * Estimated XEN for a group of `count` VMUs starting at `startRank`.
- * Mirrors the original per-VMU accumulation formula.
+ * Estimated XEN for a group using each VMU's actual on-chain rank.
  */
 export function estimateGroupXen(params: {
   globalRank: number
-  startRank: number
-  count: number
+  ranks: number[]
   term: number
   amplifier: number
   eaaRate: number
   maturityMs: number
+  currentTimeMs?: number
 }): number {
-  const { globalRank, startRank, count, term, amplifier, eaaRate, maturityMs } = params
-  if (!globalRank || !startRank) return 0
-  const penalty = getRewardsPenalty(maturityMs)
+  const { globalRank, ranks, term, amplifier, eaaRate, maturityMs, currentTimeMs } = params
+  if (!globalRank || !ranks.length) return 0
+  const penalty = getRewardsPenalty(maturityMs, currentTimeMs)
   let total = 0
-  for (let i = 0; i < count; i++) {
-    const rankDiff = globalRank - (startRank + i)
+  for (const rank of ranks) {
+    if (!Number.isSafeInteger(rank) || rank <= 0) continue
+    const rankDiff = globalRank - rank
     const rankDiffLog = Number(Math.log2(rankDiff > 1 ? rankDiff : 2).toFixed(4))
     const rewards = rankDiffLog * term * amplifier * (1 + eaaRate / 1000) * penalty
     total += Math.floor(rewards)

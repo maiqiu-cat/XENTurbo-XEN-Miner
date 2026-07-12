@@ -7,7 +7,10 @@ export interface InjectedProvider {
   request(args: Eip1193Request): Promise<unknown>
   isMetaMask?: boolean
   providers?: InjectedProvider[]
-  on?(event: 'accountsChanged' | 'chainChanged' | 'disconnect', listener: (...args: unknown[]) => void): void
+  on?(
+    event: 'accountsChanged' | 'chainChanged' | 'disconnect',
+    listener: (...args: unknown[]) => void
+  ): void
   removeListener?(
     event: 'accountsChanged' | 'chainChanged' | 'disconnect',
     listener: (...args: unknown[]) => void
@@ -27,7 +30,10 @@ export function getInjectedProvider(): InjectedProvider | undefined {
   const ethereum = (window as Window & { ethereum?: InjectedProvider }).ethereum
   if (!ethereum) return undefined
   if (Array.isArray(ethereum.providers)) {
-    return ethereum.providers.find((provider: InjectedProvider) => provider.isMetaMask) ?? ethereum.providers[0]
+    return (
+      ethereum.providers.find((provider: InjectedProvider) => provider.isMetaMask) ??
+      ethereum.providers[0]
+    )
   }
   return ethereum
 }
@@ -43,7 +49,8 @@ function parseQuantity(value: unknown, label: string): number {
   try {
     if (typeof value === 'bigint') parsed = value
     else if (typeof value === 'number' && Number.isSafeInteger(value)) parsed = BigInt(value)
-    else if (typeof value === 'string' && /^(?:0x[0-9a-f]+|[0-9]+)$/i.test(value)) parsed = BigInt(value)
+    else if (typeof value === 'string' && /^(?:0x[0-9a-f]+|[0-9]+)$/i.test(value))
+      parsed = BigInt(value)
     else throw new Error('invalid quantity')
   } catch {
     throw new Error(`Invalid ${label} returned by injected wallet`)
@@ -68,17 +75,59 @@ export async function getInjectedChainId(): Promise<number> {
   return parseQuantity(chainId, 'chain id')
 }
 
-export async function getInjectedPendingNonce(address: string): Promise<number> {
+async function getInjectedTransactionCount(
+  address: string,
+  blockTag: 'latest' | 'pending'
+): Promise<number> {
   const nonce = await requireInjectedProvider().request({
     method: 'eth_getTransactionCount',
-    params: [address, 'pending']
+    params: [address, blockTag]
   })
-  return parseQuantity(nonce, 'pending nonce')
+  return parseQuantity(nonce, `${blockTag} nonce`)
+}
+
+export function getInjectedLatestNonce(address: string): Promise<number> {
+  return getInjectedTransactionCount(address, 'latest')
+}
+
+export function getInjectedPendingNonce(address: string): Promise<number> {
+  return getInjectedTransactionCount(address, 'pending')
+}
+
+/** Perform an authoritative read or simulation through the wallet's active chain. */
+export async function callInjectedContract(
+  to: string,
+  data: string,
+  options: { from?: string; value?: bigint } = {}
+): Promise<string> {
+  if (!/^0x[0-9a-f]{40}$/i.test(to)) throw new Error('Invalid contract address for wallet read')
+  if (!/^0x[0-9a-f]*$/i.test(data)) throw new Error('Invalid calldata for wallet read')
+  if (options.from && !/^0x[0-9a-f]{40}$/i.test(options.from)) {
+    throw new Error('Invalid wallet address for wallet simulation')
+  }
+  const transaction: Record<string, string> = { to, data }
+  if (options.from) transaction.from = options.from
+  if (options.value !== undefined) transaction.value = `0x${options.value.toString(16)}`
+  const result = await requireInjectedProvider().request({
+    method: 'eth_call',
+    params: [transaction, 'latest']
+  })
+  if (typeof result !== 'string' || !/^0x[0-9a-f]*$/i.test(result)) {
+    throw new Error('Invalid eth_call result returned by injected wallet')
+  }
+  return result
 }
 
 export function assertNonceAgreement(walletNonce: number, rpcNonce: number): number {
-  if (!Number.isSafeInteger(walletNonce) || !Number.isSafeInteger(rpcNonce) || walletNonce < 0 || rpcNonce < 0) {
-    throw new Error('PENDING_STATE_UNCERTAIN: Invalid pending nonce returned by wallet or read RPC.')
+  if (
+    !Number.isSafeInteger(walletNonce) ||
+    !Number.isSafeInteger(rpcNonce) ||
+    walletNonce < 0 ||
+    rpcNonce < 0
+  ) {
+    throw new Error(
+      'PENDING_STATE_UNCERTAIN: Invalid pending nonce returned by wallet or read RPC.'
+    )
   }
   if (walletNonce !== rpcNonce) {
     throw new Error(

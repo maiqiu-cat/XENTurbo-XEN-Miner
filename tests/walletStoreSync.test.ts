@@ -6,11 +6,12 @@ import type { Eip1193Request } from '../src/core/eip1193'
 const ACCOUNT = '0x0000000000000000000000000000000000000001'
 
 const rpc = vi.hoisted(() => ({
-  getCode: vi.fn()
+  getCode: vi.fn(),
+  ensureHealthyReadProvider: vi.fn()
 }))
 
 vi.mock('@/core/rpc', () => ({
-  getReadProvider: () => ({ getCode: rpc.getCode })
+  ensureHealthyReadProvider: rpc.ensureHealthyReadProvider
 }))
 
 type Listener = (...args: unknown[]) => void
@@ -61,6 +62,7 @@ describe('wallet store injected state synchronization', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     rpc.getCode.mockReset().mockResolvedValue('0x')
+    rpc.ensureHealthyReadProvider.mockReset().mockResolvedValue({ getCode: rpc.getCode })
   })
 
   afterEach(() => {

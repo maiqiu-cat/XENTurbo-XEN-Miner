@@ -5,7 +5,12 @@ import type { Vmu, WalletSnapshot } from '@/core/types'
 const chainReader = vi.hoisted(() => ({
   readVmuCount: vi.fn(),
   readGlobalRank: vi.fn(),
-  readWalletVmus: vi.fn()
+  readChainTimestamp: vi.fn(),
+  readWalletVmus: vi.fn(),
+  classifyVmuStatus: vi.fn((rank: number, maturityMs: number, chainTimestampMs: number) => {
+    if (rank === 0) return 'EMPTY'
+    return maturityMs + 1_000 > chainTimestampMs ? 'MINTING' : 'CLAIMABLE'
+  })
 }))
 
 const snapshots = vi.hoisted(() => ({
@@ -14,8 +19,13 @@ const snapshots = vi.hoisted(() => ({
   clearSnapshot: vi.fn()
 }))
 
+const rpcHealth = vi.hoisted(() => ({
+  ensureHealthyReadProvider: vi.fn()
+}))
+
 vi.mock('@/core/chainReader', () => chainReader)
 vi.mock('@/core/idb', () => snapshots)
+vi.mock('@/core/rpc', () => rpcHealth)
 vi.mock('@/core/localLock', () => ({
   broadcastLockedIds: () => new Set<number>()
 }))
@@ -55,7 +65,8 @@ function snapshot(wallet: string): WalletSnapshot {
     wallet,
     vmuCount: 1,
     vmus: [mintingVmu()],
-    syncedAt: 123
+    syncedAt: 123,
+    chainTimestampMs: 100
   }
 }
 
@@ -65,6 +76,23 @@ describe('vmu store request invalidation', () => {
     vi.clearAllMocks()
     snapshots.saveSnapshot.mockResolvedValue(undefined)
     snapshots.clearSnapshot.mockResolvedValue(undefined)
+    rpcHealth.ensureHealthyReadProvider.mockResolvedValue({})
+    chainReader.readChainTimestamp.mockResolvedValue(Date.now())
+  })
+
+  it('checks configured RPC health before reading wallet state', async () => {
+    snapshots.loadSnapshot.mockResolvedValue(null)
+    chainReader.readVmuCount.mockResolvedValue(0)
+    chainReader.readGlobalRank.mockResolvedValue(100)
+    chainReader.readWalletVmus.mockResolvedValue([])
+    const store = useVmuStore()
+
+    await store.load('eth', walletA)
+
+    expect(rpcHealth.ensureHealthyReadProvider).toHaveBeenCalledWith('eth')
+    expect(rpcHealth.ensureHealthyReadProvider.mock.invocationCallOrder[0]).toBeLessThan(
+      chainReader.readVmuCount.mock.invocationCallOrder[0]
+    )
   })
 
   it('does not apply a cached snapshot that resolves after detach', async () => {
@@ -191,5 +219,50 @@ describe('vmu store request invalidation', () => {
     expect(store.error).toBeNull()
     expect(store.loading).toBe(false)
     expect(store.syncedAt).toBe(newSyncedAt)
+  })
+
+  it('refreshes automatically after the nearest chain maturity', async () => {
+    vi.useFakeTimers()
+    try {
+      const chainNow = 1_000_000
+      snapshots.loadSnapshot.mockResolvedValue(null)
+      chainReader.readVmuCount.mockResolvedValue(1)
+      chainReader.readGlobalRank.mockResolvedValue(100)
+      chainReader.readChainTimestamp.mockResolvedValue(chainNow)
+      chainReader.readWalletVmus
+        .mockResolvedValueOnce([
+          { ...mintingVmu(), maturityTs: chainNow + 2_000, status: 'MINTING' }
+        ])
+        .mockResolvedValueOnce([
+          { ...mintingVmu(), maturityTs: chainNow + 2_000, status: 'CLAIMABLE' }
+        ])
+      const store = useVmuStore()
+
+      await store.load('eth', walletA)
+      expect(chainReader.readWalletVmus).toHaveBeenCalledTimes(1)
+
+      await vi.advanceTimersByTimeAsync(3_500)
+
+      expect(chainReader.readWalletVmus).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('rereads chain time after a long VMU scan and reclassifies the result', async () => {
+    snapshots.loadSnapshot.mockResolvedValue(null)
+    chainReader.readVmuCount.mockResolvedValue(1)
+    chainReader.readGlobalRank.mockResolvedValue(100)
+    chainReader.readChainTimestamp.mockResolvedValueOnce(1_000).mockResolvedValueOnce(5_000)
+    chainReader.readWalletVmus.mockResolvedValue([
+      { ...mintingVmu(), maturityTs: 3_000, status: 'MINTING' }
+    ])
+    const store = useVmuStore()
+
+    await store.load('eth', walletA)
+
+    expect(chainReader.readChainTimestamp).toHaveBeenCalledTimes(2)
+    expect(store.chainTimestampMs).toBe(5_000)
+    expect(store.vmus[0].status).toBe('CLAIMABLE')
   })
 })

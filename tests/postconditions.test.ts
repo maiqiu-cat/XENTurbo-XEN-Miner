@@ -1,12 +1,24 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const rpcHealth = vi.hoisted(() => ({
+  ensureHealthyReadProvider: vi.fn()
+}))
+
+vi.mock('@/core/rpc', () => rpcHealth)
+
 import {
   verifyOperationOutcome,
+  verifyOperationOutcomeWithRetry,
   type OutcomeOperation,
   type OperationOutcome
 } from '@/core/postconditions'
 import type { VmuStatus } from '@/core/types'
 
 const wallet = '0x0000000000000000000000000000000000000001'
+
+beforeEach(() => {
+  rpcHealth.ensureHealthyReadProvider.mockReset().mockResolvedValue({})
+})
 
 function operation(overrides: Partial<OutcomeOperation>): OutcomeOperation {
   return {
@@ -71,31 +83,34 @@ describe('operation postconditions', () => {
       expectedIds: [6, 9],
       expectedStatus: 'MINTING' as const
     }
-  ])('verifies $op.op against its exact expected state', async ({ op, expectedIds, expectedStatus }) => {
-    const statuses = new Map(expectedIds.map((id) => [id, expectedStatus]))
-    const evidence =
-      op.op === 'CREATE_EMPTY_SLOT'
-        ? {
-            deployments: new Map(expectedIds.map((id) => [id, 'DEPLOYED' as const])),
-            vmuCount: op.preVmuCount! + op.count
-          }
-        : undefined
+  ])(
+    'verifies $op.op against its exact expected state',
+    async ({ op, expectedIds, expectedStatus }) => {
+      const statuses = new Map(expectedIds.map((id) => [id, expectedStatus]))
+      const evidence =
+        op.op === 'CREATE_EMPTY_SLOT'
+          ? {
+              deployments: new Map(expectedIds.map((id) => [id, 'DEPLOYED' as const])),
+              vmuCount: op.preVmuCount! + op.count
+            }
+          : undefined
 
-    const result = await verify(op, statuses, evidence)
+      const result = await verify(op, statuses, evidence)
 
-    expect(result).toEqual({
-      classification: 'full',
-      expectedStatus,
-      expectedCount: expectedIds.length,
-      expectedIds,
-      matchingCount: expectedIds.length,
-      matchingIds: expectedIds,
-      unexpectedCount: 0,
-      unexpectedIds: [],
-      readErrorCount: 0,
-      readErrorIds: []
-    })
-  })
+      expect(result).toEqual({
+        classification: 'full',
+        expectedStatus,
+        expectedCount: expectedIds.length,
+        expectedIds,
+        matchingCount: expectedIds.length,
+        matchingIds: expectedIds,
+        unexpectedCount: 0,
+        unexpectedIds: [],
+        readErrorCount: 0,
+        readErrorIds: []
+      })
+    }
+  )
 
   it('reports known mismatches as a partial result with exact ids and counts', async () => {
     const result = await verify(
@@ -220,5 +235,62 @@ describe('operation postconditions', () => {
     expect(result.classification).toBe('uncertain')
     expect(result.matchingIds).toEqual([11])
     expect(result.readErrorIds).toEqual([12])
+  })
+})
+
+describe('postcondition retry', () => {
+  const partial: OperationOutcome = {
+    classification: 'partial',
+    expectedStatus: 'MINTING',
+    expectedCount: 1,
+    expectedIds: [1],
+    matchingCount: 0,
+    matchingIds: [],
+    unexpectedCount: 1,
+    unexpectedIds: [1],
+    readErrorCount: 0,
+    readErrorIds: []
+  }
+  const full: OperationOutcome = {
+    ...partial,
+    classification: 'full',
+    matchingCount: 1,
+    matchingIds: [1],
+    unexpectedCount: 0,
+    unexpectedIds: []
+  }
+
+  it('retries a lagging result and stops as soon as full success is visible', async () => {
+    const verify = vi
+      .fn()
+      .mockResolvedValueOnce(partial)
+      .mockResolvedValueOnce(partial)
+      .mockResolvedValueOnce(full)
+    const sleep = vi.fn(async () => {})
+
+    const result = await verifyOperationOutcomeWithRetry(operation({ count: 1 }), {
+      verify,
+      sleep
+    })
+
+    expect(result.classification).toBe('full')
+    expect(rpcHealth.ensureHealthyReadProvider).toHaveBeenCalledTimes(3)
+    expect(verify).toHaveBeenCalledTimes(3)
+    expect(sleep).toHaveBeenNthCalledWith(1, 500)
+    expect(sleep).toHaveBeenNthCalledWith(2, 1_500)
+  })
+
+  it('reports a stable mismatch only after all retry delays', async () => {
+    const verify = vi.fn(async () => partial)
+    const sleep = vi.fn(async () => {})
+
+    const result = await verifyOperationOutcomeWithRetry(operation({ count: 1 }), {
+      verify,
+      sleep
+    })
+
+    expect(result.classification).toBe('partial')
+    expect(verify).toHaveBeenCalledTimes(4)
+    expect(sleep.mock.calls).toEqual([[500], [1_500], [3_000]])
   })
 })

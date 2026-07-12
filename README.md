@@ -58,13 +58,15 @@ Same five on-chain operations as the original Manual Batch tool:
 
 Ethereum and Polygon (both use the deployed factory
 `0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2`). The per-VMU service fee is read
-live from the contract (`FEE()`), so it still flows to the original fee receiver.
+through the active injected wallet (`FEE()`) and cross-checked against the read RPC
+at send time. Gas pricing is left to the wallet rather than copied from a public RPC.
 Add more chains in `src/config/chains.ts` + `src/config/contracts.ts`.
 
 ## Setup
 
 ```bash
-npm install
+nvm use                    # Node 24, from .nvmrc
+npm ci
 cp .env.example .env   # optional: set custom Ethereum or Polygon RPC URLs
 npm run dev
 ```
@@ -93,8 +95,8 @@ to override the script's default RPC for the selected chain.
 
 Vite development and preview responses include the release security headers so they
 can be validated locally. A matching Nginx snippet is prepared at
-`ops/nginx/security-headers.conf`; it has not been applied to the server. The CSP
-allows same-origin requests and HTTPS RPC endpoints, including user-configured RPCs.
+`ops/nginx/security-headers.conf` for production deployment. The CSP allows
+same-origin requests and HTTPS RPC endpoints, including user-configured RPCs.
 
 ## Bundle budget
 
@@ -116,3 +118,4 @@ measured JavaScript chunk and exits non-zero when either limit is exceeded.
 - Large wallets (tens of thousands of VMUs) take a moment on first load; results
   are cached in IndexedDB, and the source of truth is always the chain.
 - If you hit RPC error `-32603`, add your own RPC endpoint via the in-app RPC button.
+  Custom endpoints must use HTTPS and return the selected chain ID before they are saved.

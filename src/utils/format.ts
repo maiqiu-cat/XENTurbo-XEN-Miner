@@ -18,8 +18,8 @@ export function formatDate(ms: number): string {
   )}`
 }
 
-export function countdownTo(ms: number): string {
-  const diff = ms - Date.now()
+export function countdownTo(ms: number, now = Date.now()): string {
+  const diff = ms - now
   if (diff <= 0) return 'Matured'
   const d = Math.floor(diff / 86_400_000)
   const h = Math.floor((diff % 86_400_000) / 3_600_000)

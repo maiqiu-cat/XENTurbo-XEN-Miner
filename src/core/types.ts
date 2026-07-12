@@ -24,6 +24,7 @@ export interface VmuGroup {
   maturityTs: number
   status: Exclude<VmuStatus, 'READ_ERROR' | 'EMPTY'>
   rank: number
+  ranks: number[]
   amplifier: number
   eaaRate: number
   ids: number[]
@@ -37,4 +38,5 @@ export interface WalletSnapshot {
   vmuCount: number
   vmus: Vmu[]
   syncedAt: number
+  chainTimestampMs: number
 }

@@ -26,10 +26,7 @@ let accountState: WalletAccount = {}
 let addressVersion = 0
 let chainVersion = 0
 
-type WalletStateListener = (
-  address?: string,
-  chainId?: number
-) => void | Promise<void>
+type WalletStateListener = (address?: string, chainId?: number) => void | Promise<void>
 
 const walletStateListeners = new Set<WalletStateListener>()
 const pendingNotifications = new Set<Promise<void>>()
@@ -120,8 +117,7 @@ function ensureObservedProvider(provider = getInjectedProvider()): void {
   if (!provider?.on) return
 
   const generation = providerListenerGeneration
-  const isCurrent = () =>
-    generation === providerListenerGeneration && observedProvider === provider
+  const isCurrent = () => generation === providerListenerGeneration && observedProvider === provider
   const handleAccountsChanged = (value: unknown) => {
     if (!isCurrent()) return
     setAddressState(firstAccount(value))
@@ -263,9 +259,7 @@ const toHex = (value: bigint) => `0x${value.toString(16)}`
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
     promise,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`${label}_TIMEOUT`)), ms)
-    )
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${label}_TIMEOUT`)), ms))
   ])
 }
 
@@ -295,6 +289,10 @@ export async function writeFactory(params: {
   maxFeePerGas?: bigint
   maxPriorityFeePerGas?: bigint
   expectedFrom?: string
+  /** Called after all local checks, immediately before opening the wallet request. */
+  onRequestStart?: () => void
+  /** Called only when the provider throws before returning a request promise. */
+  onRequestSyncError?: (error: unknown) => void
 }): Promise<`0x${string}`> {
   const provider = getInjectedProvider()
   if (!provider) {
@@ -333,9 +331,15 @@ export async function writeFactory(params: {
   }
 
   try {
-    const send = beginWalletSend(() =>
-      provider.request({ method: 'eth_sendTransaction', params: [txParams] })
-    )
+    const send = beginWalletSend(() => {
+      params.onRequestStart?.()
+      try {
+        return provider.request({ method: 'eth_sendTransaction', params: [txParams] })
+      } catch (error) {
+        params.onRequestSyncError?.(error)
+        throw error
+      }
+    })
     const hash = await send.result
     if (typeof hash !== 'string' || !/^0x[0-9a-f]{64}$/i.test(hash)) {
       throw new Error('Wallet returned an invalid transaction hash')

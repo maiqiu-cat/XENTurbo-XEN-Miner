@@ -1,4 +1,4 @@
-import { Contract } from 'ethers'
+import { Contract, Interface } from 'ethers'
 import { CONTRACTS } from '@/config/contracts'
 import { CHAINS, type ChainKey } from '@/config/chains'
 import { XENFactoryABI } from '@/abis/XENFactoryABI'
@@ -10,8 +10,8 @@ import {
   DEFAULT_TERM_MAX
 } from '@/config/miner'
 import { writeFactory, warmUpInjected } from './wallet'
-import { readFee, readVmuCount, readVmuStatuses } from './chainReader'
-import { getReadProvider } from './rpc'
+import { readFee, readVmuStatuses } from './chainReader'
+import { ensureHealthyReadProvider, getReadProvider } from './rpc'
 import {
   attachTxHash,
   releaseLock,
@@ -20,27 +20,24 @@ import {
   tryAcquireLock,
   clearSoftLocks
 } from './localLock'
-import { countUnresolvedPendingOps, recordPendingOp } from './pendingOps'
+import { countUnresolvedPendingOps, recordPendingOp, removePendingOpRecord } from './pendingOps'
 import { operationKey, runWalletExclusive } from './operationGate'
 import {
-  assertNonceAgreement,
+  callInjectedContract,
   getInjectedAccount,
   getInjectedChainId,
+  getInjectedLatestNonce,
   getInjectedPendingNonce
 } from './eip1193'
 import {
   uncertainOperationOutcome,
-  verifyOperationOutcome,
+  verifyOperationOutcomeWithRetry,
   type OperationOutcome
 } from './postconditions'
 import type { VmuStatus } from './types'
 
 export type OpType =
-  | 'GENERAL_MINT'
-  | 'CREATE_EMPTY_SLOT'
-  | 'MINT_EMPTY_SLOT'
-  | 'CLAIM'
-  | 'CLAIM_REUSE'
+  'GENERAL_MINT' | 'CREATE_EMPTY_SLOT' | 'MINT_EMPTY_SLOT' | 'CLAIM' | 'CLAIM_REUSE'
 
 export interface TxStepState {
   estimate: 'wait' | 'process' | 'done' | 'error'
@@ -55,6 +52,8 @@ export interface TxStepState {
 
 export interface TxCallbacks {
   onStep?: (state: TxStepState) => void
+  /** Returns true while an unbroadcast operation should be abandoned. */
+  isCancelled?: () => boolean
 }
 
 /** Reject if a promise does not settle within `ms`, with a labelled error. */
@@ -72,6 +71,9 @@ const PROBE_UNITS = 32
 const GAS_RATIO_SCALE = 10_000n
 /** Keep 10% of the latest block gas limit free for block assembly variance. */
 const BLOCK_GAS_SAFETY_BPS = 9_000n
+export const PREPARED_OP_TTL_MS = 120_000
+
+const factoryIface = new Interface(XENFactoryABI as unknown as any[])
 
 function collectErrorDetails(error: unknown, seen = new Set<unknown>(), depth = 0): string[] {
   if (error == null || depth > 4 || seen.has(error)) return []
@@ -82,7 +84,17 @@ function collectErrorDetails(error: unknown, seen = new Set<unknown>(), depth = 
 
   seen.add(error)
   const value = error as Record<string, unknown>
-  const fields = ['name', 'code', 'message', 'shortMessage', 'reason', 'data', 'error', 'info', 'cause']
+  const fields = [
+    'name',
+    'code',
+    'message',
+    'shortMessage',
+    'reason',
+    'data',
+    'error',
+    'info',
+    'cause'
+  ]
   return fields.flatMap((field) => collectErrorDetails(value[field], seen, depth + 1))
 }
 
@@ -134,8 +146,7 @@ export async function estimateWithProbe(
 
   // Let a probe failure propagate unchanged; it may contain useful revert data.
   const probeGas = await probe()
-  const projected =
-    (probeGas * BigInt(units) + BigInt(probeUnits) - 1n) / BigInt(probeUnits)
+  const projected = (probeGas * BigInt(units) + BigInt(probeUnits) - 1n) / BigInt(probeUnits)
   return applyGasRatio(projected, ratio)
 }
 
@@ -243,7 +254,14 @@ function allocatesVmuIds(op: OpType): boolean {
   return op === 'GENERAL_MINT' || op === 'CREATE_EMPTY_SLOT'
 }
 
-function validateParams(params: {
+function assertWholeNumber(value: number, label: string, min: number, max: number): void {
+  if (!Number.isSafeInteger(value)) throw new Error(`${label} must be a whole number`)
+  if (value < min || value > max) {
+    throw new Error(`${label} must be between ${min} and ${max}`)
+  }
+}
+
+export function validateOperationParams(params: {
   chain: ChainKey
   op: OpType
   ids: number[]
@@ -253,34 +271,36 @@ function validateParams(params: {
   const { chain, op, ids, count, term } = params
   const lim = LIMITS[chain]
 
+  if (ids.some((id) => !Number.isSafeInteger(id) || id <= 0) || new Set(ids).size !== ids.length) {
+    throw new Error('VMU ids must be unique positive whole numbers')
+  }
+
   // createVMUs has no term — only mint / remint / claim-reuse need one.
   if (op === 'GENERAL_MINT' || op === 'MINT_EMPTY_SLOT' || op === 'CLAIM_REUSE') {
-    if (!Number.isFinite(term) || term < 1 || term > DEFAULT_TERM_MAX) {
-      throw new Error(`Term must be between 1 and ${DEFAULT_TERM_MAX} days`)
-    }
+    assertWholeNumber(term, 'Term', 1, DEFAULT_TERM_MAX)
   }
 
   switch (op) {
     case 'GENERAL_MINT':
-      if (!Number.isFinite(count) || count < 1 || count > lim.generalMint) {
-        throw new Error(`Mint count must be 1–${lim.generalMint}`)
-      }
+      assertWholeNumber(count, 'Mint count', 1, lim.generalMint)
       break
     case 'CREATE_EMPTY_SLOT':
-      if (!Number.isFinite(count) || count < 1 || count > lim.createEmptySlot) {
-        throw new Error(`Create count must be 1–${lim.createEmptySlot}`)
-      }
+      assertWholeNumber(count, 'Create count', 1, lim.createEmptySlot)
       break
     case 'MINT_EMPTY_SLOT':
       if (!ids.length) throw new Error('No empty VMUs selected')
       if (ids.length > lim.mintEmptySlot) {
-        throw new Error(`Empty-slot mint limited to ${lim.mintEmptySlot} VMUs per tx (selected ${ids.length})`)
+        throw new Error(
+          `Empty-slot mint limited to ${lim.mintEmptySlot} VMUs per tx (selected ${ids.length})`
+        )
       }
       break
     case 'CLAIM':
       if (!ids.length) throw new Error('No claimable VMUs selected')
       if (ids.length > lim.claim) {
-        throw new Error(`Claim limited to ${lim.claim} VMUs per tx (selected ${ids.length}). Deselect some and retry.`)
+        throw new Error(
+          `Claim limited to ${lim.claim} VMUs per tx (selected ${ids.length}). Deselect some and retry.`
+        )
       }
       break
     case 'CLAIM_REUSE':
@@ -294,7 +314,94 @@ function validateParams(params: {
   }
 }
 
-async function assertIdsStillValid(chain: ChainKey, wallet: string, op: OpType, ids: number[]): Promise<void> {
+export function authoritativeServiceValue(params: {
+  walletFee: bigint
+  units: number
+  feeApplies: boolean
+}): bigint | undefined {
+  const { walletFee, units, feeApplies } = params
+  if (!feeApplies) return undefined
+  if (walletFee < 0n || !Number.isSafeInteger(units) || units <= 0) {
+    throw new Error('Invalid service fee inputs')
+  }
+  return walletFee * BigInt(units)
+}
+
+export function assertPreparedContext(
+  prepared: Pick<PreparedOp, 'wallet' | 'chainId' | 'preparedAt' | 'expiresAt'>,
+  account: string,
+  chainId: number,
+  now = Date.now()
+): void {
+  if (account.toLowerCase() !== prepared.wallet.toLowerCase()) {
+    throw new Error('Wallet account changed during the operation. Reconnect and retry.')
+  }
+  if (chainId !== prepared.chainId) {
+    throw new Error('Wallet is on the wrong network. Switch networks and retry.')
+  }
+  if (now > prepared.expiresAt) {
+    throw new Error('Prepared transaction expired. Estimate again before signing.')
+  }
+}
+
+async function readInjectedFactoryFee(factoryAddress: string): Promise<bigint> {
+  const data = factoryIface.encodeFunctionData('FEE')
+  const result = await callInjectedContract(factoryAddress, data)
+  const fee = factoryIface.decodeFunctionResult('FEE', result)[0]
+  if (typeof fee !== 'bigint' || fee < 0n) {
+    throw new Error('Wallet returned an invalid factory fee')
+  }
+  return fee
+}
+
+async function readInjectedVmuCount(factoryAddress: string, wallet: string): Promise<number> {
+  const data = factoryIface.encodeFunctionData('vmuCount', [wallet])
+  const result = await callInjectedContract(factoryAddress, data)
+  const rawCount = factoryIface.decodeFunctionResult('vmuCount', result)[0]
+  if (typeof rawCount !== 'bigint' || rawCount < 0n || rawCount > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error('Wallet returned an invalid VMU count')
+  }
+  return Number(rawCount)
+}
+
+function assertOperationActive(callbacks: TxCallbacks): void {
+  if (callbacks.isCancelled?.()) {
+    throw new Error('OPERATION_CANCELLED: Operation cancelled before the wallet request opened.')
+  }
+}
+
+export function strictSimulationFunction(op: OpType): string {
+  switch (op) {
+    case 'GENERAL_MINT':
+      return 'bulkClaimRank_'
+    case 'CREATE_EMPTY_SLOT':
+      return 'createVMUs_'
+    case 'MINT_EMPTY_SLOT':
+      return 'reuseVMUs_'
+    case 'CLAIM':
+      return 'bulkClaimMintReward_'
+    case 'CLAIM_REUSE':
+      return 'bulkClaimMintRewardAndClaimRank_'
+  }
+}
+
+async function simulatePreparedWithWallet(
+  prepared: PreparedOp,
+  value: bigint | undefined
+): Promise<void> {
+  const data = factoryIface.encodeFunctionData(strictSimulationFunction(prepared.op), prepared.args)
+  await callInjectedContract(prepared.factoryAddress, data, {
+    from: prepared.wallet,
+    value
+  })
+}
+
+async function assertIdsStillValid(
+  chain: ChainKey,
+  wallet: string,
+  op: OpType,
+  ids: number[]
+): Promise<void> {
   const want = expectedStatus(op)
   if (!want || !ids.length) return
   const statuses = await readVmuStatuses(chain, wallet, ids)
@@ -309,7 +416,12 @@ async function assertIdsStillValid(chain: ChainKey, wallet: string, op: OpType, 
   }
 }
 
-function buildCall(op: OpType, ids: number[], count: number, term: number): { fnName: string; args: readonly unknown[] } {
+function buildCall(
+  op: OpType,
+  ids: number[],
+  count: number,
+  term: number
+): { fnName: string; args: readonly unknown[] } {
   switch (op) {
     case 'GENERAL_MINT':
       return { fnName: 'bulkClaimRank', args: [BigInt(term), BigInt(count)] }
@@ -320,7 +432,10 @@ function buildCall(op: OpType, ids: number[], count: number, term: number): { fn
     case 'CLAIM':
       return { fnName: 'bulkClaimMintReward', args: [ids.map((i) => BigInt(i))] }
     case 'CLAIM_REUSE':
-      return { fnName: 'bulkClaimMintRewardAndClaimRank', args: [ids.map((i) => BigInt(i)), BigInt(term)] }
+      return {
+        fnName: 'bulkClaimMintRewardAndClaimRank',
+        args: [ids.map((i) => BigInt(i)), BigInt(term)]
+      }
     default:
       throw new Error(`Unknown op ${op}`)
   }
@@ -336,18 +451,15 @@ export interface PreparedOp {
   term: number
   chainId: number
   factoryAddress: `0x${string}`
+  contextKey: string
+  preparedAt: number
+  expiresAt: number
   gasLimit: bigint
-  value?: bigint
   fnName: string
   args: readonly unknown[]
   batch: string
   lockIds: number[]
   state: TxStepState
-  /** Prefetched so MetaMask does not stall on its own RPC before showing the popup. */
-  nonce: number
-  maxFeePerGas: bigint
-  maxPriorityFeePerGas: bigint
-
   /** VMU count immediately before an allocating transaction is sent. */
   preVmuCount?: number
 }
@@ -360,20 +472,36 @@ export interface PreparedOp {
  */
 /** pendingNonce - latestNonce; >0 means at least one in-flight tx. */
 export async function getPendingTxCount(chain: ChainKey, wallet: string): Promise<number> {
-  const provider = getReadProvider(chain)
-  const [latest, pending] = await Promise.all([
-    provider.getTransactionCount(wallet, 'latest'),
-    provider.getTransactionCount(wallet, 'pending')
+  const [chainId, latest, pending] = await Promise.all([
+    getInjectedChainId(),
+    getInjectedLatestNonce(wallet),
+    getInjectedPendingNonce(wallet)
   ])
+  if (chainId !== CHAINS[chain].chainId) {
+    throw new Error('Wallet is on the wrong network. Switch networks and retry.')
+  }
   return Math.max(0, pending - latest)
 }
 
-export async function prepareOperation(params: RunParams, cb: TxCallbacks = {}): Promise<PreparedOp> {
+export async function prepareOperation(
+  params: RunParams,
+  cb: TxCallbacks = {}
+): Promise<PreparedOp> {
   const { chain, wallet, op, ids = [], count = 0, term = 0 } = params
   const state: TxStepState = { estimate: 'wait', send: 'wait', confirm: 'wait' }
   const emit = () => cb.onStep?.({ ...state })
 
-  validateParams({ chain, op, ids, count, term })
+  validateOperationParams({ chain, op, ids, count, term })
+
+  let readProvider
+  try {
+    readProvider = await ensureHealthyReadProvider(chain)
+  } catch (err: any) {
+    state.estimate = 'error'
+    state.error = normalizeError(err)
+    emit()
+    throw err
+  }
 
   // Block before any gas spend if a previous tx is still in-flight.
   // EIP-7702 / Infura only allows 1 in-flight tx for delegated accounts.
@@ -389,19 +517,19 @@ export async function prepareOperation(params: RunParams, cb: TxCallbacks = {}):
   const factoryAddress = CONTRACTS[chain].factory as `0x${string}`
   const chainId = CHAINS[chain].chainId
 
-  const units = op === 'GENERAL_MINT' || op === 'CREATE_EMPTY_SLOT' ? count : ids.length
   const feeApplies =
     !FREE_CHAINS.includes(chain) &&
     (op === 'GENERAL_MINT' || op === 'MINT_EMPTY_SLOT' || op === 'CLAIM_REUSE')
   const fee = feeApplies ? await readFee(chain) : 0n
-  const value = feeApplies ? fee * BigInt(units) : undefined
 
   const batch = newBatchId()
   const lockIds = op === 'GENERAL_MINT' || op === 'CREATE_EMPTY_SLOT' ? [] : ids
 
   if (lockIds.length) {
     if (!tryAcquireLock({ chain, wallet, ids: lockIds, batch, op, count, term })) {
-      throw new Error('Some selected VMUs are already pending in another tab/window. Wait or refresh.')
+      throw new Error(
+        'Some selected VMUs are already pending in another tab/window. Wait or refresh.'
+      )
     }
   }
 
@@ -411,11 +539,7 @@ export async function prepareOperation(params: RunParams, cb: TxCallbacks = {}):
 
     state.estimate = 'process'
     emit()
-    const readProvider = getReadProvider(chain)
-    // Prefetch nonce + fees from OUR RPC in parallel with gas estimation.
-    // MetaMask otherwise fetches these via its own (often slow/broken) endpoint
-    // before showing the signature popup — that alone can take 1–2 minutes.
-    const [estimatedGas, nonce, feeData, latestBlock, preVmuCount] = await Promise.all([
+    const [estimatedGas, latestBlock] = await Promise.all([
       estimateGasLimit({
         readFactory,
         op,
@@ -427,22 +551,17 @@ export async function prepareOperation(params: RunParams, cb: TxCallbacks = {}):
         feeApplies,
         ratio
       }),
-      readProvider.getTransactionCount(wallet, 'pending'),
-      readProvider.getFeeData(),
-      readProvider.getBlock('latest'),
-      allocatesVmuIds(op) ? readVmuCount(chain, wallet) : Promise.resolve(undefined)
+      readProvider.getBlock('latest')
     ])
     if (!latestBlock) throw new Error('Latest block is unavailable; cannot validate the gas limit')
     const gasLimit = assertFitsBlockGasLimit(estimatedGas, latestBlock.gasLimit)
-    const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas ?? 1_000_000_000n // 1 gwei fallback
-    const maxFeePerGas =
-      feeData.maxFeePerGas ?? maxPriorityFeePerGas * 2n + (feeData.gasPrice ?? 0n)
 
     state.estimate = 'done'
     state.readyToSign = true
     emit()
 
     const { fnName, args } = buildCall(op, ids, count, term)
+    const preparedAt = Date.now()
     return {
       chain,
       wallet,
@@ -452,17 +571,15 @@ export async function prepareOperation(params: RunParams, cb: TxCallbacks = {}):
       term,
       chainId,
       factoryAddress,
+      contextKey: `${chainId}:${wallet.toLowerCase()}`,
+      preparedAt,
+      expiresAt: preparedAt + PREPARED_OP_TTL_MS,
       gasLimit,
-      value,
       fnName,
       args,
       batch,
       lockIds,
-      state,
-      nonce,
-      maxFeePerGas,
-      maxPriorityFeePerGas,
-      preVmuCount
+      state
     }
   } catch (err: any) {
     if (lockIds.length) releaseLock(batch)
@@ -478,7 +595,10 @@ export async function prepareOperation(params: RunParams, cb: TxCallbacks = {}):
  * Phase 2: send + confirm. MUST be called from a click handler so MetaMask
  * receives a fresh user gesture and can show the signature popup.
  */
-export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallbacks = {}): Promise<TxStepState> {
+export async function sendPreparedOperation(
+  prepared: PreparedOp,
+  cb: TxCallbacks = {}
+): Promise<TxStepState> {
   const state: TxStepState = {
     estimate: 'done',
     send: 'wait',
@@ -489,14 +609,16 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
   const lockHeld = prepared.lockIds.length > 0
   let broadcasted = false
   let resolved = false
-  let broadcastNonce = prepared.nonce
+  let broadcastNonce: number | null = null
   let awaitingWalletRecorded = false
   let awaitingWalletResolved = false
 
   try {
+    assertOperationActive(cb)
     const walletSend = runWalletExclusive(
       operationKey(prepared.chain, prepared.wallet),
       async () => {
+        assertOperationActive(cb)
         // Keep the final safety check, nonce read, and wallet request in one
         // cross-tab critical section so two tabs cannot send concurrently.
         const unresolvedLocal = countUnresolvedPendingOps(prepared.chain, prepared.wallet)
@@ -506,6 +628,7 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
           )
         }
 
+        await ensureHealthyReadProvider(prepared.chain)
         const inflight = await getPendingTxCount(prepared.chain, prepared.wallet)
         if (inflight > 0) {
           throw new Error(
@@ -513,58 +636,43 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
           )
         }
 
-        const readProvider = getReadProvider(prepared.chain)
         const [injectedAccount, injectedChainId] = await Promise.all([
           getInjectedAccount(),
           getInjectedChainId()
         ])
-        if (!injectedAccount || injectedAccount.toLowerCase() !== prepared.wallet.toLowerCase()) {
-          throw new Error('Wallet account changed during the operation. Reconnect and retry.')
-        }
-        if (injectedChainId !== prepared.chainId) {
-          throw new Error('Wallet is on the wrong network. Switch networks and retry.')
-        }
+        if (!injectedAccount) throw new Error('No wallet account available. Reconnect your wallet.')
+        assertPreparedContext(prepared, injectedAccount, injectedChainId)
 
-        const [walletNonce, rpcNonce, feeData, preVmuCount] = await Promise.all([
+        const units =
+          prepared.op === 'GENERAL_MINT' || prepared.op === 'CREATE_EMPTY_SLOT'
+            ? prepared.count
+            : prepared.ids.length
+        const feeApplies =
+          !FREE_CHAINS.includes(prepared.chain) &&
+          (prepared.op === 'GENERAL_MINT' ||
+            prepared.op === 'MINT_EMPTY_SLOT' ||
+            prepared.op === 'CLAIM_REUSE')
+
+        const [walletNonce, walletFee, preVmuCount] = await Promise.all([
           getInjectedPendingNonce(prepared.wallet),
-          readProvider.getTransactionCount(prepared.wallet, 'pending'),
-          readProvider.getFeeData(),
+          feeApplies ? readInjectedFactoryFee(prepared.factoryAddress) : Promise.resolve(0n),
           allocatesVmuIds(prepared.op)
-            ? readVmuCount(prepared.chain, prepared.wallet)
+            ? readInjectedVmuCount(prepared.factoryAddress, prepared.wallet)
             : Promise.resolve(undefined)
         ])
         prepared.preVmuCount = preVmuCount
-        const nonce = assertNonceAgreement(walletNonce, rpcNonce)
+        const nonce = walletNonce
         broadcastNonce = nonce
-        const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas ?? 1_000_000_000n
-        const maxFeePerGas =
-          feeData.maxFeePerGas ?? maxPriorityFeePerGas * 2n + (feeData.gasPrice ?? 0n)
+        const value = authoritativeServiceValue({
+          walletFee,
+          units,
+          feeApplies
+        })
 
         // Preparation can be seconds old by the time the user confirms. Re-read
         // selected IDs inside the cross-tab lock at the actual send boundary.
-        await assertIdsStillValid(
-          prepared.chain,
-          prepared.wallet,
-          prepared.op,
-          prepared.ids
-        )
-
-        state.send = 'process'
-        emit()
-
-        recordPendingOp({
-          id: prepared.batch,
-          chain: prepared.chain,
-          wallet: prepared.wallet,
-          op: prepared.op,
-          ids: prepared.ids,
-          count: prepared.count,
-          term: prepared.term,
-          txHash: '',
-          nonce,
-          phase: 'awaiting-wallet'
-        })
-        awaitingWalletRecorded = true
+        await assertIdsStillValid(prepared.chain, prepared.wallet, prepared.op, prepared.ids)
+        await simulatePreparedWithWallet(prepared, value)
 
         return writeFactory({
           chainId: prepared.chainId,
@@ -572,12 +680,34 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
           abi: XENFactoryABI,
           functionName: prepared.fnName,
           args: prepared.args,
-          value: prepared.value,
+          value,
           gas: prepared.gasLimit,
           nonce,
-          maxFeePerGas,
-          maxPriorityFeePerGas,
-          expectedFrom: prepared.wallet
+          expectedFrom: prepared.wallet,
+          onRequestStart: () => {
+            assertOperationActive(cb)
+            assertPreparedContext(prepared, prepared.wallet, prepared.chainId)
+            state.send = 'process'
+            emit()
+            recordPendingOp({
+              id: prepared.batch,
+              chain: prepared.chain,
+              wallet: prepared.wallet,
+              op: prepared.op,
+              ids: prepared.ids,
+              count: prepared.count,
+              term: prepared.term,
+              txHash: '',
+              nonce,
+              phase: 'awaiting-wallet'
+            })
+            awaitingWalletRecorded = true
+          },
+          onRequestSyncError: () => {
+            if (!awaitingWalletRecorded) return
+            removePendingOpRecord(prepared.batch)
+            awaitingWalletResolved = true
+          }
         })
       }
     )
@@ -603,11 +733,15 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
 
     state.confirm = 'process'
     emit()
-    const readProvider = getReadProvider(prepared.chain)
+    const readProvider = await ensureHealthyReadProvider(prepared.chain)
     const confirmMs = CONFIRM_TIMEOUT_MS[prepared.chain]
     let receipt
     try {
-      receipt = await withTimeout(readProvider.waitForTransaction(txHash, 1), confirmMs, 'Confirmation')
+      receipt = await withTimeout(
+        readProvider.waitForTransaction(txHash, 1),
+        confirmMs,
+        'Confirmation'
+      )
     } catch (err: any) {
       if (/Confirmation timed out/i.test(err?.message || '')) {
         state.confirm = 'error'
@@ -650,7 +784,7 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
     })
     resolved = true
     try {
-      state.outcome = await verifyOperationOutcome(prepared)
+      state.outcome = await verifyOperationOutcomeWithRetry(prepared)
     } catch {
       // The outer receipt is confirmed. A verifier failure only makes the
       // result uncertain and must not keep the operation or VMU locks pending.
@@ -675,7 +809,7 @@ export async function sendPreparedOperation(prepared: PreparedOp, cb: TxCallback
       })
       awaitingWalletResolved = true
     }
-    if (state.send === 'process') state.send = 'error'
+    if (!broadcasted && state.send !== 'done') state.send = 'error'
     else if (state.confirm === 'process') state.confirm = 'error'
     if (!state.error) state.error = normalizeError(err)
     emit()
@@ -711,7 +845,7 @@ export async function resumePendingLocks(chain: ChainKey, wallet: string): Promi
   clearSoftLocks(chain, wallet)
   const pending = pendingLocks(chain, wallet)
   if (!pending.length) return false
-  const provider = getReadProvider(chain)
+  const provider = await ensureHealthyReadProvider(chain)
   let resolvedAny = false
   await Promise.all(
     pending.map(async (lock) => {
@@ -741,6 +875,13 @@ export async function resumePendingLocks(chain: ChainKey, wallet: string): Promi
 
 export function normalizeError(err: any): string {
   const msg: string = err?.shortMessage || err?.reason || err?.message || String(err)
+  if (/OPERATION_CANCELLED/i.test(msg)) return 'Operation cancelled. No transaction was submitted.'
+  if (/Prepared transaction expired/i.test(msg))
+    return 'The prepared transaction expired after 2 minutes. Estimate it again before signing.'
+  if (/RPC_UNAVAILABLE|RPC_NOT_VALIDATED/i.test(msg))
+    return 'No configured RPC endpoint responded on the expected network. Your RPC list was preserved. Check internet access, DNS, firewall, and proxy/VPN settings, then retry; or change endpoints in RPC settings.'
+  if (/PENDING_STORAGE_WRITE_FAILED/i.test(msg))
+    return 'Browser storage is full or unavailable. Clear old site data before sending another transaction.'
   if (/PENDING_STATE_UNCERTAIN/i.test(msg))
     return 'Wallet and read RPC disagree about the pending nonce. Do not retry yet. Open MetaMask Activity, verify the selected network, then recheck.'
   if (/WALLET_ASLEEP/.test(msg))
@@ -759,9 +900,11 @@ export function normalizeError(err: any): string {
     return 'Transaction reverted on-chain. Refresh the list and try again.'
   if (/Wallet account changed|wrong network/i.test(msg)) return msg
   if (/still be pending/i.test(msg)) return msg
-  if (/VMU state changed|already pending|limited to|Term must|count must|No .* selected/i.test(msg)) return msg
+  if (/VMU state changed|already pending|limited to|Term must|count must|No .* selected/i.test(msg))
+    return msg
   if (/user rejected|denied|rejected the request/i.test(msg)) return 'Transaction rejected'
-  if (msg.includes('-32603')) return 'RPC node error (-32603). Try switching RPC / clear pending txs in MetaMask.'
+  if (msg.includes('-32603'))
+    return 'RPC node error (-32603). Try switching RPC / clear pending txs in MetaMask.'
   if (msg.includes('-32080') || /HTTP client error/i.test(msg))
     return 'Wallet RPC endpoint error. Change the network RPC in your wallet, or use the in-app RPC button.'
   if (/insufficient funds/i.test(msg)) return 'Insufficient funds for gas + fee'

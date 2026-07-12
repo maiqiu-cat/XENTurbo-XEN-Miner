@@ -6,6 +6,21 @@ import { CONTRACTS } from '../src/config/contracts'
 const WALLET = '0x00000000000000000000000000000000000000ab'
 const HASH = `0x${'1'.repeat(64)}`
 
+type PendingTransaction = {
+  from: string
+  to: string
+  data: string
+  nonce: number
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
 function createStorage(initial: Record<string, string> = {}): Storage {
   const values = new Map(Object.entries(initial))
   return {
@@ -20,29 +35,66 @@ function createStorage(initial: Record<string, string> = {}): Storage {
   }
 }
 
+function createInterleavingStorage(): {
+  storage: Storage
+  interceptNextWrite(effect: () => void): void
+} {
+  const base = createStorage()
+  let nextEffect: (() => void) | null = null
+  let runningEffect = false
+  return {
+    storage: {
+      get length() {
+        return base.length
+      },
+      clear: () => base.clear(),
+      getItem: (key) => base.getItem(key),
+      key: (index) => base.key(index),
+      removeItem: (key) => base.removeItem(key),
+      setItem(key, value) {
+        const effect = nextEffect
+        if (effect && !runningEffect) {
+          nextEffect = null
+          runningEffect = true
+          effect()
+          runningEffect = false
+        }
+        base.setItem(key, value)
+      }
+    },
+    interceptNextWrite(effect) {
+      nextEffect = effect
+    }
+  }
+}
+
 async function installPendingHarness(options: {
   latestNonce: number
   pendingNonce: number
   receipt?: { status: number } | null
-  transaction?: {
-    from: string
-    to: string
-    data: string
-    nonce: number
-  } | null
+  transaction?: PendingTransaction | null | Promise<PendingTransaction | null>
+  pendingBlock?: { transactions: unknown[] }
 }) {
   const provider = {
     getTransactionCount: vi.fn(async (_wallet: string, tag: 'latest' | 'pending') =>
       tag === 'latest' ? options.latestNonce : options.pendingNonce
     ),
     getTransactionReceipt: vi.fn(async () => options.receipt ?? null),
-    getTransaction: vi.fn(async () => options.transaction ?? null)
+    getTransaction: vi.fn(async () => await (options.transaction ?? null)),
+    send: vi.fn(async (method: string) => {
+      if (method !== 'eth_getBlockByNumber') throw new Error(`Unexpected method ${method}`)
+      return options.pendingBlock ?? { transactions: [] }
+    })
   }
   const releaseLocksByTxHash = vi.fn()
   const releaseLock = vi.fn()
   const attachTxHash = vi.fn()
 
-  vi.doMock('../src/core/rpc', () => ({ getReadProvider: () => provider }))
+  const ensureHealthyReadProvider = vi.fn(async () => provider)
+  vi.doMock('../src/core/rpc', () => ({
+    ensureHealthyReadProvider,
+    getReadProvider: () => provider
+  }))
   vi.doMock('../src/core/localLock', () => ({
     attachTxHash,
     pendingLocks: vi.fn(() => []),
@@ -51,7 +103,14 @@ async function installPendingHarness(options: {
   }))
 
   const pending = await import('../src/core/pendingOps')
-  return { pending, provider, attachTxHash, releaseLock, releaseLocksByTxHash }
+  return {
+    pending,
+    provider,
+    ensureHealthyReadProvider,
+    attachTxHash,
+    releaseLock,
+    releaseLocksByTxHash
+  }
 }
 
 function recordBroadcast(
@@ -118,10 +177,11 @@ describe('pending operation reconciliation', () => {
   })
 
   it('coalesces a tracked hash into the awaiting-wallet record with the same nonce', async () => {
-    const data = new Interface([
-      'function bulkClaimMintReward(uint256[] ids)'
-    ]).encodeFunctionData('bulkClaimMintReward', [[7n]])
-    const { pending, attachTxHash } = await installPendingHarness({
+    const data = new Interface(['function bulkClaimMintReward(uint256[] ids)']).encodeFunctionData(
+      'bulkClaimMintReward',
+      [[7n]]
+    )
+    const { pending, ensureHealthyReadProvider, attachTxHash } = await installPendingHarness({
       latestNonce: 7,
       pendingNonce: 8,
       receipt: null,
@@ -152,10 +212,14 @@ describe('pending operation reconciliation', () => {
     expect(stored).toHaveLength(1)
     expect(stored[0]).toMatchObject({ id: 'batch-1', txHash: HASH, nonce: 7 })
     expect(attachTxHash).toHaveBeenCalledWith('batch-1', HASH)
+    expect(ensureHealthyReadProvider).toHaveBeenCalledWith('eth')
   })
 
   it('uses the wallet address explorer URL when a record has no transaction hash', async () => {
-    const { pending } = await installPendingHarness({ latestNonce: 7, pendingNonce: 7 })
+    const { pending, ensureHealthyReadProvider } = await installPendingHarness({
+      latestNonce: 7,
+      pendingNonce: 7
+    })
     pending.recordPendingOp({
       id: 'batch-1',
       chain: 'eth',
@@ -171,6 +235,7 @@ describe('pending operation reconciliation', () => {
 
     const result = await pending.refreshPendingOps('eth', WALLET)
 
+    expect(ensureHealthyReadProvider).toHaveBeenCalledWith('eth')
     expect(result.views[0].explorerUrl).toBe(`${CHAINS.eth.blockExplorerUrl}/address/${WALLET}`)
     expect(result.views[0].explorerUrl).not.toContain('/tx/')
   })
@@ -242,7 +307,7 @@ describe('pending operation reconciliation', () => {
   })
 
   it('keeps a missing transaction unresolved while pending nonce covers its nonce', async () => {
-    const { pending, releaseLocksByTxHash } = await installPendingHarness({
+    const { pending, provider, releaseLocksByTxHash } = await installPendingHarness({
       latestNonce: 7,
       pendingNonce: 8,
       receipt: null,
@@ -258,6 +323,20 @@ describe('pending operation reconciliation', () => {
     expect(result.unresolvedCount).toBe(1)
     expect(result.views).toHaveLength(1)
     expect(releaseLocksByTxHash).not.toHaveBeenCalled()
+    expect(provider.send).not.toHaveBeenCalled()
+  })
+
+  it('throttles pending-block discovery for an unexplained nonce gap', async () => {
+    const { pending, provider } = await installPendingHarness({
+      latestNonce: 7,
+      pendingNonce: 8,
+      pendingBlock: { transactions: [] }
+    })
+
+    await pending.refreshPendingOps('eth', WALLET)
+    await pending.refreshPendingOps('eth', WALLET)
+
+    expect(provider.send).toHaveBeenCalledTimes(1)
   })
 
   it('marks a missing hash replaced after the confirmed account nonce advances', async () => {
@@ -297,6 +376,60 @@ describe('pending operation reconciliation', () => {
     expect(releaseLocksByTxHash).not.toHaveBeenCalled()
   })
 
+  it('does not overwrite a newer terminal record when an older refresh finishes', async () => {
+    const transaction = deferred<PendingTransaction | null>()
+    const { pending, provider } = await installPendingHarness({
+      latestNonce: 7,
+      pendingNonce: 7,
+      receipt: null,
+      transaction: transaction.promise
+    })
+    recordBroadcast(pending, { id: 'batch-1' })
+
+    const refresh = pending.refreshPendingOps('eth', WALLET)
+    await vi.waitFor(() => expect(provider.getTransaction).toHaveBeenCalledOnce())
+    expect(pending.markPendingOpDropped('batch-1')?.phase).toBe('dropped')
+
+    transaction.resolve(null)
+    const result = await refresh
+    const stored = pending.listPendingOps('eth', WALLET)[0]
+
+    expect(stored.phase).toBe('dropped')
+    expect(result.unresolvedCount).toBe(0)
+    expect(result.views).toHaveLength(0)
+  })
+
+  it('preserves a concurrent record written between refresh read and persistence', async () => {
+    const interleaving = createInterleavingStorage()
+    vi.stubGlobal('localStorage', interleaving.storage)
+    const { pending } = await installPendingHarness({
+      latestNonce: 8,
+      pendingNonce: 8,
+      receipt: { status: 1 },
+      transaction: null
+    })
+    recordBroadcast(pending, { id: 'batch-1' })
+    const concurrentHash = `0x${'2'.repeat(64)}`
+    interleaving.interceptNextWrite(() => {
+      pending.recordPendingOp({
+        id: 'batch-2',
+        chain: 'eth',
+        wallet: WALLET,
+        op: 'CLAIM',
+        ids: [8],
+        count: 0,
+        term: 0,
+        txHash: concurrentHash,
+        nonce: 8,
+        phase: 'broadcast'
+      })
+    })
+
+    await pending.refreshPendingOps('eth', WALLET)
+
+    expect(pending.listPendingOps('eth', WALLET).map((record) => record.id)).toContain('batch-2')
+  })
+
   it('migrates old records conservatively instead of deleting them by age', async () => {
     const oldRecord = {
       id: 'old-record',
@@ -309,10 +442,7 @@ describe('pending operation reconciliation', () => {
       txHash: HASH,
       submittedAt: Date.now() - 7 * 24 * 60 * 60 * 1000
     }
-    vi.stubGlobal(
-      'localStorage',
-      createStorage({ 'sm.pendingOps': JSON.stringify([oldRecord]) })
-    )
+    vi.stubGlobal('localStorage', createStorage({ 'sm.pendingOps': JSON.stringify([oldRecord]) }))
     const { pending } = await installPendingHarness({
       latestNonce: 7,
       pendingNonce: 7,
@@ -328,6 +458,48 @@ describe('pending operation reconciliation', () => {
       phase: 'broadcast',
       updatedAt: oldRecord.submittedAt
     })
+  })
+
+  it('retains unresolved records but bounds terminal history to 50 records and 7 days', async () => {
+    const now = Date.now()
+    const terminal = Array.from({ length: 55 }, (_, index) => ({
+      id: `terminal-${index}`,
+      chain: 'eth',
+      wallet: WALLET,
+      op: 'CLAIM',
+      ids: [index + 1],
+      count: 0,
+      term: 0,
+      txHash: `0x${(index + 2).toString(16).padStart(64, '0')}`,
+      nonce: index,
+      phase: 'confirmed',
+      submittedAt: now - index * 1_000,
+      updatedAt: now - index * 1_000
+    }))
+    const unresolved = {
+      ...terminal[0],
+      id: 'unresolved-old',
+      txHash: HASH,
+      phase: 'broadcast',
+      updatedAt: now - 30 * 24 * 60 * 60 * 1_000
+    }
+    const expired = {
+      ...terminal[0],
+      id: 'expired-terminal',
+      txHash: `0x${'f'.repeat(64)}`,
+      updatedAt: now - 8 * 24 * 60 * 60 * 1_000
+    }
+    vi.stubGlobal(
+      'localStorage',
+      createStorage({ 'sm.pendingOps': JSON.stringify([...terminal, unresolved, expired]) })
+    )
+    const { pending } = await installPendingHarness({ latestNonce: 0, pendingNonce: 0 })
+
+    const stored = pending.listPendingOps('eth', WALLET)
+
+    expect(stored.filter((record) => record.phase === 'confirmed')).toHaveLength(50)
+    expect(stored.some((record) => record.id === 'unresolved-old')).toBe(true)
+    expect(stored.some((record) => record.id === 'expired-terminal')).toBe(false)
   })
 
   it('supports an explicit dropped transition and only then releases the lock', async () => {
@@ -363,6 +535,15 @@ describe('pending operation reconciliation', () => {
     expect(pending.markPendingOpDropped('batch-1')).toBeNull()
     expect(pending.listPendingOps('eth', WALLET)[0].phase).toBe('confirmed')
   })
+
+  it('does not downgrade a confirmed record when a late broadcast event arrives', async () => {
+    const { pending } = await installPendingHarness({ latestNonce: 8, pendingNonce: 8 })
+    recordBroadcast(pending, { id: 'batch-1', phase: 'confirmed' })
+
+    recordBroadcast(pending, { id: 'batch-1', phase: 'broadcast' })
+
+    expect(pending.listPendingOps('eth', WALLET)[0].phase).toBe('confirmed')
+  })
 })
 
 describe('broadcast VMU locks', () => {
@@ -395,11 +576,6 @@ describe('transaction lock lifecycle', () => {
     const recordPendingOp = vi.fn()
     const provider = {
       getTransactionCount: vi.fn(async () => 7),
-      getFeeData: vi.fn(async () => ({
-        maxFeePerGas: 20n,
-        maxPriorityFeePerGas: 3n,
-        gasPrice: 10n
-      })),
       waitForTransaction: vi.fn(async () => null)
     }
 
@@ -412,15 +588,22 @@ describe('transaction lock lifecycle', () => {
           if (method === 'eth_accounts') return [WALLET]
           if (method === 'eth_chainId') return '0x1'
           if (method === 'eth_getTransactionCount') return '0x7'
+          if (method === 'eth_call') return '0x'
           throw new Error(`Unexpected method: ${method}`)
         }
       }
     })
     vi.doMock('../src/core/wallet', () => ({
       warmUpInjected: vi.fn(),
-      writeFactory: vi.fn(async () => HASH)
+      writeFactory: vi.fn(async (params: { onRequestStart?: () => void }) => {
+        params.onRequestStart?.()
+        return HASH
+      })
     }))
-    vi.doMock('../src/core/rpc', () => ({ getReadProvider: () => provider }))
+    vi.doMock('../src/core/rpc', () => ({
+      ensureHealthyReadProvider: vi.fn(async () => provider),
+      getReadProvider: () => provider
+    }))
     vi.doMock('../src/core/chainReader', () => ({
       readFee: vi.fn(),
       readVmuStatuses: vi.fn(async () => new Map([[7, 'CLAIMABLE']]))
@@ -439,6 +622,7 @@ describe('transaction lock lifecycle', () => {
     }))
 
     const { sendPreparedOperation } = await import('../src/core/txManager')
+    const preparedAt = Date.now()
     const send = sendPreparedOperation({
       chain: 'eth',
       wallet: WALLET,
@@ -448,15 +632,15 @@ describe('transaction lock lifecycle', () => {
       term: 0,
       chainId: 1,
       factoryAddress: '0x0000000000000000000000000000000000000001',
+      contextKey: `1:${WALLET.toLowerCase()}`,
+      preparedAt,
+      expiresAt: preparedAt + 120_000,
       gasLimit: 100_000n,
       fnName: 'bulkClaimMintReward',
       args: [[7n]],
       batch: 'batch-1',
       lockIds: [7],
-      state: { estimate: 'done', send: 'wait', confirm: 'wait' },
-      nonce: 7,
-      maxFeePerGas: 2n,
-      maxPriorityFeePerGas: 1n
+      state: { estimate: 'done', send: 'wait', confirm: 'wait' }
     })
 
     await expect(send).rejects.toThrow('Transaction receipt missing')

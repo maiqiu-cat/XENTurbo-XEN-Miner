@@ -7,7 +7,6 @@ declare module '*.vue' {
 }
 
 interface ImportMetaEnv {
-  readonly VITE_WALLETCONNECT_PROJECT_ID?: string
   readonly VITE_RPC_ETH?: string
   readonly VITE_RPC_POLYGON?: string
 }

@@ -23,50 +23,74 @@ export function usePendingTx(
   const lastCheckedAt = ref<number | null>(null)
   const error = ref<string | null>(null)
 
-  let timer: ReturnType<typeof setInterval> | null = null
+  let timer: ReturnType<typeof setTimeout> | null = null
   let gen = 0
+  let active: { generation: number; promise: Promise<number> } | null = null
+  let trailing = false
 
-  async function check(): Promise<number> {
+  function resetState(): void {
+    checking.value = false
+    pendingCount.value = 0
+    localUnresolvedCount.value = 0
+    ops.value = []
+  }
+
+  function check(): Promise<number> {
     const addr = address()
     const key = chain()
     if (!addr || !key) {
-      gen += 1
-      checking.value = false
-      pendingCount.value = 0
-      localUnresolvedCount.value = 0
-      ops.value = []
-      return 0
+      resetState()
+      return Promise.resolve(0)
     }
-    const myGen = ++gen
+    const myGen = gen
+    if (active?.generation === myGen) {
+      trailing = true
+      return active.promise
+    }
+
     checking.value = true
     error.value = null
-    try {
-      const { views, pendingNonceGap, unresolvedCount } = await refreshPendingOps(key, addr)
-      if (myGen !== gen) return pendingCount.value
-      pendingCount.value = pendingNonceGap
-      localUnresolvedCount.value = unresolvedCount
-      ops.value = views
-      lastCheckedAt.value = Date.now()
-      return pendingNonceGap
-    } catch (err: any) {
-      if (myGen !== gen) return pendingCount.value
-      error.value = err?.shortMessage || err?.message || 'Failed to check pending txs'
-      return pendingCount.value
-    } finally {
-      if (myGen === gen) checking.value = false
-    }
+    const promise = refreshPendingOps(key, addr)
+      .then(({ views, pendingNonceGap, unresolvedCount }) => {
+        if (myGen !== gen) return pendingCount.value
+        pendingCount.value = pendingNonceGap
+        localUnresolvedCount.value = unresolvedCount
+        ops.value = views
+        lastCheckedAt.value = Date.now()
+        return pendingNonceGap
+      })
+      .catch((err: any) => {
+        if (myGen !== gen) return pendingCount.value
+        error.value = err?.shortMessage || err?.message || 'Failed to check pending txs'
+        return pendingCount.value
+      })
+      .finally(() => {
+        if (active?.promise === promise) active = null
+        if (myGen !== gen) return
+        checking.value = false
+        if (trailing) {
+          trailing = false
+          void check()
+        }
+      })
+    active = { generation: myGen, promise }
+    return promise
   }
 
   function startPolling() {
     stopPolling()
-    void check()
-    timer = setInterval(() => {
-      void check()
-    }, 8_000)
+    const pollGen = gen
+    const poll = async () => {
+      await check()
+      if (pollGen !== gen) return
+      timer = setTimeout(() => void poll(), 8_000)
+    }
+    void poll()
   }
 
   function stopPolling() {
     gen += 1
+    trailing = false
     checking.value = false
     if (timer) {
       clearInterval(timer)
@@ -80,9 +104,7 @@ export function usePendingTx(
       if (addr && key) startPolling()
       else {
         stopPolling()
-        pendingCount.value = 0
-        localUnresolvedCount.value = 0
-        ops.value = []
+        resetState()
       }
     },
     { immediate: true }
@@ -90,9 +112,7 @@ export function usePendingTx(
 
   onScopeDispose(stopPolling)
 
-  const hasPending = computed(
-    () => pendingCount.value > 0 || localUnresolvedCount.value > 0
-  )
+  const hasPending = computed(() => pendingCount.value > 0 || localUnresolvedCount.value > 0)
 
   async function trackHash(txHash: string, seenText?: string): Promise<void> {
     const addr = address()
@@ -105,7 +125,9 @@ export function usePendingTx(
   async function markDropped(id: string): Promise<void> {
     const candidate = ops.value.find((op) => op.id === id)
     if (!candidate || !canMarkPendingOpDropped(candidate)) {
-      throw new Error('Only an unresolved transaction with unknown chain status can be marked dropped')
+      throw new Error(
+        'Only an unresolved transaction with unknown chain status can be marked dropped'
+      )
     }
     const dropped = markPendingOpDropped(id)
     if (!dropped) throw new Error('Pending transaction record no longer exists')

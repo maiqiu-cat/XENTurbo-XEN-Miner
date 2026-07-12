@@ -10,8 +10,20 @@ export interface MinerLimits {
 }
 
 export const LIMITS: Record<ChainKey, MinerLimits> = {
-  eth: { generalMint: 128, createEmptySlot: 500, mintEmptySlot: 150, claim: 350, claimAndReuse: 300 },
-  polygon: { generalMint: 65, createEmptySlot: 320, mintEmptySlot: 90, claim: 220, claimAndReuse: 160 }
+  eth: {
+    generalMint: 128,
+    createEmptySlot: 500,
+    mintEmptySlot: 150,
+    claim: 350,
+    claimAndReuse: 300
+  },
+  polygon: {
+    generalMint: 65,
+    createEmptySlot: 320,
+    mintEmptySlot: 90,
+    claim: 220,
+    claimAndReuse: 160
+  }
 }
 
 // gasLimit safety multiplier applied to estimated gas, ported from original.
@@ -38,6 +50,3 @@ export const CONFIRM_TIMEOUT_MS: Record<ChainKey, number> = {
   eth: 120_000,
   polygon: 180_000
 }
-
-/** Max time waiting for the user to approve/reject in the wallet UI. */
-export const SEND_TIMEOUT_MS = 10 * 60 * 1000

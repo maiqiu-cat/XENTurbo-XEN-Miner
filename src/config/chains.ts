@@ -19,12 +19,7 @@ export const CHAINS: Record<ChainKey, ChainConfig> = {
     chainId: 1,
     name: 'Ethereum',
     nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
-    defaultRpcUrls: [
-      'https://ethereum.publicnode.com',
-      'https://ethereum-rpc.publicnode.com',
-      'https://rpc.ankr.com/eth',
-      'https://cloudflare-eth.com'
-    ],
+    defaultRpcUrls: ['https://ethereum.publicnode.com', 'https://ethereum-rpc.publicnode.com'],
     blockExplorerUrl: 'https://etherscan.io'
   },
   polygon: {
@@ -45,9 +40,6 @@ export const CHAINS: Record<ChainKey, ChainConfig> = {
 
 export const CHAIN_KEYS = Object.keys(CHAINS) as ChainKey[]
 
-export const chainByChainId = (chainId: number): ChainConfig | undefined =>
-  CHAIN_KEYS.map((k) => CHAINS[k]).find((c) => c.chainId === chainId)
-
 /**
  * Resolve effective RPC list for a chain.
  * Priority: user overrides (localStorage) > env override > defaults.
@@ -62,6 +54,7 @@ export function getRpcUrls(key: ChainKey): string[] {
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean)
+      .map(normalizeHttpsRpcUrl)
   }
   return CHAINS[key].defaultRpcUrls
 }
@@ -79,16 +72,38 @@ function readAllCustomRpc(): Record<string, string[]> {
 
 export function readCustomRpc(key: ChainKey): string[] {
   const all = readAllCustomRpc()
-  return Array.isArray(all[key]) ? all[key] : []
+  if (!Array.isArray(all[key])) return []
+  return all[key].flatMap((url) => {
+    try {
+      return [normalizeHttpsRpcUrl(url)]
+    } catch {
+      return []
+    }
+  })
 }
 
 export function writeCustomRpc(key: ChainKey, urls: string[]): void {
   const all = readAllCustomRpc()
-  const cleaned = urls.map((u) => u.trim()).filter(Boolean)
+  const cleaned = urls.map(normalizeHttpsRpcUrl)
   if (cleaned.length) {
     all[key] = cleaned
   } else {
     delete all[key]
   }
   localStorage.setItem(RPC_STORAGE_KEY, JSON.stringify(all))
+}
+
+/** Normalize and reject RPC URLs that are unsafe to persist in the browser. */
+export function normalizeHttpsRpcUrl(value: string): string {
+  let url: URL
+  try {
+    url = new URL(value.trim())
+  } catch {
+    throw new Error('RPC endpoint must be a valid HTTPS URL')
+  }
+  if (url.protocol !== 'https:') throw new Error('RPC endpoint must use HTTPS')
+  if (url.username || url.password) {
+    throw new Error('RPC endpoint must not contain credentials in the URL')
+  }
+  return url.toString()
 }

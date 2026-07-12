@@ -11,12 +11,13 @@ const walletApi = vi.hoisted(() => ({
 }))
 
 const rpc = vi.hoisted(() => ({
-  getCode: vi.fn()
+  getCode: vi.fn(),
+  ensureHealthyReadProvider: vi.fn()
 }))
 
 vi.mock('@/core/wallet', () => walletApi)
 vi.mock('@/core/rpc', () => ({
-  getReadProvider: () => ({ getCode: rpc.getCode })
+  ensureHealthyReadProvider: rpc.ensureHealthyReadProvider
 }))
 
 import { useWalletStore } from '@/stores/walletStore'
@@ -45,6 +46,7 @@ describe('wallet store request invalidation', () => {
     walletApi.switchToChain.mockResolvedValue(undefined)
     walletApi.currentAccount.mockReturnValue({})
     rpc.getCode.mockResolvedValue('0x')
+    rpc.ensureHealthyReadProvider.mockResolvedValue({ getCode: rpc.getCode })
     stateListener = undefined
     walletApi.onAccountChange.mockImplementation((listener) => {
       stateListener = listener
@@ -64,6 +66,8 @@ describe('wallet store request invalidation', () => {
     expect(store.address).toBe(walletA)
     expect(store.chainId).toBe(137)
     expect(store.ready).toBe(true)
+    expect(store.contractWalletChecked).toBe(true)
+    expect(rpc.ensureHealthyReadProvider).toHaveBeenCalledWith('polygon')
     expect(walletApi.currentAccount).not.toHaveBeenCalled()
   })
 
@@ -132,6 +136,16 @@ describe('wallet store request invalidation', () => {
     expect(store.address).toBe(walletB)
     expect(store.chainId).toBe(137)
     expect(store.isContractWallet).toBe(false)
+  })
+
+  it('does not treat an RPC failure as a verified EOA result', async () => {
+    rpc.ensureHealthyReadProvider.mockRejectedValueOnce(new Error('RPC_UNAVAILABLE'))
+    const store = useWalletStore()
+
+    await store.applyAccount(walletA, 1)
+
+    expect(store.isContractWallet).toBe(false)
+    expect(store.contractWalletChecked).toBe(false)
   })
 
   it('does not let an old switch rejection clear or overwrite a newer switch', async () => {

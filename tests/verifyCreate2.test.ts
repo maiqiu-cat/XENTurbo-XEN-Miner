@@ -27,14 +27,10 @@ const xenInterface = new Interface([
 const servers = new Set<Server>()
 
 afterEach(async () => {
-  await Promise.all(
-    [...servers].map(
-      (server) =>
-        new Promise<void>((resolve, reject) =>
-          server.close((error) => (error ? reject(error) : resolve()))
-        )
-    )
-  )
+  for (const server of servers) {
+    server.closeAllConnections()
+    if (server.listening) server.close()
+  }
   servers.clear()
 })
 
@@ -113,12 +109,19 @@ async function runVerification({
         id,
         result: rpcResult(method, params, { activeIds, chainId, vmuCount, wallet, xen })
       }))
-      response.writeHead(200, { 'Content-Type': 'application/json' })
+      response.writeHead(200, { 'Content-Type': 'application/json', Connection: 'close' })
       response.end(JSON.stringify(Array.isArray(payload) ? replies : replies[0]))
     })
   })
   servers.add(server)
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => reject(error)
+    server.once('error', onError)
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', onError)
+      resolve()
+    })
+  })
   const address = server.address()
   if (!address || typeof address === 'string') throw new Error('Mock RPC failed to bind')
 

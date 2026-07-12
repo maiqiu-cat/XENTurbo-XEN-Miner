@@ -106,8 +106,12 @@ export async function verifyCreate2({ config, provider, wallet, log = console.lo
 async function main() {
   const { config, rpcUrl, wallet } = parseVerificationArgs(process.argv.slice(2))
   const provider = new JsonRpcProvider(rpcUrl)
-  const verified = await verifyCreate2({ config, provider, wallet })
-  if (!verified) process.exitCode = 2
+  try {
+    const verified = await verifyCreate2({ config, provider, wallet })
+    if (!verified) process.exitCode = 2
+  } finally {
+    provider.destroy()
+  }
 }
 
 if (import.meta.url === new URL(process.argv[1], 'file:').href) {

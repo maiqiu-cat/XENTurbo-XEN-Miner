@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { Interface } from 'ethers'
 import {
   createInMemoryExclusiveGate,
   operationKey,
@@ -8,6 +9,18 @@ import {
 afterEach(() => {
   vi.unstubAllGlobals()
 })
+
+const feeInterface = new Interface(['function FEE() view returns (uint256)'])
+const feeResult = feeInterface.encodeFunctionResult('FEE', [18n])
+
+function preparedContext() {
+  const preparedAt = Date.now()
+  return {
+    contextKey: '1:0xabc',
+    preparedAt,
+    expiresAt: preparedAt + 120_000
+  }
+}
 
 describe('operation gate', () => {
   it('scopes sends by chain and normalized wallet address', () => {
@@ -66,15 +79,12 @@ describe('operation gate', () => {
 
   it('keeps the final pending check and wallet send inside one browser lock', async () => {
     vi.resetModules()
+    const walletAddress = '0x0000000000000000000000000000000000000abc'
     const events: string[] = []
     const provider = {
       getTransactionCount: vi.fn(async (_wallet: string, blockTag: string) => {
         events.push(`nonce:${blockTag}`)
         return 7
-      }),
-      getFeeData: vi.fn(async () => {
-        events.push('fees')
-        return { maxFeePerGas: 2n, maxPriorityFeePerGas: 1n, gasPrice: 1n }
       }),
       waitForTransaction: vi.fn(async () => {
         events.push('confirm')
@@ -84,14 +94,18 @@ describe('operation gate', () => {
 
     vi.doMock('../src/core/wallet', () => ({
       warmUpInjected: vi.fn(),
-      writeFactory: vi.fn(async () => {
+      writeFactory: vi.fn(async (params: { onRequestStart?: () => void }) => {
+        params.onRequestStart?.()
         events.push('send')
         return '0xhash'
       })
     }))
-    vi.doMock('../src/core/rpc', () => ({ getReadProvider: () => provider }))
+    vi.doMock('../src/core/rpc', () => ({
+      ensureHealthyReadProvider: vi.fn(async () => provider),
+      getReadProvider: () => provider
+    }))
     vi.doMock('../src/core/chainReader', () => ({
-      readFee: vi.fn(),
+      readFee: vi.fn(async () => 18n),
       readVmuCount: vi.fn(async () => 0),
       readVmuStatuses: vi.fn()
     }))
@@ -110,6 +124,10 @@ describe('operation gate', () => {
       }),
       recordPendingOp: vi.fn()
     }))
+    vi.doMock('../src/core/postconditions', () => ({
+      verifyOperationOutcomeWithRetry: vi.fn(async () => ({ classification: 'full' })),
+      uncertainOperationOutcome: vi.fn(() => ({ classification: 'uncertain' }))
+    }))
     vi.stubGlobal('navigator', {
       locks: {
         request: async (_key: string, work: () => Promise<string>) => {
@@ -126,9 +144,10 @@ describe('operation gate', () => {
       ethereum: {
         request: async ({ method }: { method: string }) => {
           events.push(`wallet:${method}`)
-          if (method === 'eth_accounts') return ['0xAbC']
+          if (method === 'eth_accounts') return [walletAddress]
           if (method === 'eth_chainId') return '0x1'
           if (method === 'eth_getTransactionCount') return '0x7'
+          if (method === 'eth_call') return feeResult
           throw new Error(`Unexpected wallet method: ${method}`)
         }
       }
@@ -137,38 +156,39 @@ describe('operation gate', () => {
     const { sendPreparedOperation } = await import('../src/core/txManager')
     await sendPreparedOperation({
       chain: 'eth',
-      wallet: '0xAbC',
+      wallet: walletAddress,
       op: 'GENERAL_MINT',
       ids: [],
       count: 1,
       term: 100,
       chainId: 1,
       factoryAddress: '0x0000000000000000000000000000000000000001',
+      ...preparedContext(),
       gasLimit: 100_000n,
       fnName: 'bulkClaimRank',
       args: [100n, 1n],
       batch: 'batch-1',
       lockIds: [],
-      state: { estimate: 'done', send: 'wait', confirm: 'wait' },
-      nonce: 7,
-      maxFeePerGas: 2n,
-      maxPriorityFeePerGas: 1n
+      state: { estimate: 'done', send: 'wait', confirm: 'wait' }
     })
 
     expect(events).toEqual([
       'lock:start',
       'local:pending',
-      'nonce:latest',
-      'nonce:pending',
+      'wallet:eth_chainId',
+      'wallet:eth_getTransactionCount',
+      'wallet:eth_getTransactionCount',
       'wallet:eth_accounts',
       'wallet:eth_chainId',
       'wallet:eth_getTransactionCount',
-      'nonce:pending',
-      'fees',
+      'wallet:eth_call',
+      'wallet:eth_call',
+      'wallet:eth_call',
       'send',
       'lock:end',
       'confirm'
     ])
+    expect(provider.getTransactionCount).not.toHaveBeenCalled()
   })
 
   it('blocks a locally unresolved operation before any nonce read or wallet request', async () => {
@@ -185,7 +205,10 @@ describe('operation gate', () => {
       warmUpInjected: vi.fn(),
       writeFactory
     }))
-    vi.doMock('../src/core/rpc', () => ({ getReadProvider: () => provider }))
+    vi.doMock('../src/core/rpc', () => ({
+      ensureHealthyReadProvider: vi.fn(async () => provider),
+      getReadProvider: () => provider
+    }))
     vi.doMock('../src/core/chainReader', () => ({
       readFee: vi.fn(),
       readVmuStatuses: vi.fn()
@@ -229,15 +252,13 @@ describe('operation gate', () => {
       term: 100,
       chainId: 1,
       factoryAddress: '0x0000000000000000000000000000000000000001' as const,
+      ...preparedContext(),
       gasLimit: 100_000n,
       fnName: 'bulkClaimRank',
       args: [100n, 1n],
       batch: 'batch-1',
       lockIds: [],
-      state: { estimate: 'done' as const, send: 'wait' as const, confirm: 'wait' as const },
-      nonce: 7,
-      maxFeePerGas: 2n,
-      maxPriorityFeePerGas: 1n
+      state: { estimate: 'done' as const, send: 'wait' as const, confirm: 'wait' as const }
     }
 
     await expect(sendPreparedOperation(prepared)).rejects.toThrow('LOCAL_PENDING_UNRESOLVED')
@@ -262,10 +283,6 @@ describe('operation gate', () => {
         events.push(`nonce:${blockTag}`)
         return 7
       }),
-      getFeeData: vi.fn(async () => {
-        events.push('fees')
-        return { maxFeePerGas: 2n, maxPriorityFeePerGas: 1n, gasPrice: 1n }
-      }),
       waitForTransaction: vi.fn()
     }
 
@@ -273,9 +290,12 @@ describe('operation gate', () => {
       warmUpInjected: vi.fn(),
       writeFactory
     }))
-    vi.doMock('../src/core/rpc', () => ({ getReadProvider: () => provider }))
+    vi.doMock('../src/core/rpc', () => ({
+      ensureHealthyReadProvider: vi.fn(async () => provider),
+      getReadProvider: () => provider
+    }))
     vi.doMock('../src/core/chainReader', () => ({
-      readFee: vi.fn(),
+      readFee: vi.fn(async () => 18n),
       readVmuCount: vi.fn(),
       readVmuStatuses: vi.fn(async () => {
         events.push('ids:validate')
@@ -316,6 +336,7 @@ describe('operation gate', () => {
           if (method === 'eth_accounts') return ['0xAbC']
           if (method === 'eth_chainId') return '0x1'
           if (method === 'eth_getTransactionCount') return '0x7'
+          if (method === 'eth_call') return feeResult
           throw new Error(`Unexpected wallet method: ${method}`)
         }
       }
@@ -332,28 +353,26 @@ describe('operation gate', () => {
         term: 100,
         chainId: 1,
         factoryAddress: '0x0000000000000000000000000000000000000001',
+        ...preparedContext(),
         gasLimit: 100_000n,
         fnName: 'reuseVMUs',
         args: [[4n], 100n],
         batch: 'batch-1',
         lockIds: [4],
-        state: { estimate: 'done', send: 'wait', confirm: 'wait' },
-        nonce: 7,
-        maxFeePerGas: 2n,
-        maxPriorityFeePerGas: 1n
+        state: { estimate: 'done', send: 'wait', confirm: 'wait' }
       })
     ).rejects.toThrow('VMU state changed on-chain')
 
     expect(events).toEqual([
       'lock:start',
       'local:pending',
-      'nonce:latest',
-      'nonce:pending',
+      'wallet:eth_chainId',
+      'wallet:eth_getTransactionCount',
+      'wallet:eth_getTransactionCount',
       'wallet:eth_accounts',
       'wallet:eth_chainId',
       'wallet:eth_getTransactionCount',
-      'nonce:pending',
-      'fees',
+      'wallet:eth_call',
       'ids:validate',
       'lock:end'
     ])

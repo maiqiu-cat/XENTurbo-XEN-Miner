@@ -7,12 +7,13 @@ import {
   switchToChain,
   chainIdToKey
 } from '@/core/wallet'
-import { getReadProvider } from '@/core/rpc'
+import { ensureHealthyReadProvider } from '@/core/rpc'
 
 interface State {
   address: string | null
   chainId: number | null
   isContractWallet: boolean
+  contractWalletChecked: boolean
   ready: boolean
   connectError: string | null
   /** True while waiting for the wallet to approve / finish a chain switch. */
@@ -53,6 +54,7 @@ export const useWalletStore = defineStore('wallet', {
     address: null,
     chainId: null,
     isContractWallet: false,
+    contractWalletChecked: false,
     ready: false,
     connectError: null,
     switchingChain: false,
@@ -62,7 +64,7 @@ export const useWalletStore = defineStore('wallet', {
   getters: {
     isConnected: (s): boolean => !!s.address,
     // The active chain key, only if it is a supported chain.
-    chainKey: (s): ChainKey | null => (s.chainId ? chainIdToKey[s.chainId] ?? null : null),
+    chainKey: (s): ChainKey | null => (s.chainId ? (chainIdToKey[s.chainId] ?? null) : null),
     isSupportedChain(): boolean {
       return this.chainKey !== null
     }
@@ -100,6 +102,7 @@ export const useWalletStore = defineStore('wallet', {
       this.address = address ?? null
       this.chainId = chainId ?? null
       this.isContractWallet = false
+      this.contractWalletChecked = false
       this.switchingChain = false
       this.switchError = null
       if (address && chainId) {
@@ -118,14 +121,24 @@ export const useWalletStore = defineStore('wallet', {
         this.chainId === chainId
       const key = chainIdToKey[chainId]
       if (!key) {
-        if (isCurrent()) this.isContractWallet = false
+        if (isCurrent()) {
+          this.isContractWallet = false
+          this.contractWalletChecked = false
+        }
         return
       }
       try {
-        const code = await getReadProvider(key).getCode(_address)
-        if (isCurrent()) this.isContractWallet = isContractCode(code)
+        const provider = await ensureHealthyReadProvider(key)
+        const code = await provider.getCode(_address)
+        if (isCurrent()) {
+          this.isContractWallet = isContractCode(code)
+          this.contractWalletChecked = true
+        }
       } catch {
-        if (isCurrent()) this.isContractWallet = false
+        if (isCurrent()) {
+          this.isContractWallet = false
+          this.contractWalletChecked = false
+        }
       }
     },
 

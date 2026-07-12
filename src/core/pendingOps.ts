@@ -2,19 +2,19 @@ import { Interface } from 'ethers'
 import type { ChainKey } from '@/config/chains'
 import { CHAINS } from '@/config/chains'
 import { CONTRACTS } from '@/config/contracts'
-import { getReadProvider } from './rpc'
+import { ensureHealthyReadProvider, getReadProvider } from './rpc'
 import { attachTxHash, pendingLocks, releaseLock, releaseLocksByTxHash } from './localLock'
 import type { OpType } from './txManager'
 
-const KEY = 'sm.pendingOps'
+const LEGACY_KEY = 'sm.pendingOps'
+const EVENT_KEY_PREFIX = 'sm.pendingOps.event.'
+const TERMINAL_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000
+const TERMINAL_RECORD_LIMIT = 50
+const DISCOVERY_THROTTLE_MS = 60_000
+const lastDiscoveryAt = new Map<string, number>()
 
 export type PendingPhase =
-  | 'awaiting-wallet'
-  | 'broadcast'
-  | 'confirmed'
-  | 'reverted'
-  | 'replaced'
-  | 'dropped'
+  'awaiting-wallet' | 'broadcast' | 'confirmed' | 'reverted' | 'replaced' | 'dropped'
 
 const UNRESOLVED_PHASES = new Set<PendingPhase>(['awaiting-wallet', 'broadcast'])
 
@@ -39,6 +39,17 @@ export interface PendingOpView extends PendingOpRecord {
   detail: string
   explorerUrl: string
   status: 'pending' | 'confirmed' | 'reverted' | 'replaced' | 'dropped' | 'unknown'
+}
+
+interface PendingStorageEvent {
+  recordId: string
+  updatedAt: number
+  record: PendingOpRecord | null
+}
+
+interface StoredPendingEvent {
+  key: string
+  value: PendingStorageEvent
 }
 
 const OP_LABELS: Record<OpType, string> = {
@@ -100,26 +111,164 @@ function isPendingPhase(value: unknown): value is PendingPhase {
   )
 }
 
+function nextUpdatedAt(previous = 0): number {
+  return Math.max(Date.now(), previous + 0.001)
+}
+
+function eventKey(): string {
+  return `${EVENT_KEY_PREFIX}${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
+}
+
+function appendStorageEvent(value: PendingStorageEvent): void {
+  try {
+    localStorage.setItem(eventKey(), JSON.stringify(value))
+  } catch {
+    throw new Error(
+      'PENDING_STORAGE_WRITE_FAILED: Browser storage is full or unavailable. Clear old site data before sending another transaction.'
+    )
+  }
+}
+
+function appendRecord(record: PendingOpRecord): void {
+  appendStorageEvent({ recordId: record.id, updatedAt: record.updatedAt, record })
+}
+
+function appendTombstone(record: PendingOpRecord): void {
+  appendStorageEvent({
+    recordId: record.id,
+    updatedAt: nextUpdatedAt(record.updatedAt),
+    record: null
+  })
+}
+
+function storageEventPriority(event: StoredPendingEvent): number {
+  const record = event.value.record
+  if (!record) return 100
+  if (!isUnresolvedPending(record)) return 80
+  if (record.phase === 'broadcast' || record.txHash) return 40
+  return 20
+}
+
+function newerStorageEvent(
+  current: StoredPendingEvent | undefined,
+  candidate: StoredPendingEvent
+): StoredPendingEvent {
+  if (!current) return candidate
+  if (candidate.value.updatedAt !== current.value.updatedAt) {
+    return candidate.value.updatedAt > current.value.updatedAt ? candidate : current
+  }
+  const priorityDifference = storageEventPriority(candidate) - storageEventPriority(current)
+  if (priorityDifference !== 0) return priorityDifference > 0 ? candidate : current
+  return candidate.key > current.key ? candidate : current
+}
+
+function readStoredEvents(): StoredPendingEvent[] {
+  const keys = Array.from({ length: localStorage.length }, (_, index) =>
+    localStorage.key(index)
+  ).filter((key): key is string => Boolean(key?.startsWith(EVENT_KEY_PREFIX)))
+  const events: StoredPendingEvent[] = []
+  for (const key of keys) {
+    try {
+      const raw = localStorage.getItem(key)
+      if (!raw) continue
+      const parsed = JSON.parse(raw) as Partial<PendingStorageEvent>
+      const record = parsed.record === null ? null : normalizeRecord(parsed.record)
+      if (
+        typeof parsed.recordId !== 'string' ||
+        typeof parsed.updatedAt !== 'number' ||
+        !Number.isFinite(parsed.updatedAt) ||
+        (parsed.record !== null && (!record || record.id !== parsed.recordId))
+      ) {
+        localStorage.removeItem(key)
+        continue
+      }
+      events.push({
+        key,
+        value: { recordId: parsed.recordId, updatedAt: parsed.updatedAt, record }
+      })
+    } catch {
+      localStorage.removeItem(key)
+    }
+  }
+  return events
+}
+
+function migrateLegacyRecords(): void {
+  const raw = localStorage.getItem(LEGACY_KEY)
+  if (!raw) return
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (Array.isArray(parsed)) {
+      for (const value of parsed) {
+        const record = normalizeRecord(value)
+        if (record) appendRecord(record)
+      }
+    }
+    localStorage.removeItem(LEGACY_KEY)
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('PENDING_STORAGE_WRITE_FAILED')) {
+      throw error
+    }
+    localStorage.removeItem(LEGACY_KEY)
+  }
+}
+
 function readAll(): PendingOpRecord[] {
   try {
-    const raw = localStorage.getItem(KEY)
-    const list = raw ? (JSON.parse(raw) as unknown[]) : []
-    if (!Array.isArray(list)) return []
-    const valid = list.map(normalizeRecord).filter((r): r is PendingOpRecord => r !== null)
-    const needsMigration = list.some((record) => {
-      if (!record || typeof record !== 'object') return true
-      const value = record as Record<string, unknown>
-      return !('nonce' in value) || !isPendingPhase(value.phase) || typeof value.updatedAt !== 'number'
-    })
-    if (valid.length !== list.length || needsMigration) writeAll(valid)
-    return valid
+    migrateLegacyRecords()
+    const events = readStoredEvents()
+    const winners = new Map<string, StoredPendingEvent>()
+    for (const event of events) {
+      winners.set(event.value.recordId, newerStorageEvent(winners.get(event.value.recordId), event))
+    }
+
+    const records = [...winners.values()].flatMap((event) =>
+      event.value.record ? [event.value.record] : []
+    )
+    const pruned = prunePendingRecords(records)
+    const retainedIds = new Set(pruned.map((record) => record.id))
+
+    // Compact only keys observed in this snapshot. A concurrent writer uses a
+    // unique key and therefore cannot be deleted or overwritten here.
+    for (const event of events) {
+      const winner = winners.get(event.value.recordId)
+      if (winner?.key !== event.key || !retainedIds.has(event.value.recordId)) {
+        localStorage.removeItem(event.key)
+      }
+    }
+    return pruned
   } catch {
     return []
   }
 }
 
-function writeAll(list: PendingOpRecord[]): void {
-  localStorage.setItem(KEY, JSON.stringify(list))
+function sameRecordRevision(a: PendingOpRecord, b: PendingOpRecord): boolean {
+  return (
+    a.id === b.id &&
+    a.chain === b.chain &&
+    a.wallet.toLowerCase() === b.wallet.toLowerCase() &&
+    a.op === b.op &&
+    a.ids.length === b.ids.length &&
+    a.ids.every((id, index) => id === b.ids[index]) &&
+    a.count === b.count &&
+    a.term === b.term &&
+    a.updatedAt === b.updatedAt &&
+    a.submittedAt === b.submittedAt &&
+    a.phase === b.phase &&
+    a.txHash === b.txHash &&
+    a.nonce === b.nonce
+  )
+}
+
+export function prunePendingRecords(list: PendingOpRecord[], now = Date.now()): PendingOpRecord[] {
+  const unresolved = list.filter(isUnresolvedPending)
+  const terminal = list
+    .filter(
+      (record) => !isUnresolvedPending(record) && now - record.updatedAt <= TERMINAL_RETENTION_MS
+    )
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .slice(0, TERMINAL_RECORD_LIMIT)
+  return [...unresolved, ...terminal]
 }
 
 function detailFor(r: Pick<PendingOpRecord, 'op' | 'ids' | 'count' | 'term'>): string {
@@ -204,29 +353,41 @@ export function recordPendingOp(params: {
     existing?.submittedAt ?? Number.POSITIVE_INFINITY,
     params.submittedAt ?? Date.now()
   )
+  const requestedPhase =
+    params.phase ?? existing?.phase ?? (params.txHash ? 'broadcast' : 'awaiting-wallet')
+  const phase =
+    existing &&
+    !isUnresolvedPending(existing) &&
+    isUnresolvedPending({ phase: requestedPhase }) &&
+    !(existing.phase === 'dropped' && normalizedHash.length > 0)
+      ? existing.phase
+      : requestedPhase
   const rec: PendingOpRecord = {
     id: existing?.id ?? params.id ?? `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     chain: params.chain,
     wallet: params.wallet,
     op: params.op,
-    ids: params.ids.length ? params.ids : existing?.ids ?? [],
+    ids: params.ids.length ? params.ids : (existing?.ids ?? []),
     count: params.count || existing?.count || 0,
     term: params.term || existing?.term || 0,
     txHash: params.txHash,
     nonce: params.nonce ?? existing?.nonce ?? null,
-    phase: params.phase ?? existing?.phase ?? (params.txHash ? 'broadcast' : 'awaiting-wallet'),
+    phase,
     // Earliest known time ≈ when the tx entered the mempool from our perspective.
     // Pending txs have no on-chain block timestamp until mined.
     submittedAt: Number.isFinite(submittedAt) ? submittedAt : Date.now(),
-    updatedAt: Date.now()
+    updatedAt: nextUpdatedAt(existing?.updatedAt)
   }
-  const list = readAll().filter(
-    (record) =>
-      record.id !== rec.id &&
-      (normalizedHash.length === 0 || record.txHash.toLowerCase() !== normalizedHash)
-  )
-  list.push(rec)
-  writeAll(list)
+  for (const duplicate of all) {
+    if (
+      duplicate.id !== rec.id &&
+      normalizedHash.length > 0 &&
+      duplicate.txHash.toLowerCase() === normalizedHash
+    ) {
+      appendTombstone(duplicate)
+    }
+  }
+  appendRecord(rec)
   if (rec.txHash && isUnresolvedPending(rec)) {
     attachTxHash(rec.id, rec.txHash)
   } else if (!isUnresolvedPending(rec)) {
@@ -244,9 +405,7 @@ export function canMarkPendingOpDropped(
   record: Pick<PendingOpView, 'id' | 'phase' | 'status'>
 ): boolean {
   return (
-    record.id !== 'unknown-pending' &&
-    record.status === 'unknown' &&
-    isUnresolvedPending(record)
+    record.id !== 'unknown-pending' && record.status === 'unknown' && isUnresolvedPending(record)
   )
 }
 
@@ -256,15 +415,16 @@ function transitionPendingOp(
   canTransition: (record: PendingOpRecord) => boolean = () => true
 ): PendingOpRecord | null {
   const normalized = identifier.toLowerCase()
-  const list = readAll()
-  const index = list.findIndex(
+  const record = readAll().find(
     (record) => record.id === identifier || record.txHash.toLowerCase() === normalized
   )
-  if (index < 0) return null
-  if (!canTransition(list[index])) return null
-  const updated: PendingOpRecord = { ...list[index], phase, updatedAt: Date.now() }
-  list[index] = updated
-  writeAll(list)
+  if (!record || !canTransition(record)) return null
+  const updated: PendingOpRecord = {
+    ...record,
+    phase,
+    updatedAt: nextUpdatedAt(record.updatedAt)
+  }
+  appendRecord(updated)
   if (!isUnresolvedPending(updated)) {
     releaseLock(updated.id)
     if (updated.txHash) releaseLocksByTxHash(updated.txHash)
@@ -276,12 +436,24 @@ export function markPendingOpDropped(identifier: string): PendingOpRecord | null
   return transitionPendingOp(identifier, 'dropped', isUnresolvedPending)
 }
 
+export function removePendingOpRecord(identifier: string): boolean {
+  const normalized = identifier.toLowerCase()
+  const matches = readAll().filter(
+    (record) => record.id === identifier || record.txHash.toLowerCase() === normalized
+  )
+  for (const record of matches) {
+    appendTombstone(record)
+    releaseLock(record.id)
+    if (record.txHash) releaseLocksByTxHash(record.txHash)
+  }
+  return matches.length > 0
+}
+
 export function removePendingOp(txHash: string): void {
   const normalized = txHash.toLowerCase()
-  const list = readAll()
-  const removed = list.some((record) => record.txHash.toLowerCase() === normalized)
-  writeAll(list.filter((record) => record.txHash.toLowerCase() !== normalized))
-  if (removed) releaseLocksByTxHash(txHash)
+  const matches = readAll().filter((record) => record.txHash.toLowerCase() === normalized)
+  for (const record of matches) appendTombstone(record)
+  if (matches.length > 0) releaseLocksByTxHash(txHash)
 }
 
 const EXPLORER_DATE_RE =
@@ -334,7 +506,7 @@ export async function trackPendingTxHash(
   if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) {
     throw new Error('Invalid transaction hash')
   }
-  const provider = getReadProvider(chain)
+  const provider = await ensureHealthyReadProvider(chain)
   const injected = getInjected()
   const factory = CONTRACTS[chain].factory.toLowerCase()
 
@@ -409,11 +581,7 @@ export function reconcilePendingOp(
 
   if (observation.receipt) {
     phase = observation.receipt.status === 0 ? 'reverted' : 'confirmed'
-  } else if (
-    !observation.transactionFound &&
-    nonce !== null &&
-    observation.latestNonce > nonce
-  ) {
+  } else if (!observation.transactionFound && nonce !== null && observation.latestNonce > nonce) {
     // A confirmed account nonce beyond this nonce proves another transaction
     // consumed it. A lower pending nonce alone is not enough evidence.
     phase = 'replaced'
@@ -554,7 +722,8 @@ async function discoverPendingFactoryTxs(
 
   const read = getReadProvider(chain) as any
   if (typeof read.send === 'function') providers.push(read)
-  else if (read.providerConfigs?.[0]?.provider?.send) providers.push(read.providerConfigs[0].provider)
+  else if (read.providerConfigs?.[0]?.provider?.send)
+    providers.push(read.providerConfigs[0].provider)
 
   if (injected) {
     providers.push({
@@ -635,7 +804,7 @@ export async function refreshPendingOps(
   chain: ChainKey,
   wallet: string
 ): Promise<{ views: PendingOpView[]; pendingNonceGap: number; unresolvedCount: number }> {
-  const provider = getReadProvider(chain)
+  const provider = await ensureHealthyReadProvider(chain)
   const injected = getInjected()
   const factory = CONTRACTS[chain].factory.toLowerCase()
 
@@ -647,8 +816,25 @@ export async function refreshPendingOps(
 
   hydrateFromLocks(chain, wallet)
 
-  // Discover unknown pending factory txs (MetaMask + public RPC).
-  if (pendingNonceGap > 0) {
+  const beforeDiscovery = listPendingOps(chain, wallet).filter(isUnresolvedPending)
+  const coveredNonces = new Set(
+    beforeDiscovery.flatMap((record) => (record.nonce === null ? [] : [record.nonce]))
+  )
+  let unexplainedGap = false
+  for (let nonce = latest; nonce < pendingNonce; nonce += 1) {
+    if (!coveredNonces.has(nonce)) {
+      unexplainedGap = true
+      break
+    }
+  }
+  const discoveryKey = `${chain}:${wallet.toLowerCase()}`
+  const now = Date.now()
+  const discoveryDue = now - (lastDiscoveryAt.get(discoveryKey) ?? 0) >= DISCOVERY_THROTTLE_MS
+
+  // Pending blocks can be huge and many RPCs do not support them. Only scan
+  // when the account nonce gap cannot be explained by known local records.
+  if (pendingNonceGap > 0 && unexplainedGap && discoveryDue) {
+    lastDiscoveryAt.set(discoveryKey, now)
     await discoverPendingFactoryTxs(chain, wallet, injected)
   }
 
@@ -664,9 +850,7 @@ export async function refreshPendingOps(
         }
       }
 
-      const tx = record.txHash
-        ? await fetchTxByHash(record.txHash, provider, injected)
-        : null
+      const tx = record.txHash ? await fetchTxByHash(record.txHash, provider, injected) : null
       let enriched = record
       if (tx?.input && tx.to?.toLowerCase() === factory) {
         const decoded = decodeFactoryCalldata(tx.input)
@@ -694,26 +878,44 @@ export async function refreshPendingOps(
         (reconciled.nonce === null || pendingNonce <= reconciled.nonce)
 
       return {
+        source: record,
         record: reconciled,
         status: uncertain ? ('unknown' as const) : statusForPhase(reconciled.phase)
       }
     })
   )
 
+  const accepted = new Map<string, { record: PendingOpRecord; status: PendingOpView['status'] }>()
   if (outcomes.length) {
-    const updates = new Map(outcomes.map(({ record }) => [record.id, record]))
-    writeAll(readAll().map((record) => updates.get(record.id) ?? record))
-  }
-
-  for (const { record } of outcomes) {
-    if (!isUnresolvedPending(record)) {
-      releaseLock(record.id)
-      if (record.txHash) releaseLocksByTxHash(record.txHash)
+    const candidates = new Map(outcomes.map((outcome) => [outcome.source.id, outcome]))
+    const current = readAll()
+    for (const record of current) {
+      const candidate = candidates.get(record.id)
+      if (!candidate || !sameRecordRevision(record, candidate.source)) continue
+      accepted.set(record.id, { record: candidate.record, status: candidate.status })
+      if (!sameRecordRevision(record, candidate.record)) appendRecord(candidate.record)
     }
   }
 
-  const unresolved = outcomes.filter(({ record }) => isUnresolvedPending(record))
-  const views = unresolved.map(({ record, status }) => toView(record, status))
+  const persisted = listPendingOps(chain, wallet)
+  const persistedById = new Map(persisted.map((record) => [record.id, record]))
+  for (const [id, observation] of accepted) {
+    const record = persistedById.get(id)
+    if (!record || !sameRecordRevision(record, observation.record) || isUnresolvedPending(record))
+      continue
+    releaseLock(record.id)
+    if (record.txHash) releaseLocksByTxHash(record.txHash)
+  }
+
+  const unresolved = persisted.filter(isUnresolvedPending)
+  const views = unresolved.map((record) => {
+    const observation = accepted.get(record.id)
+    const status =
+      observation && sameRecordRevision(record, observation.record)
+        ? observation.status
+        : statusForPhase(record.phase)
+    return toView(record, status)
+  })
   const unresolvedCount = unresolved.length
 
   // If we still have a nonce gap but zero decoded rows, surface a synthetic row

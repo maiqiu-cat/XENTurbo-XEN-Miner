@@ -1,9 +1,16 @@
 import { defineStore } from 'pinia'
 import type { ChainKey } from '@/config/chains'
 import type { Vmu, VmuGroup, VmuStatus } from '@/core/types'
-import { readWalletVmus, readGlobalRank, readVmuCount } from '@/core/chainReader'
+import {
+  readWalletVmus,
+  readGlobalRank,
+  readVmuCount,
+  readChainTimestamp,
+  classifyVmuStatus
+} from '@/core/chainReader'
 import { loadSnapshot, saveSnapshot, clearSnapshot } from '@/core/idb'
 import { broadcastLockedIds } from '@/core/localLock'
+import { ensureHealthyReadProvider } from '@/core/rpc'
 import { estimateGroupXen } from '@/utils/rewards'
 
 interface State {
@@ -15,6 +22,7 @@ interface State {
   rankAvailable: boolean
   rankError: string | null
   syncedAt: number | null
+  chainTimestampMs: number | null
   loading: boolean
   progress: { loaded: number; total: number }
   error: string | null
@@ -25,6 +33,12 @@ interface State {
 }
 
 const OPERABLE: VmuStatus[] = ['EMPTY', 'MINTING', 'CLAIMABLE']
+let maturityTimer: ReturnType<typeof setTimeout> | null = null
+
+function clearMaturityTimer(): void {
+  if (maturityTimer) clearTimeout(maturityTimer)
+  maturityTimer = null
+}
 
 function normalizeVmu(v: Vmu): Vmu {
   // Older IndexedDB snapshots may lack readOk — treat as ok.
@@ -44,6 +58,7 @@ export const useVmuStore = defineStore('vmu', {
     rankAvailable: false,
     rankError: null,
     syncedAt: null,
+    chainTimestampMs: null,
     loading: false,
     progress: { loaded: 0, total: 0 },
     error: null,
@@ -54,7 +69,9 @@ export const useVmuStore = defineStore('vmu', {
     emptyIds(state): number[] {
       // Only hide ids that already have a broadcast tx (not soft pre-sign locks).
       const locked =
-        state.chain && state.wallet ? broadcastLockedIds(state.chain, state.wallet) : new Set<number>()
+        state.chain && state.wallet
+          ? broadcastLockedIds(state.chain, state.wallet)
+          : new Set<number>()
       return state.vmus
         .filter((v) => v.status === 'EMPTY' && v.readOk && !locked.has(v.id))
         .map((v) => v.id)
@@ -64,11 +81,14 @@ export const useVmuStore = defineStore('vmu', {
     // READ_ERROR is tracked separately via readErrors.
     counts(state): Record<'EMPTY' | 'MINTING' | 'CLAIMABLE', number> {
       const locked =
-        state.chain && state.wallet ? broadcastLockedIds(state.chain, state.wallet) : new Set<number>()
+        state.chain && state.wallet
+          ? broadcastLockedIds(state.chain, state.wallet)
+          : new Set<number>()
       const c = { EMPTY: 0, MINTING: 0, CLAIMABLE: 0 }
       state.vmus.forEach((v) => {
         if (locked.has(v.id)) return
-        if (v.status === 'EMPTY' || v.status === 'MINTING' || v.status === 'CLAIMABLE') c[v.status] += 1
+        if (v.status === 'EMPTY' || v.status === 'MINTING' || v.status === 'CLAIMABLE')
+          c[v.status] += 1
       })
       return c
     },
@@ -76,7 +96,9 @@ export const useVmuStore = defineStore('vmu', {
     // backend produced for the Mint list.
     groups(state): VmuGroup[] {
       const locked =
-        state.chain && state.wallet ? broadcastLockedIds(state.chain, state.wallet) : new Set<number>()
+        state.chain && state.wallet
+          ? broadcastLockedIds(state.chain, state.wallet)
+          : new Set<number>()
       const map = new Map<string, VmuGroup>()
       for (const v of state.vmus) {
         if (v.status === 'EMPTY' || v.status === 'READ_ERROR') continue
@@ -91,6 +113,7 @@ export const useVmuStore = defineStore('vmu', {
             maturityTs: v.maturityTs,
             status: v.status as 'MINTING' | 'CLAIMABLE',
             rank: v.rank,
+            ranks: [],
             amplifier: v.amplifier,
             eaaRate: v.eaaRate,
             ids: [],
@@ -98,6 +121,7 @@ export const useVmuStore = defineStore('vmu', {
           }
           map.set(key, g)
         }
+        g.ranks.push(v.rank)
         g.ids.push(v.id)
         g.count += 1
         if (v.rank < g.rank) g.rank = v.rank
@@ -107,12 +131,12 @@ export const useVmuStore = defineStore('vmu', {
         for (const g of list) {
           g.estXen = estimateGroupXen({
             globalRank: state.globalRank,
-            startRank: g.rank,
-            count: g.count,
+            ranks: g.ranks,
             term: g.term,
             amplifier: g.amplifier,
             eaaRate: g.eaaRate,
-            maturityMs: g.maturityTs
+            maturityMs: g.maturityTs,
+            currentTimeMs: state.chainTimestampMs ?? undefined
           })
         }
       }
@@ -129,12 +153,14 @@ export const useVmuStore = defineStore('vmu', {
   },
   actions: {
     reset() {
+      clearMaturityTimer()
       this.vmuCount = 0
       this.vmus = []
       this.globalRank = 0
       this.rankAvailable = false
       this.rankError = null
       this.syncedAt = null
+      this.chainTimestampMs = null
       this.loading = false
       this.progress = { loaded: 0, total: 0 }
       this.error = null
@@ -164,6 +190,7 @@ export const useVmuStore = defineStore('vmu', {
         this.vmuCount = cached.vmuCount
         this.vmus = cached.vmus.map(normalizeVmu)
         this.syncedAt = cached.syncedAt
+        this.chainTimestampMs = cached.chainTimestampMs
         this.readErrors = this.vmus.filter((v) => !v.readOk || v.status === 'READ_ERROR').length
       }
       if (!isCurrent()) return
@@ -184,12 +211,15 @@ export const useVmuStore = defineStore('vmu', {
       this.rankAvailable = false
       this.rankError = null
       try {
-        const [count, rankResult] = await Promise.all([
+        await ensureHealthyReadProvider(chain)
+        if (!isCurrent()) return
+        const [count, rankResult, chainTimestampMs] = await Promise.all([
           readVmuCount(chain, wallet),
           readGlobalRank(chain).then(
             (rank) => ({ ok: true as const, rank }),
             (error: unknown) => ({ ok: false as const, error })
-          )
+          ),
+          readChainTimestamp(chain)
         ])
         // Abort if wallet/chain changed while we were reading.
         if (!isCurrent()) return
@@ -203,22 +233,43 @@ export const useVmuStore = defineStore('vmu', {
             err?.shortMessage || err?.message || 'Global rank is unavailable on the active chain'
         }
 
-        const vmus = await readWalletVmus(chain, wallet, {
+        const scannedVmus = await readWalletVmus(chain, wallet, {
           vmuCount: count,
+          chainTimestampMs,
           onProgress: (p) => {
             if (isCurrent()) this.progress = p
           }
         })
         if (!isCurrent()) return
 
+        const latestChainTimestampMs = await readChainTimestamp(chain).catch(() => chainTimestampMs)
+        if (!isCurrent()) return
+        const vmus = scannedVmus.map((vmu) =>
+          vmu.readOk && vmu.status !== 'READ_ERROR'
+            ? {
+                ...vmu,
+                status: classifyVmuStatus(vmu.rank, vmu.maturityTs, latestChainTimestampMs)
+              }
+            : vmu
+        )
+
         this.vmuCount = count
         this.vmus = vmus
+        this.chainTimestampMs = latestChainTimestampMs
         this.readErrors = vmus.filter((v) => !v.readOk || v.status === 'READ_ERROR').length
         this.syncedAt = Date.now()
         if (this.readErrors > 0) {
           this.error = `${this.readErrors} VMU(s) failed to read. Refresh or check RPC — do not treat them as empty.`
         }
-        await saveSnapshot({ chain, wallet, vmuCount: count, vmus, syncedAt: this.syncedAt })
+        await saveSnapshot({
+          chain,
+          wallet,
+          vmuCount: count,
+          vmus,
+          syncedAt: this.syncedAt,
+          chainTimestampMs: latestChainTimestampMs
+        })
+        if (isCurrent()) this.scheduleMaturityRefresh()
       } catch (err: any) {
         if (!isCurrent()) return
         this.error = err?.shortMessage || err?.message || 'Failed to read chain'
@@ -236,6 +287,26 @@ export const useVmuStore = defineStore('vmu', {
       await clearSnapshot(chain, wallet)
       if (gen !== this.refreshGen || this.chain !== chain || this.wallet !== wallet) return
       await this.refresh()
+    },
+
+    scheduleMaturityRefresh() {
+      clearMaturityTimer()
+      if (!this.chain || !this.wallet || this.chainTimestampMs === null) return
+      const nearest = this.vmus
+        .filter((vmu) => vmu.status === 'MINTING' && vmu.maturityTs > 0)
+        .reduce((value, vmu) => Math.min(value, vmu.maturityTs), Number.POSITIVE_INFINITY)
+      if (!Number.isFinite(nearest)) return
+
+      const chain = this.chain
+      const wallet = this.wallet
+      const delay = Math.min(
+        Math.max(1_000, nearest - this.chainTimestampMs + 1_500),
+        2_147_000_000
+      )
+      maturityTimer = setTimeout(() => {
+        maturityTimer = null
+        if (this.chain === chain && this.wallet === wallet) void this.refresh()
+      }, delay)
     }
   }
 })
