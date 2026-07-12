@@ -1,8 +1,97 @@
 # XENTurbo XEN Miner
 
-A pure-frontend batch miner for XEN, rewritten from the XENTurbo `miner` module.
-**No backend. No database.** Every piece of state is derived from on-chain data,
-so the app is a single static site you can host anywhere.
+A pure-frontend, open-source batch miner for XEN.
+
+XENTurbo Miner has no application backend and no user database. Mining state is
+read directly from Ethereum or Polygon, and transactions are submitted through
+the wallet installed in your browser.
+
+## Use XENTurbo Miner
+
+Both Miner addresses are currently available:
+
+| Version      | Address                   | Status                     |
+| ------------ | ------------------------- | -------------------------- |
+| New Miner    | https://miner.xenturbo.io | Recommended                |
+| Legacy Miner | https://xenturbo.io/miner | Available during migration |
+
+You may continue using either address for now. We recommend gradually switching
+to the new independent Miner at:
+
+https://miner.xenturbo.io
+
+The new Miner is designed to operate independently from the legacy XENTurbo
+backend. It reads mining state directly from the blockchain and stores temporary
+cache and pending-transaction information only in your browser.
+
+## Browser and wallet requirements
+
+- Use Google Chrome on a desktop computer.
+- Install MetaMask or another injected EIP-1193 extension wallet.
+- Ethereum and Polygon are supported.
+- Mobile browsers are not supported.
+- WalletConnect, Web3Modal, Reown, and Wagmi are not required.
+- Smart-contract wallets are not supported because the Miner contract requires
+  `tx.origin == msg.sender`.
+
+## Security notice
+
+Before connecting a wallet or signing a transaction:
+
+- Verify that the address is `miner.xenturbo.io` or `xenturbo.io/miner`.
+- Review every transaction carefully in your wallet before signing.
+- CryptoCell and XENTurbo will never ask for your seed phrase or private key.
+- Gas fees are determined and displayed by your wallet.
+- Blockchain transactions involve gas fees and smart-contract risks.
+- Avoid operating the same wallet from multiple devices at the same time.
+
+The application never holds your private keys and never sends transactions on
+your behalf.
+
+## Download and run locally
+
+All source code is open source. You may download this repository and run
+XENTurbo Miner locally on your own computer.
+
+Repository:
+
+https://github.com/maiqiu-cat/XENTurbo-XEN-Miner
+
+Requirements:
+
+- Node.js 24
+- npm
+- Desktop Google Chrome
+- MetaMask or another injected browser wallet
+
+```bash
+git clone https://github.com/maiqiu-cat/XENTurbo-XEN-Miner.git
+cd XENTurbo-XEN-Miner
+nvm use
+npm ci
+npm run dev
+```
+
+Open the local address printed by Vite, normally:
+
+http://127.0.0.1:5173
+
+To test a production build locally:
+
+```bash
+npm run build
+npm run preview
+```
+
+The `.env` file is optional. You can copy `.env.example` if you want to configure
+additional Ethereum or Polygon read RPC endpoints:
+
+```bash
+cp .env.example .env
+```
+
+Custom RPC endpoints can also be added through the RPC control in the Miner.
+Only HTTPS endpoints that return the expected chain ID are accepted.
 
 ## Why no backend is needed
 
@@ -21,13 +110,6 @@ per-VMU mint state, and locks. All of that is reconstructible from the chain:
 
 The miner contract (`XENFactoryUpgradeable`) is reused as-is; users' wallets call
 it directly. The app never holds keys or sends transactions on the user's behalf.
-
-## Browser and wallet requirements
-
-- Desktop Google Chrome is the supported browser.
-- Install MetaMask or another injected EIP-1193 extension wallet.
-- Mobile browsers, WalletConnect, Web3Modal, Reown, and Wagmi are not supported.
-- Wallet requests go directly through `window.ethereum`; no wallet relay or QR service is used.
 
 ## How the mining works
 
@@ -62,14 +144,30 @@ through the active injected wallet (`FEE()`) and cross-checked against the read 
 at send time. Gas pricing is left to the wallet rather than copied from a public RPC.
 Add more chains in `src/config/chains.ts` + `src/config/contracts.ts`.
 
-## Setup
+## Development and verification
 
 ```bash
 nvm use                    # Node 24, from .nvmrc
 npm ci
-cp .env.example .env   # optional: set custom Ethereum or Polygon RPC URLs
+cp .env.example .env # optional: set custom Ethereum or Polygon RPC URLs
 npm run dev
 ```
+
+## RPC availability
+
+The Miner checks configured read RPC endpoints before chain operations and uses
+only endpoints that pass the health check.
+
+If every configured endpoint is unavailable:
+
+- Chain reads and transaction preparation are blocked.
+- The existing RPC list is preserved.
+- The Miner asks the user to check internet access, DNS, firewall, proxy, or VPN.
+- Users can recheck the existing endpoints or add a custom HTTPS RPC.
+
+Transaction signing and broadcasting still go through the injected wallet.
+Public and custom RPC endpoints are used only for chain reads, state validation,
+and estimates.
 
 ## Scripts
 
@@ -119,3 +217,13 @@ measured JavaScript chunk and exits non-zero when either limit is exceeded.
   are cached in IndexedDB, and the source of truth is always the chain.
 - If you hit RPC error `-32603`, add your own RPC endpoint via the in-app RPC button.
   Custom endpoints must use HTTPS and return the selected chain ID before they are saved.
+- For a stuck pending transaction, use MetaMask Activity to choose **Speed up** or
+  **Cancel**, then recheck the pending status in the Miner.
+
+## Open-source notice
+
+All code is open source:
+
+https://github.com/maiqiu-cat/XENTurbo-XEN-Miner
+
+Copyright 2026 · [Miner.XENTurbo.io](https://miner.xenturbo.io)
