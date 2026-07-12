@@ -37,6 +37,27 @@ for (const path of historicalPaths) {
   if (blockedHistoryPaths.has(path)) failures.push(`blocked path remains in Git history: ${path}`)
 }
 
+const historicalText = git([
+  'log',
+  '--all',
+  '-p',
+  '--',
+  '.',
+  ':!package-lock.json',
+  ':!scripts/check-public-safety.mjs'
+])
+if (/\/(?:Users|home)\/[A-Za-z0-9._-]+\//.test(historicalText)) {
+  failures.push('local user home path detected in Git history')
+}
+for (const email of historicalText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) ?? []) {
+  if (!allowedEmail.test(email))
+    failures.push('non-corporate email address detected in Git history')
+}
+for (const pattern of secretPatterns) {
+  if (pattern.test(historicalText))
+    failures.push(`potential secret detected in Git history: ${pattern}`)
+}
+
 const trackedFiles = git(['ls-files', '-z']).split('\0').filter(Boolean)
 for (const path of trackedFiles) {
   let text
