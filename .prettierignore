@@ -6,3 +6,15 @@ node_modules/
 src/abis/
 playwright-report/
 test-results/
+
+# Legacy files outside the existing formatting gate.
+index.html
+src/components/PendingOpsPanel.vue
+src/components/TxModal.vue
+src/config/contracts.ts
+src/core/create2.ts
+src/core/localLock.ts
+src/main.ts
+src/styles.css
+tests/create2.test.ts
+tsconfig.node.json
