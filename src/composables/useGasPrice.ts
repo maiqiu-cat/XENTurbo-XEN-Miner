@@ -1,6 +1,6 @@
 import { ref, watch, onMounted, onUnmounted, type Ref } from 'vue'
 import { formatUnits } from 'ethers'
-import { ensureHealthyReadProvider } from '@/core/rpc'
+import { ensureRecentReadProvider } from '@/core/rpc'
 import type { ChainKey } from '@/config/chains'
 
 // Reads native gas price directly from RPC (no platform price API).
@@ -8,30 +8,43 @@ export function useGasPrice(getChain: () => ChainKey | null) {
   const gwei = ref<string>('--')
   const loading = ref(false)
   let timer: ReturnType<typeof setInterval> | null = null
+  let active: { chain: ChainKey; promise: Promise<void> } | null = null
   /** Ignore stale responses after a fast chain switch. */
   let reqSeq = 0
 
-  async function poll() {
+  function poll(): Promise<void> {
     const chain = getChain()
-    const seq = ++reqSeq
     if (!chain) {
+      reqSeq += 1
       gwei.value = '--'
       loading.value = false
-      return
+      return Promise.resolve()
     }
+    if (active?.chain === chain) return active.promise
+
+    const seq = ++reqSeq
     loading.value = true
-    try {
-      const provider = await ensureHealthyReadProvider(chain)
-      const fee = await provider.getFeeData()
-      if (seq !== reqSeq || getChain() !== chain) return
-      const price = fee.gasPrice ?? fee.maxFeePerGas
-      gwei.value = price ? formatGwei(Number(formatUnits(price, 'gwei'))) : '--'
-    } catch {
-      if (seq !== reqSeq || getChain() !== chain) return
-      gwei.value = '--'
-    } finally {
-      if (seq === reqSeq) loading.value = false
+    const promise = (async () => {
+      try {
+        const provider = await ensureRecentReadProvider(chain, 30_000)
+        const fee = await provider.getFeeData()
+        if (seq !== reqSeq || getChain() !== chain) return
+        const price = fee.gasPrice ?? fee.maxFeePerGas
+        gwei.value = price ? formatGwei(Number(formatUnits(price, 'gwei'))) : '--'
+      } catch {
+        if (seq !== reqSeq || getChain() !== chain) return
+        gwei.value = '--'
+      } finally {
+        if (seq === reqSeq) loading.value = false
+      }
+    })()
+    const flight = { chain, promise }
+    active = flight
+    const clearFlight = () => {
+      if (active === flight) active = null
     }
+    void promise.then(clearFlight, clearFlight)
+    return promise
   }
 
   // Adaptive precision: sub-1 Gwei (common on L1 now) must not round to 0.
@@ -49,12 +62,34 @@ export function useGasPrice(getChain: () => ChainKey | null) {
     void poll()
   }
 
-  onMounted(() => {
+  const pageVisible = () => typeof document === 'undefined' || document.visibilityState !== 'hidden'
+  const start = () => {
+    if (timer) clearInterval(timer)
+    timer = null
+    if (!pageVisible()) return
     void poll()
     timer = setInterval(() => void poll(), 15_000)
+  }
+  const stop = () => {
+    if (timer) clearInterval(timer)
+    timer = null
+  }
+  const onVisibilityChange = () => {
+    if (pageVisible()) start()
+    else stop()
+  }
+
+  onMounted(() => {
+    start()
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVisibilityChange)
+    }
   })
   onUnmounted(() => {
-    if (timer) clearInterval(timer)
+    stop()
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+    }
   })
 
   watch(

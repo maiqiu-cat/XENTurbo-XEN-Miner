@@ -271,6 +271,34 @@ export function ensureHealthyReadProvider(
   return promise
 }
 
+/** Reuse a recently validated provider for background polling. */
+export function ensureRecentReadProvider(
+  key: ChainKey,
+  maxAgeMs: number,
+  request: RpcChainIdRequest = requestHealthChainId
+): Promise<ReadProvider> {
+  const state = healthStates.get(key)
+  const provider = providerCache.get(key)
+  const checkedAt = state?.checkedAt
+  const age =
+    checkedAt === null || checkedAt === undefined
+      ? Number.POSITIVE_INFINITY
+      : Date.now() - checkedAt
+  if (
+    provider &&
+    state &&
+    state.error === null &&
+    state.healthyUrls.length > 0 &&
+    Number.isFinite(maxAgeMs) &&
+    maxAgeMs >= 0 &&
+    age >= 0 &&
+    age <= maxAgeMs
+  ) {
+    return Promise.resolve(provider)
+  }
+  return ensureHealthyReadProvider(key, request)
+}
+
 /** Retry an async RPC call with exponential backoff. */
 export async function withRetry<T>(
   fn: () => Promise<T>,

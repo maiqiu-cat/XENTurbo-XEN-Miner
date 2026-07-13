@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue'
+import { ref } from 'vue'
 import { canMarkPendingOpDropped, type PendingOpView } from '@/core/pendingOps'
+import { useDocumentClock } from '@/composables/useDocumentClock'
 
 const props = defineProps<{
   ops: PendingOpView[]
@@ -18,16 +19,7 @@ const pasteSeen = ref('')
 const pasteError = ref<string | null>(null)
 
 /** Tick so "pending for Xm" updates without waiting for the 8s poll. */
-const now = ref(Date.now())
-let tick: ReturnType<typeof setInterval> | null = null
-onMounted(() => {
-  tick = setInterval(() => {
-    now.value = Date.now()
-  }, 1000)
-})
-onUnmounted(() => {
-  if (tick) clearInterval(tick)
-})
+const now = useDocumentClock(1_000, () => props.ops.length > 0)
 
 function shortHash(h: string): string {
   if (!h) return 'hash unavailable'

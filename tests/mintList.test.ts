@@ -70,4 +70,31 @@ describe('MintList selection context', () => {
 
     expect(wrapper.text()).not.toContain('VMUs selected')
   })
+
+  it('renders large grouped wallets in bounded pages', async () => {
+    const { wrapper, store } = mountClaimableList()
+    const now = Date.now()
+    store.$patch({
+      vmuCount: 250,
+      vmus: Array.from({ length: 250 }, (_, index) => ({
+        id: index + 1,
+        address: `0x${(index + 1).toString(16).padStart(40, '0')}`,
+        status: 'CLAIMABLE' as const,
+        rank: index + 1,
+        term: 100,
+        maturityTs: now - (index + 1) * 1_000,
+        amplifier: 3_000,
+        eaaRate: 0,
+        readOk: true
+      }))
+    })
+    await nextTick()
+
+    expect(wrapper.findAll('tbody tr')).toHaveLength(100)
+    expect(wrapper.text()).toContain('Page 1 of 3')
+
+    await wrapper.get('button[aria-label="Next page"]').trigger('click')
+    expect(wrapper.findAll('tbody tr')).toHaveLength(100)
+    expect(wrapper.text()).toContain('Page 2 of 3')
+  })
 })

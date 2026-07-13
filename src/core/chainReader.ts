@@ -7,11 +7,13 @@ import { Multicall3ABI } from '@/abis/Multicall3ABI'
 import { computeProxyAddress, computeProxyAddressRange, minimalProxyRuntimeCode } from './create2'
 import { getReadProvider, withRetry } from './rpc'
 import type { Vmu, VmuStatus } from './types'
+import { mapWithConcurrency } from '@/utils/concurrency'
 
 const xenIface = new Interface(XENCryptoABI as unknown as any[])
 
 // Multicall batch size: number of userMints calls per aggregate3 request.
 const BATCH_SIZE = 400
+const BATCH_CONCURRENCY = 2
 const CODE_BATCH_SIZE = 32
 
 export type ProxyDeploymentStatus = 'DEPLOYED' | 'MISSING' | 'READ_ERROR'
@@ -199,9 +201,13 @@ export async function readWalletVmus(
     toId: total
   })
 
-  const vmus: Vmu[] = []
+  const batches: (typeof proxies)[] = []
   for (let start = 0; start < proxies.length; start += BATCH_SIZE) {
-    const slice = proxies.slice(start, start + BATCH_SIZE)
+    batches.push(proxies.slice(start, start + BATCH_SIZE))
+  }
+
+  let loaded = 0
+  const vmuBatches = await mapWithConcurrency(batches, BATCH_CONCURRENCY, async (slice) => {
     const calls = slice.map((p) => ({
       target: xenCrypto,
       allowFailure: true,
@@ -213,12 +219,14 @@ export async function readWalletVmus(
       returnData: string
     }[]
 
-    slice.forEach((p, i) => {
-      vmus.push(decodeUserMint(p.id, p.address, results[i], chainTimestampMs))
-    })
-
-    opts.onProgress?.({ loaded: Math.min(start + BATCH_SIZE, proxies.length), total })
-  }
+    const decoded = slice.map((p, i) =>
+      decodeUserMint(p.id, p.address, results[i], chainTimestampMs)
+    )
+    loaded += slice.length
+    opts.onProgress?.({ loaded, total })
+    return decoded
+  })
+  const vmus = vmuBatches.flat()
 
   // Retry failed reads once (small batch) so transient RPC blips don't stick.
   const failedIds = vmus.filter((v) => !v.readOk).map((v) => v.id)

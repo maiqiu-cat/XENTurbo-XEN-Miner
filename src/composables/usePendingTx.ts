@@ -27,6 +27,10 @@ export function usePendingTx(
   let gen = 0
   let active: { generation: number; promise: Promise<number> } | null = null
   let trailing = false
+  const activePollMs = 8_000
+  const idlePollMs = 30_000
+
+  const pageVisible = () => typeof document === 'undefined' || document.visibilityState !== 'hidden'
 
   function resetState(): void {
     checking.value = false
@@ -35,7 +39,7 @@ export function usePendingTx(
     ops.value = []
   }
 
-  function check(): Promise<number> {
+  function check(options: { freshRpc?: boolean } = {}): Promise<number> {
     const addr = address()
     const key = chain()
     if (!addr || !key) {
@@ -50,7 +54,7 @@ export function usePendingTx(
 
     checking.value = true
     error.value = null
-    const promise = refreshPendingOps(key, addr)
+    const promise = refreshPendingOps(key, addr, options)
       .then(({ views, pendingNonceGap, unresolvedCount }) => {
         if (myGen !== gen) return pendingCount.value
         pendingCount.value = pendingNonceGap
@@ -81,11 +85,14 @@ export function usePendingTx(
     stopPolling()
     const pollGen = gen
     const poll = async () => {
-      await check()
-      if (pollGen !== gen) return
-      timer = setTimeout(() => void poll(), 8_000)
+      if (!pageVisible()) return
+      await check({ freshRpc: false })
+      if (pollGen !== gen || !pageVisible()) return
+      const delay =
+        pendingCount.value > 0 || localUnresolvedCount.value > 0 ? activePollMs : idlePollMs
+      timer = setTimeout(() => void poll(), delay)
     }
-    void poll()
+    if (pageVisible()) void poll()
   }
 
   function stopPolling() {
@@ -93,9 +100,19 @@ export function usePendingTx(
     trailing = false
     checking.value = false
     if (timer) {
-      clearInterval(timer)
+      clearTimeout(timer)
       timer = null
     }
+  }
+
+  const onVisibilityChange = () => {
+    if (!address() || !chain()) return
+    if (pageVisible()) startPolling()
+    else stopPolling()
+  }
+
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', onVisibilityChange)
   }
 
   watch(
@@ -110,7 +127,12 @@ export function usePendingTx(
     { immediate: true }
   )
 
-  onScopeDispose(stopPolling)
+  onScopeDispose(() => {
+    stopPolling()
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+    }
+  })
 
   const hasPending = computed(() => pendingCount.value > 0 || localUnresolvedCount.value > 0)
 

@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, onScopeDispose, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useVmuStore } from '@/stores/vmuStore'
 import { useWalletStore } from '@/stores/walletStore'
 import type { VmuGroup } from '@/core/types'
 import { LIMITS, DEFAULT_TERM, DEFAULT_TERM_MAX } from '@/config/miner'
 import { formatDate, countdownTo, thousands } from '@/utils/format'
+import { useDocumentClock } from '@/composables/useDocumentClock'
 
 const props = defineProps<{
   busy: boolean
@@ -20,11 +21,7 @@ const store = useVmuStore()
 const wallet = useWalletStore()
 type Filter = 'ALL' | 'CLAIMABLE' | 'MINTING'
 const filter = ref<Filter>('ALL')
-const now = ref(Date.now())
-const clock = setInterval(() => {
-  now.value = Date.now()
-}, 30_000)
-onScopeDispose(() => clearInterval(clock))
+const now = useDocumentClock(30_000)
 
 /** Term used for the next Claim & Re-Mint — edited next to the action button. */
 const reuseTerm = ref(DEFAULT_TERM)
@@ -56,6 +53,13 @@ const list = computed<VmuGroup[]>(() => {
 // Rows are grouped by (term, maturity), so the number of rows can be smaller
 // than the number of VMUs. Surface both so the header count reconciles.
 const vmuTotal = computed(() => list.value.reduce((sum, g) => sum + g.count, 0))
+const PAGE_SIZE = 100
+const page = ref(1)
+const pageCount = computed(() => Math.max(1, Math.ceil(list.value.length / PAGE_SIZE)))
+const pagedList = computed(() => {
+  const start = (page.value - 1) * PAGE_SIZE
+  return list.value.slice(start, start + PAGE_SIZE)
+})
 
 const selected = ref<Set<string>>(new Set())
 
@@ -89,7 +93,16 @@ const overReuse = computed(() => selectedIds.value.length > claimReuseLimit.valu
 
 function clearSel() {
   selected.value = new Set()
+  page.value = 1
 }
+
+watch(filter, () => {
+  page.value = 1
+})
+
+watch(pageCount, (count) => {
+  if (page.value > count) page.value = count
+})
 
 watch(
   [() => wallet.address, () => wallet.chainKey, () => wallet.contextGen, () => store.syncedAt],
@@ -173,7 +186,7 @@ function doClaimReuse() {
       </thead>
       <tbody>
         <tr
-          v-for="g in list"
+          v-for="g in pagedList"
           :key="g.key"
           :class="{ selectable: g.status === 'CLAIMABLE', sel: selected.has(g.key) }"
           @click="toggle(g)"
@@ -200,6 +213,28 @@ function doClaimReuse() {
         </tr>
       </tbody>
     </table>
+
+    <nav v-if="pageCount > 1" class="pagination" aria-label="Mint list pages">
+      <button
+        class="btn btn-ghost page-button"
+        aria-label="Previous page"
+        title="Previous page"
+        :disabled="page === 1"
+        @click="page -= 1"
+      >
+        &larr;
+      </button>
+      <span class="dim mono">Page {{ page }} of {{ pageCount }}</span>
+      <button
+        class="btn btn-ghost page-button"
+        aria-label="Next page"
+        title="Next page"
+        :disabled="page === pageCount"
+        @click="page += 1"
+      >
+        &rarr;
+      </button>
+    </nav>
 
     <p v-if="list.length" class="dim group-note">
       {{ list.length }} group{{ list.length > 1 ? 's' : '' }} · {{ vmuTotal }} VMU{{
@@ -325,6 +360,19 @@ function doClaimReuse() {
   margin: 0;
   font-size: 12px;
   line-height: 1.4;
+}
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-height: 42px;
+  margin-top: 12px;
+}
+.page-button {
+  width: 42px;
+  min-width: 42px;
+  padding: 8px;
 }
 .blocked-reason {
   margin: 0;

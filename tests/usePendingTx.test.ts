@@ -1,3 +1,5 @@
+// @vitest-environment happy-dom
+
 import { effectScope, nextTick, ref } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { refreshPendingOps } from '../src/core/pendingOps'
@@ -21,6 +23,76 @@ function deferred<T>() {
 describe('usePendingTx', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      value: 'visible'
+    })
+  })
+
+  it('uses a slower polling interval while the account has no pending work', async () => {
+    vi.useFakeTimers()
+    vi.mocked(refreshPendingOps).mockResolvedValue({
+      views: [],
+      pendingNonceGap: 0,
+      unresolvedCount: 0
+    })
+    const address = ref('0x0000000000000000000000000000000000000001')
+    const chain = ref<'eth'>('eth')
+    const scope = effectScope()
+    scope.run(() =>
+      usePendingTx(
+        () => address.value,
+        () => chain.value
+      )
+    )
+
+    await vi.advanceTimersByTimeAsync(0)
+    expect(refreshPendingOps).toHaveBeenCalledTimes(1)
+    expect(refreshPendingOps).toHaveBeenLastCalledWith(
+      'eth',
+      '0x0000000000000000000000000000000000000001',
+      { freshRpc: false }
+    )
+    await vi.advanceTimersByTimeAsync(29_999)
+    expect(refreshPendingOps).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(refreshPendingOps).toHaveBeenCalledTimes(2)
+
+    scope.stop()
+    vi.useRealTimers()
+  })
+
+  it('pauses polling while hidden and refreshes when the page becomes visible', async () => {
+    vi.mocked(refreshPendingOps).mockResolvedValue({
+      views: [],
+      pendingNonceGap: 0,
+      unresolvedCount: 0
+    })
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      value: 'hidden'
+    })
+    const address = ref('0x0000000000000000000000000000000000000001')
+    const chain = ref<'eth'>('eth')
+    const scope = effectScope()
+    scope.run(() =>
+      usePendingTx(
+        () => address.value,
+        () => chain.value
+      )
+    )
+
+    await nextTick()
+    expect(refreshPendingOps).not.toHaveBeenCalled()
+
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      value: 'visible'
+    })
+    document.dispatchEvent(new Event('visibilitychange'))
+    await vi.waitFor(() => expect(refreshPendingOps).toHaveBeenCalledTimes(1))
+
+    scope.stop()
   })
 
   it('ignores an in-flight refresh after the wallet disconnects', async () => {

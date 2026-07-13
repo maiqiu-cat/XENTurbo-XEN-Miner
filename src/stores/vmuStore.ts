@@ -34,6 +34,10 @@ interface State {
 
 const OPERABLE: VmuStatus[] = ['EMPTY', 'MINTING', 'CLAIMABLE']
 let maturityTimer: ReturnType<typeof setTimeout> | null = null
+const refreshFlights = new WeakMap<
+  object,
+  { chain: ChainKey; wallet: string; promise: Promise<void> }
+>()
 
 function clearMaturityTimer(): void {
   if (maturityTimer) clearTimeout(maturityTimer)
@@ -168,6 +172,7 @@ export const useVmuStore = defineStore('vmu', {
     },
 
     detach() {
+      refreshFlights.delete(this)
       this.refreshGen += 1
       this.chain = null
       this.wallet = null
@@ -176,6 +181,7 @@ export const useVmuStore = defineStore('vmu', {
 
     /** Load cached snapshot instantly, then refresh from chain in the background. */
     async load(chain: ChainKey, wallet: string) {
+      refreshFlights.delete(this)
       const gen = ++this.refreshGen
       this.chain = chain
       this.wallet = wallet
@@ -202,80 +208,96 @@ export const useVmuStore = defineStore('vmu', {
       if (!this.chain || !this.wallet) return
       const chain = this.chain
       const wallet = this.wallet
-      const gen = ++this.refreshGen
-      const isCurrent = () =>
-        gen === this.refreshGen && this.chain === chain && this.wallet === wallet
-      this.loading = true
-      this.error = null
-      this.globalRank = 0
-      this.rankAvailable = false
-      this.rankError = null
-      try {
-        await ensureHealthyReadProvider(chain)
-        if (!isCurrent()) return
-        const [count, rankResult, chainTimestampMs] = await Promise.all([
-          readVmuCount(chain, wallet),
-          readGlobalRank(chain).then(
-            (rank) => ({ ok: true as const, rank }),
-            (error: unknown) => ({ ok: false as const, error })
-          ),
-          readChainTimestamp(chain)
-        ])
-        // Abort if wallet/chain changed while we were reading.
-        if (!isCurrent()) return
-
-        if (rankResult.ok) {
-          this.globalRank = rankResult.rank
-          this.rankAvailable = true
-        } else {
-          const err = rankResult.error as any
-          this.rankError =
-            err?.shortMessage || err?.message || 'Global rank is unavailable on the active chain'
-        }
-
-        const scannedVmus = await readWalletVmus(chain, wallet, {
-          vmuCount: count,
-          chainTimestampMs,
-          onProgress: (p) => {
-            if (isCurrent()) this.progress = p
-          }
-        })
-        if (!isCurrent()) return
-
-        const latestChainTimestampMs = await readChainTimestamp(chain).catch(() => chainTimestampMs)
-        if (!isCurrent()) return
-        const vmus = scannedVmus.map((vmu) =>
-          vmu.readOk && vmu.status !== 'READ_ERROR'
-            ? {
-                ...vmu,
-                status: classifyVmuStatus(vmu.rank, vmu.maturityTs, latestChainTimestampMs)
-              }
-            : vmu
-        )
-
-        this.vmuCount = count
-        this.vmus = vmus
-        this.chainTimestampMs = latestChainTimestampMs
-        this.readErrors = vmus.filter((v) => !v.readOk || v.status === 'READ_ERROR').length
-        this.syncedAt = Date.now()
-        if (this.readErrors > 0) {
-          this.error = `${this.readErrors} VMU(s) failed to read. Refresh or check RPC — do not treat them as empty.`
-        }
-        await saveSnapshot({
-          chain,
-          wallet,
-          vmuCount: count,
-          vmus,
-          syncedAt: this.syncedAt,
-          chainTimestampMs: latestChainTimestampMs
-        })
-        if (isCurrent()) this.scheduleMaturityRefresh()
-      } catch (err: any) {
-        if (!isCurrent()) return
-        this.error = err?.shortMessage || err?.message || 'Failed to read chain'
-      } finally {
-        if (isCurrent()) this.loading = false
+      const existing = refreshFlights.get(this)
+      if (existing?.chain === chain && existing.wallet.toLowerCase() === wallet.toLowerCase()) {
+        return existing.promise
       }
+
+      const promise = (async () => {
+        const gen = ++this.refreshGen
+        const isCurrent = () =>
+          gen === this.refreshGen && this.chain === chain && this.wallet === wallet
+        this.loading = true
+        this.error = null
+        this.globalRank = 0
+        this.rankAvailable = false
+        this.rankError = null
+        try {
+          await ensureHealthyReadProvider(chain)
+          if (!isCurrent()) return
+          const [count, rankResult, chainTimestampMs] = await Promise.all([
+            readVmuCount(chain, wallet),
+            readGlobalRank(chain).then(
+              (rank) => ({ ok: true as const, rank }),
+              (error: unknown) => ({ ok: false as const, error })
+            ),
+            readChainTimestamp(chain)
+          ])
+          if (!isCurrent()) return
+
+          if (rankResult.ok) {
+            this.globalRank = rankResult.rank
+            this.rankAvailable = true
+          } else {
+            const err = rankResult.error as any
+            this.rankError =
+              err?.shortMessage || err?.message || 'Global rank is unavailable on the active chain'
+          }
+
+          const scannedVmus = await readWalletVmus(chain, wallet, {
+            vmuCount: count,
+            chainTimestampMs,
+            onProgress: (p) => {
+              if (isCurrent()) this.progress = p
+            }
+          })
+          if (!isCurrent()) return
+
+          const latestChainTimestampMs = await readChainTimestamp(chain).catch(
+            () => chainTimestampMs
+          )
+          if (!isCurrent()) return
+          const vmus = scannedVmus.map((vmu) =>
+            vmu.readOk && vmu.status !== 'READ_ERROR'
+              ? {
+                  ...vmu,
+                  status: classifyVmuStatus(vmu.rank, vmu.maturityTs, latestChainTimestampMs)
+                }
+              : vmu
+          )
+
+          this.vmuCount = count
+          this.vmus = vmus
+          this.chainTimestampMs = latestChainTimestampMs
+          this.readErrors = vmus.filter((v) => !v.readOk || v.status === 'READ_ERROR').length
+          this.syncedAt = Date.now()
+          if (this.readErrors > 0) {
+            this.error = `${this.readErrors} VMU(s) failed to read. Refresh or check RPC — do not treat them as empty.`
+          }
+          await saveSnapshot({
+            chain,
+            wallet,
+            vmuCount: count,
+            vmus,
+            syncedAt: this.syncedAt,
+            chainTimestampMs: latestChainTimestampMs
+          })
+          if (isCurrent()) this.scheduleMaturityRefresh()
+        } catch (err: any) {
+          if (!isCurrent()) return
+          this.error = err?.shortMessage || err?.message || 'Failed to read chain'
+        } finally {
+          if (isCurrent()) this.loading = false
+        }
+      })()
+
+      const flight = { chain, wallet, promise }
+      refreshFlights.set(this, flight)
+      const clearFlight = () => {
+        if (refreshFlights.get(this) === flight) refreshFlights.delete(this)
+      }
+      void promise.then(clearFlight, clearFlight)
+      return promise
     },
 
     async hardRefresh() {
@@ -283,6 +305,7 @@ export const useVmuStore = defineStore('vmu', {
       const chain = this.chain
       const wallet = this.wallet
       const gen = ++this.refreshGen
+      refreshFlights.delete(this)
       this.reset()
       await clearSnapshot(chain, wallet)
       if (gen !== this.refreshGen || this.chain !== chain || this.wallet !== wallet) return

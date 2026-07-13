@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CHAINS, getRpcUrls, readCustomRpc, writeCustomRpc } from '@/config/chains'
 import {
+  ensureRecentReadProvider,
   ensureHealthyReadProvider,
   getReadProvider,
   getRpcHealthState,
@@ -69,6 +70,20 @@ describe('custom RPC validation', () => {
 })
 
 describe('runtime RPC health selection', () => {
+  it('reuses a recently validated provider until the caller freshness window expires', async () => {
+    writeCustomRpc('eth', ['https://rpc.example'])
+    const now = vi.spyOn(Date, 'now').mockReturnValue(10_000)
+    const request = vi.fn(async () => '0x1')
+
+    const initial = await ensureHealthyReadProvider('eth', request)
+    await expect(ensureRecentReadProvider('eth', 30_000, request)).resolves.toBe(initial)
+    expect(request).toHaveBeenCalledTimes(1)
+
+    now.mockReturnValue(40_001)
+    await ensureRecentReadProvider('eth', 30_000, request)
+    expect(request).toHaveBeenCalledTimes(2)
+  })
+
   it('builds the read provider from only responsive endpoints on the expected chain', async () => {
     writeCustomRpc('eth', [
       'https://healthy.example',

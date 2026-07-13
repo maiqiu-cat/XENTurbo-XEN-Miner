@@ -95,6 +95,25 @@ describe('vmu store request invalidation', () => {
     )
   })
 
+  it('coalesces overlapping full refreshes for the same wallet and chain', async () => {
+    const walletRead = deferred<Vmu[]>()
+    chainReader.readVmuCount.mockResolvedValue(1)
+    chainReader.readGlobalRank.mockResolvedValue(100)
+    chainReader.readWalletVmus.mockReturnValue(walletRead.promise)
+    const store = useVmuStore()
+    store.$patch({ chain: 'eth', wallet: walletA })
+
+    const first = store.refresh()
+    const overlapping = store.refresh()
+    await vi.waitFor(() => expect(chainReader.readWalletVmus).toHaveBeenCalled())
+
+    expect(chainReader.readVmuCount).toHaveBeenCalledTimes(1)
+    expect(chainReader.readWalletVmus).toHaveBeenCalledTimes(1)
+
+    walletRead.resolve([mintingVmu()])
+    await Promise.all([first, overlapping])
+  })
+
   it('does not apply a cached snapshot that resolves after detach', async () => {
     const cached = deferred<WalletSnapshot | null>()
     snapshots.loadSnapshot.mockReturnValueOnce(cached.promise)

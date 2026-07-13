@@ -381,6 +381,17 @@ test('mobile Chrome is blocked by the PC Chrome guard', async ({ browser, baseUR
 test('wallet initialization, connect, account changes, and chain changes update the page', async ({
   page
 }) => {
+  let nonceReads = 0
+  page.on('request', (request) => {
+    if (request.method() !== 'POST') return
+    try {
+      const payload = request.postDataJSON() as { method?: string } | Array<{ method?: string }>
+      const requests = Array.isArray(payload) ? payload : [payload]
+      nonceReads += requests.filter((entry) => entry.method === 'eth_getTransactionCount').length
+    } catch {
+      // Ignore non-JSON requests; RPC mocks below are JSON-RPC only.
+    }
+  })
   await emulateDesktopGoogleChrome(page)
   await mockSameOriginRpc(page)
   await installInjectedWallet(page)
@@ -390,6 +401,8 @@ test('wallet initialization, connect, account changes, and chain changes update 
   await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
   await expect(page.getByRole('button', { name: '0x1111...1111' }).first()).toBeVisible()
   await expect(page.getByRole('combobox')).toHaveValue('eth')
+  await page.waitForTimeout(250)
+  expect(nonceReads).toBe(2)
 
   await page.evaluate((account) => window.__walletMock.emitAccounts([account]), ACCOUNT_B)
   await expect(page.getByRole('button', { name: '0x2222...2222' }).first()).toBeVisible()

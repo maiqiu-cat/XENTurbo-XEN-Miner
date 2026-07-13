@@ -2,7 +2,7 @@ import { Interface } from 'ethers'
 import type { ChainKey } from '@/config/chains'
 import { CHAINS } from '@/config/chains'
 import { CONTRACTS } from '@/config/contracts'
-import { ensureHealthyReadProvider, getReadProvider } from './rpc'
+import { ensureHealthyReadProvider, ensureRecentReadProvider, getReadProvider } from './rpc'
 import { attachTxHash, pendingLocks, releaseLock, releaseLocksByTxHash } from './localLock'
 import type { OpType } from './txManager'
 
@@ -802,9 +802,13 @@ function hydrateFromLocks(chain: ChainKey, wallet: string): void {
  */
 export async function refreshPendingOps(
   chain: ChainKey,
-  wallet: string
+  wallet: string,
+  options: { freshRpc?: boolean } = {}
 ): Promise<{ views: PendingOpView[]; pendingNonceGap: number; unresolvedCount: number }> {
-  const provider = await ensureHealthyReadProvider(chain)
+  const provider =
+    options.freshRpc === false
+      ? await ensureRecentReadProvider(chain, 30_000)
+      : await ensureHealthyReadProvider(chain)
   const injected = getInjected()
   const factory = CONTRACTS[chain].factory.toLowerCase()
 
