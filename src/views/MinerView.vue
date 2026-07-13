@@ -22,7 +22,10 @@ import RpcSettings from '@/components/RpcSettings.vue'
 import TxModal from '@/components/TxModal.vue'
 import MintList from '@/components/MintList.vue'
 import PendingOpsPanel from '@/components/PendingOpsPanel.vue'
+import AnalyticsConsent from '@/components/AnalyticsConsent.vue'
 import { CONTRACTS } from '@/config/contracts'
+import { analyticsOperationName, analyticsRpcHealthState } from '@/core/minerAnalytics'
+import { trackAnalyticsEvent, type AnalyticsEventPayloads } from '@/core/analytics'
 
 const wallet = useWalletStore()
 const store = useVmuStore()
@@ -35,6 +38,14 @@ const activeChain = computed<ChainKey | null>(() => wallet.chainKey)
 const readChain = computed<ChainKey>(() => activeChain.value ?? 'eth')
 const { gwei, loading: gweiLoading, poll: pollGas } = useGasPrice(() => readChain.value)
 const { state: rpcHealth, unavailable: rpcUnavailable } = useRpcHealth(() => readChain.value)
+
+watch(
+  () =>
+    [readChain.value, rpcHealth.value.checkedAt, analyticsRpcHealthState(rpcHealth.value)] as const,
+  ([, checkedAt, state]) => {
+    if (checkedAt !== null && state) trackAnalyticsEvent('rpc_health_state', { state })
+  }
+)
 
 const rpcHealthMessage = computed(() => {
   const state = rpcHealth.value
@@ -72,6 +83,9 @@ async function onChainSelect(ev: Event) {
   }
   try {
     await wallet.switchChain(next)
+    trackAnalyticsEvent('chain_selected', {
+      chain: next === 'eth' ? 'ethereum' : 'polygon'
+    })
   } catch {
     /* switchError set in store; select already restored */
   }
@@ -176,6 +190,19 @@ const canOperate = computed(
 
 let opSeq = 0
 const prepared = ref<PreparedOp | null>(null)
+type OperationStage = AnalyticsEventPayloads['miner_operation']['stage']
+type OperationAnalytics = {
+  seq: number
+  operation: AnalyticsEventPayloads['miner_operation']['operation']
+  sentStages: Set<OperationStage>
+}
+let activeOperationAnalytics: OperationAnalytics | null = null
+
+function trackOperationStage(context: OperationAnalytics, stage: OperationStage) {
+  if (context.sentStages.has(stage)) return
+  context.sentStages.add(stage)
+  trackAnalyticsEvent('miner_operation', { operation: context.operation, stage })
+}
 
 // Invalidate only work that has not reached the wallet. Once an EIP-1193
 // request is open or a hash exists, keep tracking it until the wallet settles.
@@ -189,9 +216,13 @@ watch([() => wallet.address, () => wallet.chainKey, () => wallet.contextGen], ()
   if (walletRequestOpen || broadcasted) return
 
   opSeq += 1
-  if (!busy.value && !prepared.value) return
+  if (!busy.value && !prepared.value) {
+    activeOperationAnalytics = null
+    return
+  }
   abortPrepared(prepared.value)
   prepared.value = null
+  activeOperationAnalytics = null
   busy.value = false
   txState.value = null
   txVisible.value = false
@@ -207,6 +238,12 @@ async function operate(
   const requestedWallet = wallet.address
   const requestedContextGen = wallet.contextGen
   const seq = ++opSeq
+  const analyticsContext: OperationAnalytics = {
+    seq,
+    operation: analyticsOperationName(op),
+    sentStages: new Set()
+  }
+  activeOperationAnalytics = analyticsContext
   // Fresh check right before starting — polling may be a few seconds stale.
   const n = await checkPending()
   if (
@@ -215,9 +252,12 @@ async function operate(
     activeChain.value !== requestedChain ||
     wallet.address?.toLowerCase() !== requestedWallet.toLowerCase()
   ) {
+    if (activeOperationAnalytics === analyticsContext) activeOperationAnalytics = null
     return
   }
   if (n > 0) {
+    trackOperationStage(analyticsContext, 'failed')
+    if (activeOperationAnalytics === analyticsContext) activeOperationAnalytics = null
     txTitle.value = title
     txState.value = {
       estimate: 'error',
@@ -246,11 +286,15 @@ async function operate(
     )
     if (seq !== opSeq || wallet.contextGen !== requestedContextGen) {
       abortPrepared(prep)
+      if (activeOperationAnalytics === analyticsContext) activeOperationAnalytics = null
       return
     }
     prepared.value = prep
+    trackOperationStage(analyticsContext, 'prepared')
     // Keep busy=true while waiting for the user to click "Open MetaMask & Sign".
   } catch {
+    trackOperationStage(analyticsContext, 'failed')
+    if (activeOperationAnalytics === analyticsContext) activeOperationAnalytics = null
     if (seq === opSeq && wallet.contextGen === requestedContextGen) busy.value = false
     void checkPending()
   }
@@ -261,10 +305,20 @@ async function signPrepared() {
   const prep = prepared.value
   if (!prep) return
   const seq = opSeq
+  const analyticsContext =
+    activeOperationAnalytics?.seq === seq
+      ? activeOperationAnalytics
+      : {
+          seq,
+          operation: analyticsOperationName(prep.op),
+          sentStages: new Set<OperationStage>()
+        }
   const requestedContextGen = wallet.contextGen
   const n = await checkPending()
   if (seq !== opSeq || wallet.contextGen !== requestedContextGen || prepared.value !== prep) return
   if (n > 0) {
+    trackOperationStage(analyticsContext, 'failed')
+    if (activeOperationAnalytics === analyticsContext) activeOperationAnalytics = null
     abortPrepared(prep)
     prepared.value = null
     busy.value = false
@@ -281,11 +335,17 @@ async function signPrepared() {
   try {
     await sendPreparedOperation(prep, {
       onStep: (s) => {
-        if (seq === opSeq && wallet.contextGen === requestedContextGen) txState.value = s
+        if (seq === opSeq && wallet.contextGen === requestedContextGen) {
+          txState.value = s
+          if (s.send === 'process') trackOperationStage(analyticsContext, 'wallet_opened')
+          if (s.txHash) trackOperationStage(analyticsContext, 'submitted')
+          if (s.confirm === 'done') trackOperationStage(analyticsContext, 'confirmed')
+        }
       },
       isCancelled: () => seq !== opSeq || wallet.contextGen !== requestedContextGen
     })
   } catch {
+    trackOperationStage(analyticsContext, 'failed')
     // error in txState
   } finally {
     if (seq === opSeq && wallet.contextGen === requestedContextGen) {
@@ -293,6 +353,7 @@ async function signPrepared() {
       store.refresh()
       void checkPending()
     }
+    if (activeOperationAnalytics === analyticsContext) activeOperationAnalytics = null
   }
 }
 
@@ -304,6 +365,7 @@ function cancelTx() {
   opSeq++
   abortPrepared(prepared.value)
   prepared.value = null
+  activeOperationAnalytics = null
   busy.value = false
   if (activeChain.value && wallet.address)
     clearAbandonedSoftLocks(activeChain.value, wallet.address)
@@ -599,6 +661,7 @@ const explorerAddrUrl = computed(() => {
           maiqiu-cat/XENTurbo-XEN-Miner <span aria-hidden="true">↗</span>
         </a>
       </p>
+      <AnalyticsConsent />
     </footer>
 
     <TxModal
@@ -686,7 +749,7 @@ const explorerAddrUrl = computed(() => {
 }
 .site-footer {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 16px;
   margin-top: 20px;

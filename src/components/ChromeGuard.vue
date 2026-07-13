@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { checkBrowserSupport, type BrowserNavigator } from '@/core/browserGuard'
+import { trackAnalyticsEvent } from '@/core/analytics'
 
 const supported = ref(true)
 const message = ref('XENTurbo XEN Miner requires Google Chrome.')
@@ -9,17 +10,31 @@ onMounted(() => {
   const result = checkBrowserSupport(navigator as unknown as BrowserNavigator)
   supported.value = result.supported
   message.value = result.message
+  if (!result.supported && result.reason) {
+    trackAnalyticsEvent('browser_guard_shown', { reason: result.reason })
+  }
 })
 </script>
 
 <template>
-  <div v-if="!supported" class="chrome-guard" role="alertdialog" aria-modal="true" aria-labelledby="chrome-guard-title">
+  <div
+    v-if="!supported"
+    class="chrome-guard"
+    role="alertdialog"
+    aria-modal="true"
+    aria-labelledby="chrome-guard-title"
+  >
     <div class="chrome-guard__panel">
       <p id="chrome-guard-title" class="chrome-guard__title">Please use PC Chrome</p>
       <p class="chrome-guard__body">
         {{ message }}
       </p>
-      <a class="btn btn-primary chrome-guard__action" href="https://www.google.com/chrome/" target="_blank" rel="noreferrer">
+      <a
+        class="btn btn-primary chrome-guard__action"
+        href="https://www.google.com/chrome/"
+        target="_blank"
+        rel="noreferrer"
+      >
         Get Chrome
       </a>
     </div>

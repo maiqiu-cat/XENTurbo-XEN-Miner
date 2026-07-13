@@ -11,6 +11,7 @@ export interface BrowserNavigator {
 export interface BrowserCheck {
   supported: boolean
   message: string
+  reason?: 'mobile' | 'non_chrome'
 }
 
 const EXCLUDED_CHROMIUM_UA =
@@ -18,7 +19,11 @@ const EXCLUDED_CHROMIUM_UA =
 
 function isMobileEnvironment(nav: BrowserNavigator): boolean {
   if (nav.userAgentData?.mobile) return true
-  if (/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile|Tablet/i.test(nav.userAgent)) {
+  if (
+    /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile|Tablet/i.test(
+      nav.userAgent
+    )
+  ) {
     return true
   }
   // iPadOS can present a desktop Safari or Chrome user agent.
@@ -50,7 +55,9 @@ export function checkBrowserSupport(nav: BrowserNavigator): BrowserCheck {
   if (isMobileEnvironment(nav)) {
     return {
       supported: false,
-      message: 'Mobile browsers are not supported. Open this site on a desktop or laptop with Google Chrome.'
+      message:
+        'Mobile browsers are not supported. Open this site on a desktop or laptop with Google Chrome.',
+      reason: 'mobile'
     }
   }
 
@@ -58,6 +65,7 @@ export function checkBrowserSupport(nav: BrowserNavigator): BrowserCheck {
 
   return {
     supported: false,
-    message: `XENTurbo XEN Miner requires PC Google Chrome. You are currently using ${detectBrowserName(nav)}.`
+    message: `XENTurbo XEN Miner requires PC Google Chrome. You are currently using ${detectBrowserName(nav)}.`,
+    reason: 'non_chrome'
   }
 }

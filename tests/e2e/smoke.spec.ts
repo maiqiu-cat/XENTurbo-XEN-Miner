@@ -317,6 +317,10 @@ test('production preview renders in desktop Chrome without console errors and se
   const headers = response?.headers() ?? {}
   expect(headers['content-security-policy']).toContain("default-src 'self'")
   expect(headers['content-security-policy']).toContain("script-src 'self'")
+  expect(headers['content-security-policy']).toContain(
+    "script-src 'self' https://www.googletagmanager.com"
+  )
+  expect(headers['content-security-policy']).not.toContain("script-src 'self' 'unsafe-inline'")
   expect(headers['content-security-policy']).toContain("style-src 'self' 'unsafe-inline'")
   expect(headers['content-security-policy']).toContain("img-src 'self' data: chrome-extension:")
   expect(headers['content-security-policy']).toContain("font-src 'self'")

@@ -3,11 +3,13 @@ import { onMounted } from 'vue'
 import { useWalletStore } from '@/stores/walletStore'
 import ChromeGuard from '@/components/ChromeGuard.vue'
 import MinerView from '@/views/MinerView.vue'
+import { analytics } from '@/core/analytics'
 
 const wallet = useWalletStore()
 
 onMounted(() => {
-  wallet.init()
+  void wallet.init()
+  void analytics.initialize().catch(() => {})
 })
 </script>
 

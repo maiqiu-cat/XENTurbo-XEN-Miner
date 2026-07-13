@@ -9,6 +9,13 @@ declare module '*.vue' {
 interface ImportMetaEnv {
   readonly VITE_RPC_ETH?: string
   readonly VITE_RPC_POLYGON?: string
+  readonly VITE_GA_MEASUREMENT_ID?: string
+  readonly VITE_GA_ALLOWED_HOSTNAME?: string
+}
+
+interface Window {
+  dataLayer?: unknown[][]
+  gtag?: (...args: unknown[]) => void
 }
 
 interface ImportMeta {

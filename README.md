@@ -93,6 +93,29 @@ cp .env.example .env
 Custom RPC endpoints can also be added through the RPC control in the Miner.
 Only HTTPS endpoints that return the expected chain ID are accepted.
 
+## Optional usage analytics
+
+The production site at `miner.xenturbo.io` offers optional Google Analytics 4
+usage analytics. The Google tag is not requested and no analytics event is sent
+until the visitor selects **Allow analytics**.
+
+When enabled, GA4 records page and session statistics, approximate location, and
+browser/device information. It may store a first-party `_ga` client identifier.
+XENTurbo's custom events contain only fixed categories for browser support,
+wallet connection outcome, selected chain, RPC health, and Miner operation stage.
+They never include wallet addresses, transaction hashes, nonces, RPC URLs, VMU
+IDs, form values, or error text.
+
+Advertising storage, advertising user data, ad personalization, and Google
+Signals remain disabled. Visitors can change their choice at any time through
+**Analytics settings** in the page footer; declining or revoking analytics does
+not affect mining. Google explains how it processes partner-site data at
+https://policies.google.com/technologies/partner-sites.
+
+Analytics is restricted by hostname and is disabled by default for local builds
+and forks unless their operator explicitly supplies a GA4 Measurement ID and an
+allowed hostname.
+
 ## Why no backend is needed
 
 The original platform used a Java service + MySQL to store VMU proxy addresses,
@@ -194,7 +217,8 @@ to override the script's default RPC for the selected chain.
 Vite development and preview responses include the release security headers so they
 can be validated locally. A matching Nginx snippet is prepared at
 `ops/nginx/security-headers.conf` for production deployment. The CSP allows
-same-origin requests and HTTPS RPC endpoints, including user-configured RPCs.
+same-origin requests, HTTPS RPC endpoints (including user-configured RPCs), and
+the minimum Google tag and GA4 image endpoints needed after analytics consent.
 
 ## Bundle budget
 

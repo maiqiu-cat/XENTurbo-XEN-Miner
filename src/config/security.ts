@@ -4,9 +4,9 @@ export function contentSecurityPolicy(includeDevWebSockets = false): string {
 
   return [
     "default-src 'self'",
-    "script-src 'self'",
+    "script-src 'self' https://www.googletagmanager.com",
     "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data: chrome-extension:",
+    "img-src 'self' data: chrome-extension: https://*.google-analytics.com https://*.googletagmanager.com",
     "font-src 'self'",
     `connect-src ${connectSources.join(' ')}`,
     "object-src 'none'",
