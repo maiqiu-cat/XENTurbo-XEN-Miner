@@ -22,7 +22,6 @@ import RpcSettings from '@/components/RpcSettings.vue'
 import TxModal from '@/components/TxModal.vue'
 import MintList from '@/components/MintList.vue'
 import PendingOpsPanel from '@/components/PendingOpsPanel.vue'
-import AnalyticsConsent from '@/components/AnalyticsConsent.vue'
 import { CONTRACTS } from '@/config/contracts'
 import { analyticsOperationName, analyticsRpcHealthState } from '@/core/minerAnalytics'
 import { trackAnalyticsEvent, type AnalyticsEventPayloads } from '@/core/analytics'
@@ -661,7 +660,6 @@ const explorerAddrUrl = computed(() => {
           maiqiu-cat/XENTurbo-XEN-Miner <span aria-hidden="true">↗</span>
         </a>
       </p>
-      <AnalyticsConsent />
     </footer>
 
     <TxModal

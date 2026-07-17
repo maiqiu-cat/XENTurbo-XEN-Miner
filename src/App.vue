@@ -9,7 +9,7 @@ const wallet = useWalletStore()
 
 onMounted(() => {
   void wallet.init()
-  void analytics.initialize().catch(() => {})
+  void analytics.grant().catch(() => {})
 })
 </script>
 
