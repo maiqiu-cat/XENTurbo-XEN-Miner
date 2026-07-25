@@ -1,7 +1,14 @@
 import { fileURLToPath, URL } from 'node:url'
+import { readFileSync } from 'node:fs'
 import { defineConfig } from 'vitest/config'
 import vue from '@vitejs/plugin-vue'
 import { contentSecurityPolicy } from './src/config/security'
+
+const packageVersion = (
+  JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as {
+    version: string
+  }
+).version
 
 const securityHeaders = {
   'Content-Security-Policy': contentSecurityPolicy(),
@@ -14,6 +21,9 @@ const securityHeaders = {
 
 export default defineConfig({
   plugins: [vue()],
+  define: {
+    __APP_VERSION__: JSON.stringify(packageVersion)
+  },
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url))

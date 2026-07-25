@@ -23,6 +23,7 @@ import TxModal from '@/components/TxModal.vue'
 import MintList from '@/components/MintList.vue'
 import PendingOpsPanel from '@/components/PendingOpsPanel.vue'
 import { CONTRACTS } from '@/config/contracts'
+import { APP_VERSION } from '@/config/version'
 import { analyticsOperationName, analyticsRpcHealthState } from '@/core/minerAnalytics'
 import { trackAnalyticsEvent, type AnalyticsEventPayloads } from '@/core/analytics'
 
@@ -434,7 +435,10 @@ const explorerAddrUrl = computed(() => {
     <!-- header -->
     <header class="row between wrap" style="margin-bottom: 20px">
       <div>
-        <h1 style="margin: 0; font-size: 22px">XENTurbo XEN Miner</h1>
+        <div class="brand-line">
+          <h1>XENTurbo XEN Miner</h1>
+          <span data-testid="app-version" class="app-version">{{ APP_VERSION }}</span>
+        </div>
         <span class="dim">Pure frontend. No backend, no database. All state read from chain.</span>
       </div>
       <div class="row wrap">
@@ -675,6 +679,22 @@ const explorerAddrUrl = computed(() => {
 </template>
 
 <style scoped>
+.brand-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.brand-line h1 {
+  margin: 0;
+  font-size: 22px;
+}
+.app-version {
+  color: var(--text-dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+}
 .gas-pill {
   border: 1px solid var(--border);
   border-radius: 10px;

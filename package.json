@@ -1,6 +1,6 @@
 {
   "name": "standalone-miner",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "XENTurbo XEN Miner - pure frontend batch miner, no backend, no database. All state derived from on-chain data.",
   "private": true,
   "type": "module",
@@ -17,7 +17,8 @@
     "test:e2e": "npm run build && playwright test",
     "verify:create2": "node scripts/verify-create2.mjs",
     "check:rpc-health": "node scripts/check-rpc-health.mjs",
-    "check:public-safety": "node scripts/check-public-safety.mjs",
+    "check:public-safety": "node scripts/check-public-safety.mjs && node scripts/check-version.mjs",
+    "check:version": "node scripts/check-version.mjs",
     "typecheck": "vue-tsc --noEmit",
     "lint": "eslint . --max-warnings=0",
     "format:check": "prettier --check .",

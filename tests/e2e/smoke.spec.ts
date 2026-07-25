@@ -303,6 +303,7 @@ test('production preview renders in desktop Chrome without console errors and se
   const response = await page.goto('/')
 
   await expect(page.getByRole('heading', { name: 'XENTurbo XEN Miner' })).toBeVisible()
+  await expect(page.getByTestId('app-version')).toHaveText(/^v\d+\.\d+\.\d+$/)
   const footer = page.getByRole('contentinfo')
   await expect(footer).toContainText('Copyright 2026 · Miner.XENTurbo.io')
   await expect(footer).toContainText(
