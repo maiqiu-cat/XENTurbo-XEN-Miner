@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 
 const allowedEmail = /@(?:users\.noreply\.github\.com|cryptocell\.cloud)$/i
 const blockedHistoryPaths = new Set(['DEPLOY-TENCENT.md', 'RELEASE-FOR-CODEX.txt'])
+const gitOutputLimit = 64 * 1024 * 1024
 const secretPatterns = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
   /\bAKID[A-Za-z0-9]{20,}\b/,
@@ -13,7 +14,7 @@ const secretPatterns = [
 ]
 
 function git(args) {
-  return execFileSync('git', args, { encoding: 'utf8' })
+  return execFileSync('git', args, { encoding: 'utf8', maxBuffer: gitOutputLimit })
 }
 
 const failures = []
