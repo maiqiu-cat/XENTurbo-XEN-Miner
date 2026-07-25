@@ -196,24 +196,45 @@ describe('operation postconditions', () => {
   })
 
   it('does not verify empty-slot creation unless the factory count reaches every expected id', async () => {
-    const result = await verify(
+    const readStatuses = vi.fn(
+      async (_chain, _wallet, ids: number[]) => new Map(ids.map((id) => [id, 'EMPTY' as const]))
+    )
+    const readProxyDeployments = vi.fn(
+      async (_chain, _wallet, ids: number[]) => new Map(ids.map((id) => [id, 'DEPLOYED' as const]))
+    )
+    const result = await verifyOperationOutcome(
       operation({ op: 'CREATE_EMPTY_SLOT', count: 2, preVmuCount: 10 }),
-      new Map([
-        [11, 'EMPTY'],
-        [12, 'EMPTY']
-      ]),
       {
-        deployments: new Map([
-          [11, 'DEPLOYED'],
-          [12, 'DEPLOYED']
-        ]),
-        vmuCount: 11
+        readStatuses,
+        readProxyDeployments,
+        readCount: async () => 11
       }
     )
 
     expect(result.classification).toBe('partial')
     expect(result.matchingIds).toEqual([11])
     expect(result.unexpectedIds).toEqual([12])
+    expect(readStatuses).toHaveBeenCalledWith('eth', wallet, [11])
+    expect(readProxyDeployments).toHaveBeenCalledWith('eth', wallet, [11])
+  })
+
+  it('skips status and code reads when empty-slot creation did not increase the factory count', async () => {
+    const readStatuses = vi.fn()
+    const readProxyDeployments = vi.fn()
+
+    const result = await verifyOperationOutcome(
+      operation({ op: 'CREATE_EMPTY_SLOT', count: 500, preVmuCount: 10 }),
+      {
+        readStatuses,
+        readProxyDeployments,
+        readCount: async () => 10
+      }
+    )
+
+    expect(result.classification).toBe('partial')
+    expect(result.unexpectedCount).toBe(500)
+    expect(readStatuses).not.toHaveBeenCalled()
+    expect(readProxyDeployments).not.toHaveBeenCalled()
   })
 
   it('reports empty-slot proxy code read failures as uncertain', async () => {

@@ -27,7 +27,8 @@ import {
   getInjectedAccount,
   getInjectedChainId,
   getInjectedLatestNonce,
-  getInjectedPendingNonce
+  getInjectedPendingNonce,
+  assertNonceAgreement
 } from './eip1193'
 import {
   uncertainOperationOutcome,
@@ -103,6 +104,52 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   })
 }
 
+function awaitWalletResponse<T>(
+  request: Promise<T>,
+  timeoutMs: number,
+  onLateResolve: (value: T) => void,
+  onLateReject: (error: unknown) => void
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let detached = false
+    const timer = setTimeout(() => {
+      detached = true
+      reject(
+        new Error(
+          `WALLET_RESPONSE_TIMEOUT: Wallet request did not return within ${timeoutMs / 1000}s.`
+        )
+      )
+    }, timeoutMs)
+
+    request.then(
+      (value) => {
+        clearTimeout(timer)
+        if (detached) {
+          try {
+            onLateResolve(value)
+          } catch {
+            // The pending record remains unresolved and can be reconciled manually.
+          }
+          return
+        }
+        resolve(value)
+      },
+      (error) => {
+        clearTimeout(timer)
+        if (detached) {
+          try {
+            onLateReject(error)
+          } catch {
+            // The pending record remains unresolved and can be reconciled manually.
+          }
+          return
+        }
+        reject(error)
+      }
+    )
+  })
+}
+
 const ESTIMATE_TIMEOUT_MS = 40_000
 const PREFLIGHT_TIMEOUT_MS = 15_000
 const PREFLIGHT_CONTRACT_TIMEOUT_MS = 30_000
@@ -111,6 +158,7 @@ const GAS_RATIO_SCALE = 10_000n
 /** Keep 10% of the latest block gas limit free for block assembly variance. */
 const BLOCK_GAS_SAFETY_BPS = 9_000n
 export const PREPARED_OP_TTL_MS = 120_000
+export const WALLET_RESPONSE_TIMEOUT_MS = 120_000
 
 const factoryIface = new Interface(XENFactoryABI as unknown as any[])
 
@@ -511,7 +559,7 @@ export interface PreparedOp {
  */
 /** pendingNonce - latestNonce; >0 means at least one in-flight tx. */
 export async function getPendingTxCount(chain: ChainKey, wallet: string): Promise<number> {
-  const [chainId, latest, pending] = await withTimeout(
+  const [chainId, walletLatest, walletPending] = await withTimeout(
     Promise.all([
       getInjectedChainId(),
       getInjectedLatestNonce(wallet),
@@ -523,7 +571,18 @@ export async function getPendingTxCount(chain: ChainKey, wallet: string): Promis
   if (chainId !== CHAINS[chain].chainId) {
     throw new Error('Wallet is on the wrong network. Switch networks and retry.')
   }
-  return Math.max(0, pending - latest)
+  const readProvider = getReadProvider(chain)
+  const [rpcLatest, rpcPending] = await withTimeout(
+    Promise.all([
+      readProvider.getTransactionCount(wallet, 'latest'),
+      readProvider.getTransactionCount(wallet, 'pending')
+    ]),
+    PREFLIGHT_TIMEOUT_MS,
+    'Read RPC pending transaction check'
+  )
+  assertNonceAgreement(walletLatest, rpcLatest, 'latest')
+  assertNonceAgreement(walletPending, rpcPending, 'pending')
+  return Math.max(0, walletPending - walletLatest)
 }
 
 export async function prepareOperation(
@@ -691,6 +750,46 @@ export async function sendPreparedOperation(
   let awaitingWalletRecorded = false
   let awaitingWalletResolved = false
 
+  const recordBroadcast = (txHash: string) => {
+    broadcasted = true
+    awaitingWalletResolved = true
+    if (prepared.lockIds.length) attachTxHash(prepared.batch, txHash)
+    recordPendingOp({
+      id: prepared.batch,
+      chain: prepared.chain,
+      wallet: prepared.wallet,
+      op: prepared.op,
+      ids: prepared.ids,
+      count: prepared.count,
+      term: prepared.term,
+      txHash,
+      nonce: broadcastNonce,
+      phase: 'broadcast'
+    })
+  }
+
+  const recordWalletDrop = (releaseImmediately = false) => {
+    recordPendingOp({
+      id: prepared.batch,
+      chain: prepared.chain,
+      wallet: prepared.wallet,
+      op: prepared.op,
+      ids: prepared.ids,
+      count: prepared.count,
+      term: prepared.term,
+      txHash: '',
+      nonce: broadcastNonce,
+      phase: 'dropped'
+    })
+    awaitingWalletResolved = true
+    if (releaseImmediately && lockHeld && prepared.lockIds.length) releaseLock(prepared.batch)
+  }
+
+  const settleLateWalletFailure = (error: unknown) => {
+    if (!awaitingWalletRecorded || !isDefinitiveWalletRejection(error)) return
+    recordWalletDrop(true)
+  }
+
   try {
     assertOperationActive(cb)
     log('Starting final checks before opening MetaMask...')
@@ -782,62 +881,64 @@ export async function sendPreparedOperation(
         assertOperationActive(cb)
         log('Transaction simulation succeeded.', 'done')
 
-        return writeFactory({
-          chainId: prepared.chainId,
-          address: prepared.factoryAddress,
-          abi: XENFactoryABI,
-          functionName: prepared.fnName,
-          args: prepared.args,
-          value,
-          gas: prepared.gasLimit,
-          nonce,
-          expectedFrom: prepared.wallet,
-          onRequestStart: () => {
-            assertOperationActive(cb)
-            assertPreparedContext(prepared, prepared.wallet, prepared.chainId)
-            state.send = 'process'
-            state.walletPrompted = true
-            log('MetaMask request opened. Review the details and confirm or reject it.')
-            recordPendingOp({
-              id: prepared.batch,
-              chain: prepared.chain,
-              wallet: prepared.wallet,
-              op: prepared.op,
-              ids: prepared.ids,
-              count: prepared.count,
-              term: prepared.term,
-              txHash: '',
-              nonce,
-              phase: 'awaiting-wallet'
-            })
-            awaitingWalletRecorded = true
-          },
-          onRequestSyncError: () => {
-            if (!awaitingWalletRecorded) return
-            removePendingOpRecord(prepared.batch)
-            awaitingWalletResolved = true
+        try {
+          return await writeFactory({
+            chainId: prepared.chainId,
+            address: prepared.factoryAddress,
+            abi: XENFactoryABI,
+            functionName: prepared.fnName,
+            args: prepared.args,
+            value,
+            gas: prepared.gasLimit,
+            nonce,
+            expectedFrom: prepared.wallet,
+            onRequestStart: () => {
+              assertOperationActive(cb)
+              assertPreparedContext(prepared, prepared.wallet, prepared.chainId)
+              state.send = 'process'
+              state.walletPrompted = true
+              log('MetaMask request opened. Review the details and confirm or reject it.')
+              recordPendingOp({
+                id: prepared.batch,
+                chain: prepared.chain,
+                wallet: prepared.wallet,
+                op: prepared.op,
+                ids: prepared.ids,
+                count: prepared.count,
+                term: prepared.term,
+                txHash: '',
+                nonce,
+                phase: 'awaiting-wallet'
+              })
+              awaitingWalletRecorded = true
+            },
+            onRequestSyncError: () => {
+              if (!awaitingWalletRecorded) return
+              removePendingOpRecord(prepared.batch)
+              awaitingWalletResolved = true
+            }
+          })
+        } catch (error) {
+          if (
+            awaitingWalletRecorded &&
+            !awaitingWalletResolved &&
+            isDefinitiveWalletRejection(error)
+          ) {
+            recordWalletDrop()
           }
-        })
+          throw error
+        }
       }
     )
-    const txHash = await walletSend
-    broadcasted = true
+    const txHash = await awaitWalletResponse(
+      walletSend,
+      WALLET_RESPONSE_TIMEOUT_MS,
+      recordBroadcast,
+      settleLateWalletFailure
+    )
     state.txHash = txHash
     state.walletPrompted = false
-    if (prepared.lockIds.length) attachTxHash(prepared.batch, txHash)
-    // Persist for the Pending Ops panel (survives reload until mined).
-    recordPendingOp({
-      id: prepared.batch,
-      chain: prepared.chain,
-      wallet: prepared.wallet,
-      op: prepared.op,
-      ids: prepared.ids,
-      count: prepared.count,
-      term: prepared.term,
-      txHash,
-      nonce: broadcastNonce,
-      phase: 'broadcast'
-    })
+    recordBroadcast(txHash)
     state.send = 'done'
     log(`Transaction submitted: ${txHash.slice(0, 10)}...${txHash.slice(-8)}.`, 'done')
 
@@ -847,13 +948,9 @@ export async function sendPreparedOperation(
     const confirmMs = CONFIRM_TIMEOUT_MS[prepared.chain]
     let receipt
     try {
-      receipt = await withTimeout(
-        readProvider.waitForTransaction(txHash, 1),
-        confirmMs,
-        'Confirmation'
-      )
+      receipt = await readProvider.waitForTransaction(txHash, 1, confirmMs)
     } catch (err: any) {
-      if (/Confirmation timed out/i.test(err?.message || '')) {
+      if (err?.code === 'TIMEOUT' || /timed? out|timeout/i.test(err?.message || '')) {
         state.confirm = 'error'
         state.error =
           'Confirmation timed out. The transaction may still be pending — do not retry the same VMUs. Refresh later or check the explorer.'
@@ -912,20 +1009,13 @@ export async function sendPreparedOperation(
     }
     return state
   } catch (err: any) {
-    if (!broadcasted && awaitingWalletRecorded && isDefinitiveWalletRejection(err)) {
-      recordPendingOp({
-        id: prepared.batch,
-        chain: prepared.chain,
-        wallet: prepared.wallet,
-        op: prepared.op,
-        ids: prepared.ids,
-        count: prepared.count,
-        term: prepared.term,
-        txHash: '',
-        nonce: broadcastNonce,
-        phase: 'dropped'
-      })
-      awaitingWalletResolved = true
+    if (
+      !broadcasted &&
+      awaitingWalletRecorded &&
+      !awaitingWalletResolved &&
+      isDefinitiveWalletRejection(err)
+    ) {
+      recordWalletDrop()
     }
     if (!broadcasted && state.send !== 'done') state.send = 'error'
     else if (state.confirm === 'process') state.confirm = 'error'
@@ -974,10 +1064,10 @@ export async function resumePendingLocks(chain: ChainKey, wallet: string): Promi
           releaseLock(lock.batch)
           return
         }
-        const waited = await withTimeout(
-          provider.waitForTransaction(lock.txHash, 1),
-          Math.min(CONFIRM_TIMEOUT_MS[chain], 30_000),
-          'Resume confirm'
+        const waited = await provider.waitForTransaction(
+          lock.txHash,
+          1,
+          Math.min(CONFIRM_TIMEOUT_MS[chain], 30_000)
         )
         if (waited) {
           resolvedAny = true
@@ -1004,6 +1094,10 @@ export function normalizeError(err: any): string {
     return 'Wallet and read RPC disagree about the pending nonce. Do not retry yet. Open MetaMask Activity, verify the selected network, then recheck.'
   if (/WALLET_ASLEEP/.test(msg))
     return 'Wallet did not respond (it may have gone idle). Click the MetaMask extension icon or reload the page, then retry.'
+  if (/WALLET_LOCK_TIMEOUT/i.test(msg))
+    return 'Another tab is currently using this wallet. Wait for that transaction to finish, then retry.'
+  if (/WALLET_RESPONSE_TIMEOUT/i.test(msg))
+    return 'MetaMask did not return a result within 2 minutes. This page stopped waiting, but the wallet request may still be active. Check MetaMask Activity and recheck pending operations before retrying.'
   if (/LOCAL_PENDING_UNRESOLVED/i.test(msg))
     return 'A previous local transaction record is unresolved. Recheck pending operations. If it remains unknown, verify MetaMask Activity and the block explorer before marking it dropped.'
   if (/PENDING_TX|in-flight transaction limit|delegated accounts/i.test(msg))

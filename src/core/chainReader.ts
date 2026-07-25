@@ -15,12 +15,42 @@ const xenIface = new Interface(XENCryptoABI as unknown as any[])
 const BATCH_SIZE = 400
 const BATCH_CONCURRENCY = 2
 const CODE_BATCH_SIZE = 32
+export const MAX_WALLET_VMU_COUNT = 100_000
 
 export type ProxyDeploymentStatus = 'DEPLOYED' | 'MISSING' | 'READ_ERROR'
 
 export interface ReadProgress {
   loaded: number
   total: number
+}
+
+export function assertVmuCount(value: unknown): number {
+  let count: bigint
+  try {
+    if (typeof value === 'bigint') count = value
+    else if (typeof value === 'number' && Number.isSafeInteger(value)) count = BigInt(value)
+    else if (typeof value === 'string' && /^(?:0x[0-9a-f]+|[0-9]+)$/i.test(value))
+      count = BigInt(value)
+    else throw new Error('invalid')
+  } catch {
+    throw new Error('Invalid VMU count returned by the factory')
+  }
+  if (count < 0n || count > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error('Invalid VMU count returned by the factory')
+  }
+  if (count > BigInt(MAX_WALLET_VMU_COUNT)) {
+    throw new Error(
+      `VMU count limit exceeded (${count.toString()} > ${MAX_WALLET_VMU_COUNT}). Refusing an unbounded browser scan.`
+    )
+  }
+  return Number(count)
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return
+  throw signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException('The VMU scan was aborted', 'AbortError')
 }
 
 /** Read factory.vmuCount(wallet) - the on-chain source of truth for VMU count. */
@@ -32,7 +62,7 @@ export async function readVmuCount(chain: ChainKey, wallet: string): Promise<num
     provider
   )
   const count = await withRetry(() => factory.vmuCount(wallet))
-  return Number(count)
+  return assertVmuCount(count)
 }
 
 /** Read the current XEN global rank (for reward estimation). */
@@ -131,7 +161,8 @@ async function readVmuIds(
   chain: ChainKey,
   wallet: string,
   ids: number[],
-  chainTimestampMs: number
+  chainTimestampMs: number,
+  signal?: AbortSignal
 ): Promise<Vmu[]> {
   if (!ids.length) return []
   const provider = getReadProvider(chain)
@@ -150,7 +181,7 @@ async function readVmuIds(
       callData: xenIface.encodeFunctionData('userMints', [proxy.address])
     }))
     try {
-      const results = (await withRetry(() => multicall.aggregate3(calls))) as {
+      const results = (await withRetry(() => multicall.aggregate3(calls), { signal })) as {
         success: boolean
         returnData: string
       }[]
@@ -177,68 +208,82 @@ export async function readWalletVmus(
     vmuCount?: number
     chainTimestampMs?: number
     onProgress?: (p: ReadProgress) => void
+    signal?: AbortSignal
   } = {}
 ): Promise<Vmu[]> {
   const { factory, vmuTemplate, xenCrypto, multicall3 } = CONTRACTS[chain]
 
-  const total = opts.vmuCount ?? (await readVmuCount(chain, wallet))
+  throwIfAborted(opts.signal)
+  const total = assertVmuCount(opts.vmuCount ?? (await readVmuCount(chain, wallet)))
   if (total <= 0) {
     opts.onProgress?.({ loaded: 0, total: 0 })
     return []
   }
   const chainTimestampMs = opts.chainTimestampMs ?? (await readChainTimestamp(chain))
+  throwIfAborted(opts.signal)
 
   const multicall = new Contract(
     multicall3,
     Multicall3ABI as unknown as any[],
     getReadProvider(chain)
   )
-  const proxies = computeProxyAddressRange({
-    factory,
-    vmuTemplate,
-    wallet,
-    fromId: 1,
-    toId: total
-  })
-
-  const batches: (typeof proxies)[] = []
-  for (let start = 0; start < proxies.length; start += BATCH_SIZE) {
-    batches.push(proxies.slice(start, start + BATCH_SIZE))
-  }
+  const batches = Array.from({ length: Math.ceil(total / BATCH_SIZE) }, (_, index) => ({
+    fromId: index * BATCH_SIZE + 1,
+    toId: Math.min(total, (index + 1) * BATCH_SIZE)
+  }))
 
   let loaded = 0
-  const vmuBatches = await mapWithConcurrency(batches, BATCH_CONCURRENCY, async (slice) => {
+  const vmuBatches = await mapWithConcurrency(batches, BATCH_CONCURRENCY, async (batch) => {
+    throwIfAborted(opts.signal)
+    const slice = computeProxyAddressRange({
+      factory,
+      vmuTemplate,
+      wallet,
+      fromId: batch.fromId,
+      toId: batch.toId
+    })
     const calls = slice.map((p) => ({
       target: xenCrypto,
       allowFailure: true,
       callData: xenIface.encodeFunctionData('userMints', [p.address])
     }))
 
-    const results = (await withRetry(() => multicall.aggregate3(calls))) as {
-      success: boolean
-      returnData: string
-    }[]
-
-    const decoded = slice.map((p, i) =>
-      decodeUserMint(p.id, p.address, results[i], chainTimestampMs)
-    )
+    let decoded: Vmu[]
+    try {
+      const results = (await withRetry(() => multicall.aggregate3(calls), {
+        signal: opts.signal
+      })) as {
+        success: boolean
+        returnData: string
+      }[]
+      throwIfAborted(opts.signal)
+      decoded = slice.map((p, i) => decodeUserMint(p.id, p.address, results[i], chainTimestampMs))
+    } catch {
+      throwIfAborted(opts.signal)
+      decoded = slice.map((proxy) => emptyVmu(proxy.id, proxy.address, false))
+    }
     loaded += slice.length
     opts.onProgress?.({ loaded, total })
+    throwIfAborted(opts.signal)
     return decoded
   })
+  throwIfAborted(opts.signal)
   const vmus = vmuBatches.flat()
 
   // Retry failed reads once (small batch) so transient RPC blips don't stick.
   const failedIds = vmus.filter((v) => !v.readOk).map((v) => v.id)
   if (failedIds.length) {
     try {
-      const retried = await readVmuIds(chain, wallet, failedIds, chainTimestampMs)
+      throwIfAborted(opts.signal)
+      const retried = await readVmuIds(chain, wallet, failedIds, chainTimestampMs, opts.signal)
+      throwIfAborted(opts.signal)
       const byId = new Map(retried.map((v) => [v.id, v]))
       for (let i = 0; i < vmus.length; i++) {
         const fix = byId.get(vmus[i].id)
         if (fix) vmus[i] = fix
       }
     } catch {
+      throwIfAborted(opts.signal)
       // Keep READ_ERROR markers; UI will surface the count.
     }
   }

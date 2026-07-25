@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { classifyVmuStatus } from '@/core/chainReader'
+import { assertVmuCount, classifyVmuStatus, MAX_WALLET_VMU_COUNT } from '@/core/chainReader'
 
 afterEach(() => vi.restoreAllMocks())
 
@@ -13,5 +13,18 @@ describe('VMU maturity classification', () => {
 
   it('keeps rank zero as an empty slot regardless of time', () => {
     expect(classifyVmuStatus(0, 2_000_000, 9_999_999)).toBe('EMPTY')
+  })
+})
+
+describe('VMU count validation', () => {
+  it.each([-1n, BigInt(Number.MAX_SAFE_INTEGER) + 1n, BigInt(MAX_WALLET_VMU_COUNT + 1)])(
+    'rejects unsafe or resource-exhausting VMU count %s',
+    (count) => {
+      expect(() => assertVmuCount(count)).toThrow(/Invalid VMU count|VMU count limit/)
+    }
+  )
+
+  it('accepts the configured defensive boundary', () => {
+    expect(assertVmuCount(BigInt(MAX_WALLET_VMU_COUNT))).toBe(MAX_WALLET_VMU_COUNT)
   })
 })

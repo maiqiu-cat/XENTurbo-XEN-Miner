@@ -126,6 +126,7 @@ function preparedOperation() {
 async function installSendHarness(options: {
   walletNonce: number
   rpcNonce: number
+  rpcLatestNonce?: number
   walletLatestNonce?: number
   walletFee?: bigint
   readRpcFee?: bigint
@@ -134,6 +135,7 @@ async function installSendHarness(options: {
   writeFactoryFailure?: Error
   beforeRequestStart?: () => void
   syncRequestFailure?: Error
+  walletRequest?: Promise<string>
 }) {
   const feeInterface = new Interface(['function FEE() view returns (uint256)'])
   const countInterface = new Interface(['function vmuCount(address) view returns (uint256)'])
@@ -149,14 +151,16 @@ async function installSendHarness(options: {
       ;(params.onRequestSyncError as (() => void) | undefined)?.()
       throw options.syncRequestFailure
     }
-    return `0x${'2'.repeat(64)}`
+    return options.walletRequest ?? `0x${'2'.repeat(64)}`
   })
   const recordPendingOp = vi.fn()
   const removePendingOpRecord = vi.fn()
   const readVmuCount = vi.fn(async () => 0)
   const readFee = vi.fn(async () => options.readRpcFee ?? walletFee)
   const readProvider = {
-    getTransactionCount: vi.fn(async () => options.rpcNonce),
+    getTransactionCount: vi.fn(async (_wallet: string, tag: string) =>
+      tag === 'latest' ? (options.rpcLatestNonce ?? options.rpcNonce) : options.rpcNonce
+    ),
     waitForTransaction: vi.fn(async () => ({ status: 1 }))
   }
 
@@ -186,7 +190,7 @@ async function installSendHarness(options: {
   })
   vi.stubGlobal('navigator', {
     locks: {
-      request: async (_key: string, work: () => Promise<unknown>) => work()
+      request: async (_key: string, _options: LockOptions, work: () => Promise<unknown>) => work()
     }
   })
   vi.doMock('../src/core/wallet', () => ({
@@ -239,10 +243,25 @@ describe('authoritative pre-send state', () => {
     const { sendPreparedOperation, writeFactory } = await installSendHarness({
       walletNonce: 9,
       walletLatestNonce: 8,
-      rpcNonce: 9
+      rpcNonce: 9,
+      rpcLatestNonce: 8
     })
 
     await expect(sendPreparedOperation(preparedOperation())).rejects.toThrow('PENDING_TX')
+    expect(writeFactory).not.toHaveBeenCalled()
+  })
+
+  it('blocks a send when wallet and read RPC nonce sources disagree', async () => {
+    const { sendPreparedOperation, writeFactory } = await installSendHarness({
+      walletNonce: 9,
+      walletLatestNonce: 9,
+      rpcNonce: 8,
+      rpcLatestNonce: 8
+    })
+
+    await expect(sendPreparedOperation(preparedOperation())).rejects.toThrow(
+      'PENDING_STATE_UNCERTAIN'
+    )
     expect(writeFactory).not.toHaveBeenCalled()
   })
 
@@ -263,7 +282,8 @@ describe('authoritative pre-send state', () => {
     const onStep = vi.fn()
     await sendPreparedOperation(preparedOperation(), { onStep })
 
-    expect(readProvider.getTransactionCount).not.toHaveBeenCalled()
+    expect(readProvider.getTransactionCount).toHaveBeenNthCalledWith(1, SEND_WALLET, 'latest')
+    expect(readProvider.getTransactionCount).toHaveBeenNthCalledWith(2, SEND_WALLET, 'pending')
     expect(ensureHealthyReadProvider).toHaveBeenCalledWith('eth')
     expect(ensureHealthyReadProvider.mock.invocationCallOrder[0]).toBeLessThan(
       writeFactory.mock.invocationCallOrder[0]
@@ -369,5 +389,41 @@ describe('authoritative pre-send state', () => {
       /provider failed synchronously/
     )
     expect(removePendingOpRecord).toHaveBeenCalledWith('batch-1')
+  })
+
+  it('detaches a wallet request that never returns while preserving reconciliation state', async () => {
+    vi.useFakeTimers()
+    const walletRequest = deferred<string>()
+    const { sendPreparedOperation, recordPendingOp, removePendingOpRecord } =
+      await installSendHarness({
+        walletNonce: 9,
+        rpcNonce: 9,
+        walletRequest: walletRequest.promise
+      })
+
+    const result = sendPreparedOperation(preparedOperation())
+    const rejection = expect(result).rejects.toThrow('WALLET_RESPONSE_TIMEOUT')
+    await vi.advanceTimersByTimeAsync(120_000)
+    await rejection
+
+    expect(recordPendingOp).toHaveBeenCalledWith(
+      expect.objectContaining({ phase: 'awaiting-wallet', nonce: 9 })
+    )
+    expect(removePendingOpRecord).not.toHaveBeenCalled()
+  })
+
+  it('uses the provider-native confirmation timeout so listeners are cleaned up', async () => {
+    const { sendPreparedOperation, readProvider } = await installSendHarness({
+      walletNonce: 9,
+      rpcNonce: 9
+    })
+
+    await sendPreparedOperation(preparedOperation())
+
+    expect(readProvider.waitForTransaction).toHaveBeenCalledWith(
+      `0x${'2'.repeat(64)}`,
+      1,
+      expect.any(Number)
+    )
   })
 })

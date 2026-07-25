@@ -50,14 +50,16 @@ describe('operation gate', () => {
     const sendFinished = new Promise<void>((resolve) => {
       finishSend = resolve
     })
-    const request = vi.fn(async (key: string, work: () => Promise<string>) => {
-      events.push(`lock:${key}`)
-      try {
-        return await work()
-      } finally {
-        events.push('unlock')
+    const request = vi.fn(
+      async (key: string, _options: LockOptions, work: () => Promise<string>) => {
+        events.push(`lock:${key}`)
+        try {
+          return await work()
+        } finally {
+          events.push('unlock')
+        }
       }
-    })
+    )
     vi.stubGlobal('navigator', { locks: { request } })
 
     const result = runWalletExclusive('xenturbo:eth:0xabc:send', async () => {
@@ -75,6 +77,28 @@ describe('operation gate', () => {
 
     await expect(result).resolves.toBe('0xhash')
     expect(events).toEqual(['lock:xenturbo:eth:0xabc:send', 'send', 'unlock'])
+  })
+
+  it('times out while waiting for another tab without aborting acquired work', async () => {
+    vi.useFakeTimers()
+    const request = vi.fn(
+      async (_key: string, options: LockOptions, _work: () => Promise<string>) =>
+        new Promise<string>((_resolve, reject) => {
+          void _work
+          options.signal?.addEventListener('abort', () => {
+            reject(new DOMException('The request was aborted', 'AbortError'))
+          })
+        })
+    )
+    vi.stubGlobal('navigator', { locks: { request } })
+
+    const waiting = runWalletExclusive('xenturbo:eth:0xabc:send', async () => '0xhash', {
+      timeoutMs: 5_000
+    })
+    const rejection = expect(waiting).rejects.toThrow('WALLET_LOCK_TIMEOUT')
+
+    await vi.advanceTimersByTimeAsync(5_000)
+    await rejection
   })
 
   it('keeps the final pending check and wallet send inside one browser lock', async () => {
@@ -130,7 +154,7 @@ describe('operation gate', () => {
     }))
     vi.stubGlobal('navigator', {
       locks: {
-        request: async (_key: string, work: () => Promise<string>) => {
+        request: async (_key: string, _options: LockOptions, work: () => Promise<string>) => {
           events.push('lock:start')
           try {
             return await work()
@@ -178,6 +202,8 @@ describe('operation gate', () => {
       'wallet:eth_chainId',
       'wallet:eth_getTransactionCount',
       'wallet:eth_getTransactionCount',
+      'nonce:latest',
+      'nonce:pending',
       'wallet:eth_accounts',
       'wallet:eth_chainId',
       'wallet:eth_getTransactionCount',
@@ -188,7 +214,8 @@ describe('operation gate', () => {
       'lock:end',
       'confirm'
     ])
-    expect(provider.getTransactionCount).not.toHaveBeenCalled()
+    expect(provider.getTransactionCount).toHaveBeenNthCalledWith(1, walletAddress, 'latest')
+    expect(provider.getTransactionCount).toHaveBeenNthCalledWith(2, walletAddress, 'pending')
   })
 
   it('blocks a locally unresolved operation before any nonce read or wallet request', async () => {
@@ -231,7 +258,7 @@ describe('operation gate', () => {
     }))
     vi.stubGlobal('navigator', {
       locks: {
-        request: async (_key: string, work: () => Promise<string>) => {
+        request: async (_key: string, _options: LockOptions, work: () => Promise<string>) => {
           events.push('lock:start')
           try {
             return await work()
@@ -319,7 +346,7 @@ describe('operation gate', () => {
     }))
     vi.stubGlobal('navigator', {
       locks: {
-        request: async (_key: string, work: () => Promise<string>) => {
+        request: async (_key: string, _options: LockOptions, work: () => Promise<string>) => {
           events.push('lock:start')
           try {
             return await work()
@@ -369,6 +396,8 @@ describe('operation gate', () => {
       'wallet:eth_chainId',
       'wallet:eth_getTransactionCount',
       'wallet:eth_getTransactionCount',
+      'nonce:latest',
+      'nonce:pending',
       'wallet:eth_accounts',
       'wallet:eth_chainId',
       'wallet:eth_getTransactionCount',

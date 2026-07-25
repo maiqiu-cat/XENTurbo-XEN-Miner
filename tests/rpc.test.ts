@@ -7,7 +7,8 @@ import {
   getRpcHealthState,
   onRpcHealthChange,
   resetProviders,
-  validateRpcEndpoint
+  validateRpcEndpoint,
+  withRetry
 } from '@/core/rpc'
 
 function createStorage(): Storage {
@@ -27,6 +28,58 @@ function createStorage(): Storage {
 beforeEach(() => {
   vi.stubGlobal('localStorage', createStorage())
   resetProviders()
+})
+
+describe('RPC retry policy', () => {
+  it('does not retry semantic contract failures', async () => {
+    const operation = vi.fn(async () => {
+      throw Object.assign(new Error('execution reverted'), { code: 'CALL_EXCEPTION' })
+    })
+    const sleep = vi.fn(async () => {})
+
+    await expect(withRetry(operation, { retries: 3, sleep })).rejects.toThrow('execution reverted')
+    expect(operation).toHaveBeenCalledOnce()
+    expect(sleep).not.toHaveBeenCalled()
+  })
+
+  it('honors server retry timing and then applies bounded exponential backoff', async () => {
+    const limited = Object.assign(new Error('rate limit'), {
+      status: 429,
+      retryAfterMs: 2_000
+    })
+    const operation = vi
+      .fn<() => Promise<string>>()
+      .mockRejectedValueOnce(limited)
+      .mockRejectedValueOnce(new Error('ETIMEDOUT'))
+      .mockResolvedValue('ok')
+    const sleep = vi.fn(async () => {})
+
+    await expect(
+      withRetry(operation, {
+        retries: 3,
+        baseDelayMs: 400,
+        maxDelayMs: 5_000,
+        jitterRatio: 0,
+        sleep
+      })
+    ).resolves.toBe('ok')
+    expect(sleep.mock.calls).toEqual([[2_000], [800]])
+  })
+
+  it('cancels backoff immediately when the caller aborts', async () => {
+    const controller = new AbortController()
+    const sleep = vi.fn(async () => {
+      controller.abort(new DOMException('cancelled', 'AbortError'))
+    })
+
+    await expect(
+      withRetry(async () => Promise.reject(new Error('ETIMEDOUT')), {
+        retries: 3,
+        signal: controller.signal,
+        sleep
+      })
+    ).rejects.toMatchObject({ name: 'AbortError' })
+  })
 })
 
 afterEach(() => {
@@ -178,5 +231,35 @@ describe('runtime RPC health selection', () => {
     } finally {
       unsubscribe()
     }
+  })
+
+  it('destroys a cached provider when it is reset', async () => {
+    writeCustomRpc('eth', ['https://rpc.example'])
+    const provider = await ensureHealthyReadProvider(
+      'eth',
+      vi.fn(async () => '0x1')
+    )
+    const destroy = vi.spyOn(provider, 'destroy')
+
+    resetProviders('eth')
+
+    expect(destroy).toHaveBeenCalledOnce()
+  })
+
+  it('destroys the old provider when the healthy endpoint set changes', async () => {
+    writeCustomRpc('eth', ['https://first.example'])
+    const first = await ensureHealthyReadProvider(
+      'eth',
+      vi.fn(async () => '0x1')
+    )
+    const destroy = vi.spyOn(first, 'destroy')
+
+    writeCustomRpc('eth', ['https://second.example'])
+    await ensureHealthyReadProvider(
+      'eth',
+      vi.fn(async () => '0x1')
+    )
+
+    expect(destroy).toHaveBeenCalledOnce()
   })
 })

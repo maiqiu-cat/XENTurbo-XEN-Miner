@@ -127,21 +127,23 @@ export async function verifyOperationOutcome(
   const readProxyDeployments = deps.readProxyDeployments ?? readVmuProxyDeployments
   const readCount = deps.readCount ?? readVmuCount
 
-  let statuses: Map<number, VmuStatus>
+  let statuses = new Map<number, VmuStatus>()
   let deployments: Map<number, ProxyDeploymentStatus> | null = null
   let actualVmuCount: number | null = null
   try {
     if (prepared.op === 'CREATE_EMPTY_SLOT') {
-      const [currentStatuses, currentDeployments, currentVmuCount] = await Promise.all([
-        readStatuses(prepared.chain, prepared.wallet, expectedIds),
-        readProxyDeployments(prepared.chain, prepared.wallet, expectedIds),
-        readCount(prepared.chain, prepared.wallet)
-      ])
-      statuses = currentStatuses
-      deployments = currentDeployments
-      actualVmuCount = currentVmuCount
+      actualVmuCount = await readCount(prepared.chain, prepared.wallet)
       if (!Number.isSafeInteger(actualVmuCount) || actualVmuCount < 0) {
         return uncertainOperationOutcome(prepared)
+      }
+      const observableIds = expectedIds.filter((id) => id <= actualVmuCount!)
+      if (observableIds.length) {
+        ;[statuses, deployments] = await Promise.all([
+          readStatuses(prepared.chain, prepared.wallet, observableIds),
+          readProxyDeployments(prepared.chain, prepared.wallet, observableIds)
+        ])
+      } else {
+        deployments = new Map()
       }
     } else {
       statuses = await readStatuses(prepared.chain, prepared.wallet, expectedIds)
@@ -155,6 +157,10 @@ export async function verifyOperationOutcome(
   const readErrorIds: number[] = []
 
   for (const id of expectedIds) {
+    if (prepared.op === 'CREATE_EMPTY_SLOT' && actualVmuCount !== null && id > actualVmuCount) {
+      unexpectedIds.push(id)
+      continue
+    }
     const status = statuses.get(id)
     if (!status || status === 'READ_ERROR') {
       readErrorIds.push(id)
@@ -171,7 +177,7 @@ export async function verifyOperationOutcome(
         readErrorIds.push(id)
         continue
       }
-      if (deployment !== 'DEPLOYED' || actualVmuCount === null || id > actualVmuCount) {
+      if (deployment !== 'DEPLOYED') {
         unexpectedIds.push(id)
         continue
       }

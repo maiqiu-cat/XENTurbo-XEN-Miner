@@ -36,8 +36,15 @@ const OPERABLE: VmuStatus[] = ['EMPTY', 'MINTING', 'CLAIMABLE']
 let maturityTimer: ReturnType<typeof setTimeout> | null = null
 const refreshFlights = new WeakMap<
   object,
-  { chain: ChainKey; wallet: string; promise: Promise<void> }
+  { chain: ChainKey; wallet: string; controller: AbortController; promise: Promise<void> }
 >()
+
+function abortRefresh(store: object): void {
+  refreshFlights
+    .get(store)
+    ?.controller.abort(new DOMException('Wallet or chain changed', 'AbortError'))
+  refreshFlights.delete(store)
+}
 
 function clearMaturityTimer(): void {
   if (maturityTimer) clearTimeout(maturityTimer)
@@ -172,7 +179,7 @@ export const useVmuStore = defineStore('vmu', {
     },
 
     detach() {
-      refreshFlights.delete(this)
+      abortRefresh(this)
       this.refreshGen += 1
       this.chain = null
       this.wallet = null
@@ -181,7 +188,7 @@ export const useVmuStore = defineStore('vmu', {
 
     /** Load cached snapshot instantly, then refresh from chain in the background. */
     async load(chain: ChainKey, wallet: string) {
-      refreshFlights.delete(this)
+      abortRefresh(this)
       const gen = ++this.refreshGen
       this.chain = chain
       this.wallet = wallet
@@ -213,10 +220,14 @@ export const useVmuStore = defineStore('vmu', {
         return existing.promise
       }
 
+      const controller = new AbortController()
       const promise = (async () => {
         const gen = ++this.refreshGen
         const isCurrent = () =>
-          gen === this.refreshGen && this.chain === chain && this.wallet === wallet
+          !controller.signal.aborted &&
+          gen === this.refreshGen &&
+          this.chain === chain &&
+          this.wallet === wallet
         this.loading = true
         this.error = null
         this.globalRank = 0
@@ -247,6 +258,7 @@ export const useVmuStore = defineStore('vmu', {
           const scannedVmus = await readWalletVmus(chain, wallet, {
             vmuCount: count,
             chainTimestampMs,
+            signal: controller.signal,
             onProgress: (p) => {
               if (isCurrent()) this.progress = p
             }
@@ -284,6 +296,7 @@ export const useVmuStore = defineStore('vmu', {
           })
           if (isCurrent()) this.scheduleMaturityRefresh()
         } catch (err: any) {
+          if (controller.signal.aborted || err?.name === 'AbortError') return
           if (!isCurrent()) return
           this.error = err?.shortMessage || err?.message || 'Failed to read chain'
         } finally {
@@ -291,7 +304,7 @@ export const useVmuStore = defineStore('vmu', {
         }
       })()
 
-      const flight = { chain, wallet, promise }
+      const flight = { chain, wallet, controller, promise }
       refreshFlights.set(this, flight)
       const clearFlight = () => {
         if (refreshFlights.get(this) === flight) refreshFlights.delete(this)
@@ -305,7 +318,7 @@ export const useVmuStore = defineStore('vmu', {
       const chain = this.chain
       const wallet = this.wallet
       const gen = ++this.refreshGen
-      refreshFlights.delete(this)
+      abortRefresh(this)
       this.reset()
       await clearSnapshot(chain, wallet)
       if (gen !== this.refreshGen || this.chain !== chain || this.wallet !== wallet) return

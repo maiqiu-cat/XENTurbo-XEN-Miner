@@ -31,6 +31,20 @@ const healthFlights = new Map<ChainKey, { generation: number; promise: Promise<R
 
 const RPC_HEALTH_TIMEOUT_MS = 2_500
 
+function evictProvider(chain: ChainKey): ReadProvider | undefined {
+  const provider = providerCache.get(chain)
+  providerCache.delete(chain)
+  providerSignatures.delete(chain)
+  if (provider) {
+    try {
+      provider.destroy()
+    } catch {
+      // Cache invalidation must succeed even if provider cleanup fails.
+    }
+  }
+  return provider
+}
+
 function emptyHealthState(chain: ChainKey): RpcHealthState {
   return {
     chain,
@@ -97,8 +111,7 @@ export function getReadProvider(key: ChainKey): ReadProvider {
 export function resetProviders(key?: ChainKey): void {
   const keys = key ? [key] : (Object.keys(CHAINS) as ChainKey[])
   for (const chain of keys) {
-    providerCache.delete(chain)
-    providerSignatures.delete(chain)
+    evictProvider(chain)
     providerGenerations.set(chain, (providerGenerations.get(chain) ?? 0) + 1)
     healthFlights.delete(chain)
     publishHealthState(chain, emptyHealthState(chain))
@@ -192,8 +205,7 @@ export function ensureHealthyReadProvider(
         error: `RPC_UNAVAILABLE: ${CHAINS[key].name} RPC configuration is invalid: ${message}`
       }
       if ((providerGenerations.get(key) ?? 0) === generation) {
-        providerCache.delete(key)
-        providerSignatures.delete(key)
+        evictProvider(key)
         publishHealthState(key, state)
       }
       throw new Error(state.error!)
@@ -228,8 +240,7 @@ export function ensureHealthyReadProvider(
     const failures = checks.flatMap((check) => (check.failure ? [check.failure] : []))
     const checkedAt = Date.now()
     if (healthyUrls.length === 0) {
-      providerCache.delete(key)
-      providerSignatures.delete(key)
+      evictProvider(key)
       const error = `RPC_UNAVAILABLE: ${CHAINS[key].name} has 0/${urls.length} responsive configured RPC endpoints. The RPC list was preserved. This may be caused by the local internet connection, DNS, firewall, proxy/VPN, browser access policy, or the endpoints themselves. Check the network and retry, or open RPC settings to change endpoints.`
       publishHealthState(key, {
         chain: key,
@@ -246,6 +257,7 @@ export function ensureHealthyReadProvider(
     const signature = healthyUrls.join('\n')
     let provider = providerCache.get(key)
     if (!provider || providerSignatures.get(key) !== signature) {
+      if (provider) evictProvider(key)
       provider = buildReadProvider(key, healthyUrls)
       providerCache.set(key, provider)
       providerSignatures.set(key, signature)
@@ -299,21 +311,104 @@ export function ensureRecentReadProvider(
   return ensureHealthyReadProvider(key, request)
 }
 
-/** Retry an async RPC call with exponential backoff. */
+interface RetryErrorLike {
+  code?: unknown
+  status?: unknown
+  message?: unknown
+  shortMessage?: unknown
+  retryAfterMs?: unknown
+  info?: unknown
+}
+
+function retryErrorText(error: unknown): string {
+  if (!error || typeof error !== 'object') return String(error)
+  const value = error as RetryErrorLike
+  return [value.code, value.status, value.message, value.shortMessage, value.info]
+    .map((part) => {
+      try {
+        return typeof part === 'string' ? part : JSON.stringify(part)
+      } catch {
+        return String(part)
+      }
+    })
+    .join(' ')
+}
+
+export function isRetryableRpcError(error: unknown): boolean {
+  if (error && typeof error === 'object' && (error as { name?: string }).name === 'AbortError') {
+    return false
+  }
+  const text = retryErrorText(error)
+  if (
+    /CALL_EXCEPTION|execution reverted|\brevert(?:ed)?\b|INVALID_ARGUMENT|invalid (?:argument|params?)|insufficient funds|user (?:rejected|denied)|ACTION_REJECTED/i.test(
+      text
+    )
+  ) {
+    return false
+  }
+  return true
+}
+
+function retryAfterMs(error: unknown): number | null {
+  if (!error || typeof error !== 'object') return null
+  const value = Number((error as RetryErrorLike).retryAfterMs)
+  return Number.isFinite(value) && value >= 0 ? value : null
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException('The RPC operation was aborted', 'AbortError')
+}
+
+function retryDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(abortReason(signal))
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(done, ms)
+    function done() {
+      signal?.removeEventListener('abort', aborted)
+      resolve()
+    }
+    function aborted() {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', aborted)
+      reject(abortReason(signal!))
+    }
+    signal?.addEventListener('abort', aborted, { once: true })
+  })
+}
+
+/** Retry transient RPC failures with bounded exponential backoff and jitter. */
 export async function withRetry<T>(
   fn: () => Promise<T>,
-  opts: { retries?: number; baseDelayMs?: number } = {}
+  opts: {
+    retries?: number
+    baseDelayMs?: number
+    maxDelayMs?: number
+    jitterRatio?: number
+    signal?: AbortSignal
+    sleep?: (delayMs: number) => Promise<void>
+    random?: () => number
+  } = {}
 ): Promise<T> {
   const retries = opts.retries ?? 3
   const base = opts.baseDelayMs ?? 400
+  const maxDelay = opts.maxDelayMs ?? 5_000
+  const jitterRatio = opts.jitterRatio ?? 0.2
+  const random = opts.random ?? Math.random
+  const sleep = opts.sleep ?? ((delayMs: number) => retryDelay(delayMs, opts.signal))
   let lastErr: unknown
   for (let attempt = 0; attempt <= retries; attempt++) {
+    if (opts.signal?.aborted) throw abortReason(opts.signal)
     try {
       return await fn()
     } catch (err) {
       lastErr = err
-      if (attempt === retries) break
-      await new Promise((r) => setTimeout(r, base * 2 ** attempt))
+      if (attempt === retries || !isRetryableRpcError(err)) break
+      const exponential = Math.min(maxDelay, base * 2 ** attempt)
+      const serverDelay = retryAfterMs(err)
+      const nominal = serverDelay === null ? exponential : Math.min(maxDelay, serverDelay)
+      const jitter = 1 - jitterRatio + random() * jitterRatio * 2
+      await sleep(Math.max(0, Math.round(nominal * jitter)))
+      if (opts.signal?.aborted) throw abortReason(opts.signal)
     }
   }
   throw lastErr

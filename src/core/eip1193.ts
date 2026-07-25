@@ -118,7 +118,11 @@ export async function callInjectedContract(
   return result
 }
 
-export function assertNonceAgreement(walletNonce: number, rpcNonce: number): number {
+export function assertNonceAgreement(
+  walletNonce: number,
+  rpcNonce: number,
+  blockTag: 'latest' | 'pending' = 'pending'
+): number {
   if (
     !Number.isSafeInteger(walletNonce) ||
     !Number.isSafeInteger(rpcNonce) ||
@@ -126,12 +130,12 @@ export function assertNonceAgreement(walletNonce: number, rpcNonce: number): num
     rpcNonce < 0
   ) {
     throw new Error(
-      'PENDING_STATE_UNCERTAIN: Invalid pending nonce returned by wallet or read RPC.'
+      `PENDING_STATE_UNCERTAIN: Invalid ${blockTag} nonce returned by wallet or read RPC.`
     )
   }
   if (walletNonce !== rpcNonce) {
     throw new Error(
-      `PENDING_STATE_UNCERTAIN: Wallet pending nonce ${walletNonce} disagrees with read RPC pending nonce ${rpcNonce}.`
+      `PENDING_STATE_UNCERTAIN: Wallet ${blockTag} nonce ${walletNonce} disagrees with read RPC ${blockTag} nonce ${rpcNonce}.`
     )
   }
   return walletNonce

@@ -4,6 +4,7 @@ import { Interface } from 'ethers'
 const ACCOUNT_A = '0x1111111111111111111111111111111111111111'
 const ACCOUNT_B = '0x2222222222222222222222222222222222222222'
 const ZERO_HASH = `0x${'0'.repeat(64)}`
+const TX_HASH = `0x${'a'.repeat(64)}`
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
 const FACTORY = '0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2'
 const MULTICALL = '0xcA11bde05977b3631167028862bE2a173976CA11'
@@ -34,6 +35,7 @@ declare global {
       emitAccounts(accounts: string[]): void
       emitChain(chainId: string): void
       setStalled(method: string, stalled: boolean): void
+      setSendDelay(delayMs: number): void
       stats(): WalletMockStats
     }
   }
@@ -57,7 +59,12 @@ function blockResult(chainId: number) {
   }
 }
 
-function contractReadResult(chainId: 1 | 137, params: unknown[]): string {
+interface RpcMockState {
+  successfulTx?: boolean
+  confirmed?: boolean
+}
+
+function contractReadResult(chainId: 1 | 137, params: unknown[], state: RpcMockState = {}): string {
   const call = params[0] as { to?: string; data?: string }
   const to = call.to?.toLowerCase()
   const data = call.data ?? '0x'
@@ -85,9 +92,9 @@ function contractReadResult(chainId: 1 | 137, params: unknown[]): string {
         true,
         xenInterface.encodeFunctionResult('userMints', [
           proxy,
-          100n,
-          1_700_000_000n,
-          100n,
+          state.confirmed ? 0n : 100n,
+          state.confirmed ? 0n : 1_700_000_000n,
+          state.confirmed ? 0n : 100n,
           3_000n,
           0n
         ])
@@ -98,7 +105,12 @@ function contractReadResult(chainId: 1 | 137, params: unknown[]): string {
   throw new Error(`Unhandled contract read to ${call.to} data=${data.slice(0, 10)}`)
 }
 
-function rpcResult(method: string, chainId: 1 | 137, params: unknown[]): unknown {
+function rpcResult(
+  method: string,
+  chainId: 1 | 137,
+  params: unknown[],
+  state: RpcMockState = {}
+): unknown {
   switch (method) {
     case 'eth_chainId':
       return `0x${chainId.toString(16)}`
@@ -123,12 +135,30 @@ function rpcResult(method: string, chainId: 1 | 137, params: unknown[]): unknown
     case 'eth_getBlockByNumber':
       return blockResult(chainId)
     case 'eth_call':
-      return contractReadResult(chainId, params)
+      return contractReadResult(chainId, params, state)
     case 'eth_estimateGas':
       return '0x4c4b40'
     case 'eth_getLogs':
       return []
     case 'eth_getTransactionReceipt':
+      if (!state.successfulTx) return null
+      state.confirmed = true
+      return {
+        blockHash: `0x${'b'.repeat(64)}`,
+        blockNumber: '0x1',
+        contractAddress: null,
+        cumulativeGasUsed: '0x5208',
+        effectiveGasPrice: '0x3b9aca00',
+        from: ACCOUNT_A,
+        gasUsed: '0x5208',
+        logs: [],
+        logsBloom: `0x${'0'.repeat(512)}`,
+        status: '0x1',
+        to: FACTORY,
+        transactionHash: TX_HASH,
+        transactionIndex: '0x0',
+        type: '0x2'
+      }
     case 'eth_getTransactionByHash':
       return null
     default:
@@ -136,7 +166,7 @@ function rpcResult(method: string, chainId: 1 | 137, params: unknown[]): unknown
   }
 }
 
-async function handleRpcRoute(route: Route): Promise<void> {
+async function handleRpcRouteWithState(route: Route, state: RpcMockState): Promise<void> {
   const request = route.request()
   const chainId = request.url().includes('polygon') || request.url().includes('matic') ? 137 : 1
   const payload = request.postDataJSON() as
@@ -146,7 +176,7 @@ async function handleRpcRoute(route: Route): Promise<void> {
   const replies = requests.map(({ id, method, params }) => ({
     jsonrpc: '2.0',
     id,
-    result: rpcResult(method, chainId, params)
+    result: rpcResult(method, chainId, params, state)
   }))
 
   await route.fulfill({
@@ -156,7 +186,11 @@ async function handleRpcRoute(route: Route): Promise<void> {
   })
 }
 
-async function mockSameOriginRpc(page: Page): Promise<void> {
+async function handleRpcRoute(route: Route): Promise<void> {
+  return handleRpcRouteWithState(route, {})
+}
+
+async function mockSameOriginRpc(page: Page, state?: RpcMockState): Promise<void> {
   for (const endpoint of [
     'https://ethereum.publicnode.com/**',
     'https://ethereum-rpc.publicnode.com/**',
@@ -165,7 +199,8 @@ async function mockSameOriginRpc(page: Page): Promise<void> {
     'https://polygon.drpc.org/**',
     'https://1rpc.io/matic/**'
   ]) {
-    await page.route(endpoint, handleRpcRoute)
+    if (state) await page.route(endpoint, (route) => handleRpcRouteWithState(route, state))
+    else await page.route(endpoint, handleRpcRoute)
   }
 }
 
@@ -208,9 +243,12 @@ async function emulateDesktopGoogleChrome(page: Page): Promise<void> {
   })
 }
 
-async function installInjectedWallet(page: Page): Promise<void> {
+async function installInjectedWallet(
+  page: Page,
+  options: { successfulSend?: boolean } = {}
+): Promise<void> {
   await page.addInitScript(
-    ({ accountA }) => {
+    ({ accountA, successfulSend, txHash }) => {
       type Listener = (...args: unknown[]) => void
       const listeners = new Map<string, Set<Listener>>()
       let accounts: string[] = []
@@ -218,6 +256,7 @@ async function installInjectedWallet(page: Page): Promise<void> {
       let chainId = '0x1'
       let sendAttempts = 0
       let successfulBroadcasts = 0
+      let sendDelayMs = 0
       const stalledMethods = new Set<string>()
 
       const emit = (event: string, value: unknown) => {
@@ -243,6 +282,13 @@ async function installInjectedWallet(page: Page): Promise<void> {
               return null
             case 'eth_sendTransaction': {
               sendAttempts += 1
+              if (sendDelayMs > 0) {
+                await new Promise((resolve) => setTimeout(resolve, sendDelayMs))
+              }
+              if (successfulSend) {
+                successfulBroadcasts += 1
+                return txHash
+              }
               const error = new Error('User rejected the request') as Error & { code: number }
               error.code = 4001
               throw error
@@ -279,12 +325,15 @@ async function installInjectedWallet(page: Page): Promise<void> {
           if (stalled) stalledMethods.add(method)
           else stalledMethods.delete(method)
         },
+        setSendDelay(delayMs: number) {
+          sendDelayMs = delayMs
+        },
         stats() {
           return { sendAttempts, successfulBroadcasts }
         }
       }
     },
-    { accountA: ACCOUNT_A }
+    { accountA: ACCOUNT_A, successfulSend: options.successfulSend ?? false, txHash: TX_HASH }
   )
 }
 
@@ -612,4 +661,50 @@ test('a code-4001 wallet rejection reports failure without a successful broadcas
   await expect
     .poll(() => page.evaluate(() => window.__walletMock.stats()))
     .toEqual({ sendAttempts: 1, successfulBroadcasts: 0 })
+})
+
+test('a successful claim is confirmed and its on-chain result is verified', async ({ page }) => {
+  const rpcState: RpcMockState = { successfulTx: true, confirmed: false }
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page, rpcState)
+  await installInjectedWallet(page, { successfulSend: true })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+
+  const checkbox = page.locator('tbody input[type="checkbox"]').first()
+  await expect(checkbox).toBeVisible()
+  await checkbox.click()
+  await page.getByRole('button', { name: 'Claim only' }).click()
+  await expect(page.getByRole('button', { name: 'Open MetaMask & Sign' })).toBeVisible()
+  await page.getByRole('button', { name: 'Open MetaMask & Sign' }).click()
+
+  await expect(page.getByText('Transaction result verified.')).toBeVisible()
+  await expect
+    .poll(() => page.evaluate(() => window.__walletMock.stats()))
+    .toEqual({ sendAttempts: 1, successfulBroadcasts: 1 })
+})
+
+test('two tabs serialize wallet sends with a shared Web Lock', async ({ page, context }) => {
+  const second = await context.newPage()
+  for (const candidate of [page, second]) {
+    await emulateDesktopGoogleChrome(candidate)
+    await mockSameOriginRpc(candidate)
+    await installInjectedWallet(candidate)
+    await candidate.goto('/')
+    await candidate.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    await candidate.getByRole('button', { name: 'Confirm Mint' }).click()
+    await expect(candidate.getByRole('button', { name: 'Open MetaMask & Sign' })).toBeVisible()
+  }
+
+  await page.evaluate(() => window.__walletMock.setSendDelay(1_000))
+  await page.getByRole('button', { name: 'Open MetaMask & Sign' }).click()
+  await expect.poll(() => page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(1)
+
+  await second.getByRole('button', { name: 'Open MetaMask & Sign' }).click()
+  await second.waitForTimeout(250)
+  expect(await second.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+
+  await expect(page.getByText('Transaction rejected', { exact: true })).toBeVisible()
+  await expect.poll(() => second.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(1)
+  await second.close()
 })

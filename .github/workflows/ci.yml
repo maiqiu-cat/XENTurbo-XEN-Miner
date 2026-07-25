@@ -33,7 +33,8 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm run check:bundle
-      - run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
+      - run: npm run audit:prod
+      - run: npm run audit:dependencies
 
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium

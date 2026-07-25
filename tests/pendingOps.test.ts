@@ -71,7 +71,7 @@ function createInterleavingStorage(): {
 async function installPendingHarness(options: {
   latestNonce: number
   pendingNonce: number
-  receipt?: { status: number } | null
+  receipt?: { status: number } | null | (() => Promise<{ status: number } | null>)
   transaction?: PendingTransaction | null | Promise<PendingTransaction | null>
   pendingBlock?: { transactions: unknown[] }
 }) {
@@ -79,7 +79,9 @@ async function installPendingHarness(options: {
     getTransactionCount: vi.fn(async (_wallet: string, tag: 'latest' | 'pending') =>
       tag === 'latest' ? options.latestNonce : options.pendingNonce
     ),
-    getTransactionReceipt: vi.fn(async () => options.receipt ?? null),
+    getTransactionReceipt: vi.fn(async () =>
+      typeof options.receipt === 'function' ? options.receipt() : (options.receipt ?? null)
+    ),
     getTransaction: vi.fn(async () => await (options.transaction ?? null)),
     send: vi.fn(async (method: string) => {
       if (method !== 'eth_getBlockByNumber') throw new Error(`Unexpected method ${method}`)
@@ -339,6 +341,34 @@ describe('pending operation reconciliation', () => {
     expect(provider.send).toHaveBeenCalledTimes(1)
   })
 
+  it('reconciles many local records with bounded RPC concurrency', async () => {
+    let active = 0
+    let peak = 0
+    const { pending } = await installPendingHarness({
+      latestNonce: 0,
+      pendingNonce: 12,
+      receipt: async () => {
+        active += 1
+        peak = Math.max(peak, active)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        active -= 1
+        return null
+      }
+    })
+    for (let nonce = 0; nonce < 12; nonce += 1) {
+      recordBroadcast(pending, {
+        id: `batch-${nonce}`,
+        txHash: `0x${(nonce + 1).toString(16).padStart(64, '0')}`,
+        nonce
+      })
+    }
+
+    await pending.refreshPendingOps('eth', WALLET)
+
+    expect(peak).toBeGreaterThan(1)
+    expect(peak).toBeLessThanOrEqual(4)
+  })
+
   it('marks a missing hash replaced after the confirmed account nonce advances', async () => {
     const { pending, releaseLocksByTxHash } = await installPendingHarness({
       latestNonce: 8,
@@ -580,7 +610,9 @@ describe('transaction lock lifecycle', () => {
     }
 
     vi.stubGlobal('navigator', {
-      locks: { request: async (_key: string, work: () => Promise<unknown>) => work() }
+      locks: {
+        request: async (_key: string, _options: LockOptions, work: () => Promise<unknown>) => work()
+      }
     })
     vi.stubGlobal('window', {
       ethereum: {

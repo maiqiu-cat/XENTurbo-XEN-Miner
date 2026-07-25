@@ -147,9 +147,15 @@ describe('vmu store request invalidation', () => {
     chainReader.readGlobalRank.mockResolvedValue(100)
     const walletRead = deferred<Vmu[]>()
     let reportProgress: ((progress: { loaded: number; total: number }) => void) | undefined
+    let scanSignal: AbortSignal | undefined
     chainReader.readWalletVmus.mockImplementation(
-      async (_chain: string, _wallet: string, options: { onProgress?: typeof reportProgress }) => {
+      async (
+        _chain: string,
+        _wallet: string,
+        options: { onProgress?: typeof reportProgress; signal?: AbortSignal }
+      ) => {
         reportProgress = options.onProgress
+        scanSignal = options.signal
         return walletRead.promise
       }
     )
@@ -160,6 +166,7 @@ describe('vmu store request invalidation', () => {
     expect(store.loading).toBe(true)
 
     store.detach()
+    expect(scanSignal?.aborted).toBe(true)
     reportProgress?.({ loaded: 1, total: 1 })
     walletRead.reject(new Error('late RPC failure'))
     await loading

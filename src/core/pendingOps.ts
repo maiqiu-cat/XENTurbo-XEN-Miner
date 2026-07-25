@@ -5,12 +5,14 @@ import { CONTRACTS } from '@/config/contracts'
 import { ensureHealthyReadProvider, ensureRecentReadProvider, getReadProvider } from './rpc'
 import { attachTxHash, pendingLocks, releaseLock, releaseLocksByTxHash } from './localLock'
 import type { OpType } from './txManager'
+import { mapWithConcurrency } from '@/utils/concurrency'
 
 const LEGACY_KEY = 'sm.pendingOps'
 const EVENT_KEY_PREFIX = 'sm.pendingOps.event.'
 const TERMINAL_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000
 const TERMINAL_RECORD_LIMIT = 50
 const DISCOVERY_THROTTLE_MS = 60_000
+const RECONCILE_CONCURRENCY = 4
 const lastDiscoveryAt = new Map<string, number>()
 
 export type PendingPhase =
@@ -843,51 +845,49 @@ export async function refreshPendingOps(
   }
 
   const local = listPendingOps(chain, wallet).filter(isUnresolvedPending)
-  const outcomes = await Promise.all(
-    local.map(async (record) => {
-      let receipt: { status?: number | null } | null = null
-      if (record.txHash) {
-        try {
-          receipt = await provider.getTransactionReceipt(record.txHash)
-        } catch {
-          // An RPC failure is not resolution evidence.
+  const outcomes = await mapWithConcurrency(local, RECONCILE_CONCURRENCY, async (record) => {
+    let receipt: { status?: number | null } | null = null
+    if (record.txHash) {
+      try {
+        receipt = await provider.getTransactionReceipt(record.txHash)
+      } catch {
+        // An RPC failure is not resolution evidence.
+      }
+    }
+
+    const tx = record.txHash ? await fetchTxByHash(record.txHash, provider, injected) : null
+    let enriched = record
+    if (tx?.input && tx.to?.toLowerCase() === factory) {
+      const decoded = decodeFactoryCalldata(tx.input)
+      if (decoded) {
+        enriched = {
+          ...record,
+          op: decoded.op,
+          ids: decoded.ids.length ? decoded.ids : record.ids,
+          count: decoded.count || record.count,
+          term: decoded.term || record.term
         }
       }
+    }
 
-      const tx = record.txHash ? await fetchTxByHash(record.txHash, provider, injected) : null
-      let enriched = record
-      if (tx?.input && tx.to?.toLowerCase() === factory) {
-        const decoded = decodeFactoryCalldata(tx.input)
-        if (decoded) {
-          enriched = {
-            ...record,
-            op: decoded.op,
-            ids: decoded.ids.length ? decoded.ids : record.ids,
-            count: decoded.count || record.count,
-            term: decoded.term || record.term
-          }
-        }
-      }
-
-      const reconciled = reconcilePendingOp(enriched, {
-        receipt,
-        transactionFound: tx !== null,
-        observedNonce: tx?.nonce,
-        latestNonce: latest,
-        pendingNonce
-      })
-      const uncertain =
-        isUnresolvedPending(reconciled) &&
-        tx === null &&
-        (reconciled.nonce === null || pendingNonce <= reconciled.nonce)
-
-      return {
-        source: record,
-        record: reconciled,
-        status: uncertain ? ('unknown' as const) : statusForPhase(reconciled.phase)
-      }
+    const reconciled = reconcilePendingOp(enriched, {
+      receipt,
+      transactionFound: tx !== null,
+      observedNonce: tx?.nonce,
+      latestNonce: latest,
+      pendingNonce
     })
-  )
+    const uncertain =
+      isUnresolvedPending(reconciled) &&
+      tx === null &&
+      (reconciled.nonce === null || pendingNonce <= reconciled.nonce)
+
+    return {
+      source: record,
+      record: reconciled,
+      status: uncertain ? ('unknown' as const) : statusForPhase(reconciled.phase)
+    }
+  })
 
   const accepted = new Map<string, { record: PendingOpRecord; status: PendingOpView['status'] }>()
   if (outcomes.length) {
