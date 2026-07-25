@@ -39,15 +39,24 @@ import type { VmuStatus } from './types'
 export type OpType =
   'GENERAL_MINT' | 'CREATE_EMPTY_SLOT' | 'MINT_EMPTY_SLOT' | 'CLAIM' | 'CLAIM_REUSE'
 
+export interface TxLogEntry {
+  at: number
+  status: 'process' | 'done' | 'error' | 'info'
+  message: string
+}
+
 export interface TxStepState {
   estimate: 'wait' | 'process' | 'done' | 'error'
   send: 'wait' | 'process' | 'done' | 'error'
   confirm: 'wait' | 'process' | 'done' | 'error'
   /** True after estimate succeeds — UI should show "Open MetaMask" button. */
   readyToSign?: boolean
+  /** True only after the EIP-1193 transaction request reaches the wallet. */
+  walletPrompted?: boolean
   txHash?: string
   error?: string
   outcome?: OperationOutcome
+  logs?: TxLogEntry[]
 }
 
 export interface TxCallbacks {
@@ -56,17 +65,47 @@ export interface TxCallbacks {
   isCancelled?: () => boolean
 }
 
+function txStateSnapshot(state: TxStepState): TxStepState {
+  return {
+    ...state,
+    logs: state.logs?.map((entry) => ({ ...entry }))
+  }
+}
+
+function appendTxLog(
+  state: TxStepState,
+  message: string,
+  status: TxLogEntry['status'] = 'process'
+): void {
+  const previousStatus: TxLogEntry['status'] = status === 'error' ? 'error' : 'done'
+  state.logs = [
+    ...(state.logs ?? []).map((entry) =>
+      entry.status === 'process' ? { ...entry, status: previousStatus } : entry
+    ),
+    { at: Date.now(), status, message }
+  ]
+}
+
 /** Reject if a promise does not settle within `ms`, with a labelled error. */
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
-  return Promise.race([
-    p,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms)
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms)
+    p.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error) => {
+        clearTimeout(timer)
+        reject(error)
+      }
     )
-  ])
+  })
 }
 
 const ESTIMATE_TIMEOUT_MS = 40_000
+const PREFLIGHT_TIMEOUT_MS = 15_000
+const PREFLIGHT_CONTRACT_TIMEOUT_MS = 30_000
 const PROBE_UNITS = 32
 const GAS_RATIO_SCALE = 10_000n
 /** Keep 10% of the latest block gas limit free for block assembly variance. */
@@ -472,11 +511,15 @@ export interface PreparedOp {
  */
 /** pendingNonce - latestNonce; >0 means at least one in-flight tx. */
 export async function getPendingTxCount(chain: ChainKey, wallet: string): Promise<number> {
-  const [chainId, latest, pending] = await Promise.all([
-    getInjectedChainId(),
-    getInjectedLatestNonce(wallet),
-    getInjectedPendingNonce(wallet)
-  ])
+  const [chainId, latest, pending] = await withTimeout(
+    Promise.all([
+      getInjectedChainId(),
+      getInjectedLatestNonce(wallet),
+      getInjectedPendingNonce(wallet)
+    ]),
+    PREFLIGHT_TIMEOUT_MS,
+    'Wallet network and pending transaction check'
+  )
   if (chainId !== CHAINS[chain].chainId) {
     throw new Error('Wallet is on the wrong network. Switch networks and retry.')
   }
@@ -488,57 +531,81 @@ export async function prepareOperation(
   cb: TxCallbacks = {}
 ): Promise<PreparedOp> {
   const { chain, wallet, op, ids = [], count = 0, term = 0 } = params
-  const state: TxStepState = { estimate: 'wait', send: 'wait', confirm: 'wait' }
-  const emit = () => cb.onStep?.({ ...state })
-
-  validateOperationParams({ chain, op, ids, count, term })
-
-  let readProvider
-  try {
-    readProvider = await ensureHealthyReadProvider(chain)
-  } catch (err: any) {
-    state.estimate = 'error'
-    state.error = normalizeError(err)
+  const state: TxStepState = {
+    estimate: 'wait',
+    send: 'wait',
+    confirm: 'wait',
+    logs: []
+  }
+  const emit = () => cb.onStep?.(txStateSnapshot(state))
+  const log = (message: string, status: TxLogEntry['status'] = 'process') => {
+    appendTxLog(state, message, status)
     emit()
-    throw err
   }
-
-  // Block before any gas spend if a previous tx is still in-flight.
-  // EIP-7702 / Infura only allows 1 in-flight tx for delegated accounts.
-  const inflight = await getPendingTxCount(chain, wallet)
-  if (inflight > 0) {
-    throw new Error(
-      `PENDING_TX: ${inflight} transaction(s) still pending on-chain. Wait for confirmation (or Speed up / Cancel in MetaMask) before submitting another.`
-    )
-  }
-
-  const readFactory = getReadFactory(chain)
-  const ratio = GAS_LIMIT_RATIO[chain]
-  const factoryAddress = CONTRACTS[chain].factory as `0x${string}`
-  const chainId = CHAINS[chain].chainId
-
-  const feeApplies =
-    !FREE_CHAINS.includes(chain) &&
-    (op === 'GENERAL_MINT' || op === 'MINT_EMPTY_SLOT' || op === 'CLAIM_REUSE')
-  const fee = feeApplies ? await readFee(chain) : 0n
-
   const batch = newBatchId()
   const lockIds = op === 'GENERAL_MINT' || op === 'CREATE_EMPTY_SLOT' ? [] : ids
+  let lockAcquired = false
 
-  if (lockIds.length) {
-    if (!tryAcquireLock({ chain, wallet, ids: lockIds, batch, op, count, term })) {
+  state.estimate = 'process'
+  try {
+    log('Validating operation parameters...')
+    validateOperationParams({ chain, op, ids, count, term })
+    assertOperationActive(cb)
+    log('Operation parameters validated.', 'done')
+
+    log('Checking configured RPC availability...')
+    const readProvider = await ensureHealthyReadProvider(chain)
+    assertOperationActive(cb)
+    log('Configured RPC is available.', 'done')
+
+    // Block before any gas spend if a previous tx is still in-flight.
+    // EIP-7702 / Infura only allows 1 in-flight tx for delegated accounts.
+    log('Checking wallet network and pending transactions...')
+    const inflight = await getPendingTxCount(chain, wallet)
+    assertOperationActive(cb)
+    if (inflight > 0) {
       throw new Error(
-        'Some selected VMUs are already pending in another tab/window. Wait or refresh.'
+        `PENDING_TX: ${inflight} transaction(s) still pending on-chain. Wait for confirmation (or Speed up / Cancel in MetaMask) before submitting another.`
       )
     }
-  }
+    log('Wallet network is correct and no pending transaction was found.', 'done')
 
-  try {
-    await assertIdsStillValid(chain, wallet, op, ids)
+    const readFactory = getReadFactory(chain)
+    const ratio = GAS_LIMIT_RATIO[chain]
+    const factoryAddress = CONTRACTS[chain].factory as `0x${string}`
+    const chainId = CHAINS[chain].chainId
+    const feeApplies =
+      !FREE_CHAINS.includes(chain) &&
+      (op === 'GENERAL_MINT' || op === 'MINT_EMPTY_SLOT' || op === 'CLAIM_REUSE')
+    if (feeApplies) log('Reading the current contract service fee...')
+    const fee = feeApplies
+      ? await withTimeout(readFee(chain), PREFLIGHT_CONTRACT_TIMEOUT_MS, 'Factory fee read')
+      : 0n
+    assertOperationActive(cb)
+    if (feeApplies) log('Current contract service fee loaded.', 'done')
+
+    if (lockIds.length) {
+      log('Reserving the selected VMUs for this operation...')
+      if (!tryAcquireLock({ chain, wallet, ids: lockIds, batch, op, count, term })) {
+        throw new Error(
+          'Some selected VMUs are already pending in another tab/window. Wait or refresh.'
+        )
+      }
+      lockAcquired = true
+      log('Selected VMUs reserved in this browser.', 'done')
+    }
+
+    log('Rechecking selected VMU state on-chain...')
+    await withTimeout(
+      assertIdsStillValid(chain, wallet, op, ids),
+      PREFLIGHT_CONTRACT_TIMEOUT_MS,
+      'Selected VMU validation'
+    )
+    assertOperationActive(cb)
+    log('Selected VMUs are still eligible.', 'done')
     void warmUpInjected(chainId).catch(() => {})
 
-    state.estimate = 'process'
-    emit()
+    log('Estimating gas and checking the latest block limit...')
     const [estimatedGas, latestBlock] = await Promise.all([
       estimateGasLimit({
         readFactory,
@@ -551,14 +618,19 @@ export async function prepareOperation(
         feeApplies,
         ratio
       }),
-      readProvider.getBlock('latest')
+      withTimeout(
+        readProvider.getBlock('latest'),
+        PREFLIGHT_CONTRACT_TIMEOUT_MS,
+        'Latest block read'
+      )
     ])
+    assertOperationActive(cb)
     if (!latestBlock) throw new Error('Latest block is unavailable; cannot validate the gas limit')
     const gasLimit = assertFitsBlockGasLimit(estimatedGas, latestBlock.gasLimit)
 
     state.estimate = 'done'
     state.readyToSign = true
-    emit()
+    log('Gas estimate is ready. Open MetaMask to review and sign.', 'done')
 
     const { fnName, args } = buildCall(op, ids, count, term)
     const preparedAt = Date.now()
@@ -582,11 +654,11 @@ export async function prepareOperation(
       state
     }
   } catch (err: any) {
-    if (lockIds.length) releaseLock(batch)
-    if (state.estimate === 'process') state.estimate = 'error'
+    if (lockAcquired) releaseLock(batch)
+    state.estimate = 'error'
     state.error = normalizeError(err)
     state.readyToSign = false
-    emit()
+    log(`Preparation failed: ${state.error}`, 'error')
     throw err
   }
 }
@@ -601,11 +673,17 @@ export async function sendPreparedOperation(
 ): Promise<TxStepState> {
   const state: TxStepState = {
     estimate: 'done',
-    send: 'wait',
+    send: 'process',
     confirm: 'wait',
-    readyToSign: false
+    readyToSign: false,
+    walletPrompted: false,
+    logs: prepared.state.logs?.map((entry) => ({ ...entry })) ?? []
   }
-  const emit = () => cb.onStep?.({ ...state })
+  const emit = () => cb.onStep?.(txStateSnapshot(state))
+  const log = (message: string, status: TxLogEntry['status'] = 'process') => {
+    appendTxLog(state, message, status)
+    emit()
+  }
   const lockHeld = prepared.lockIds.length > 0
   let broadcasted = false
   let resolved = false
@@ -615,33 +693,42 @@ export async function sendPreparedOperation(
 
   try {
     assertOperationActive(cb)
+    log('Starting final checks before opening MetaMask...')
     const walletSend = runWalletExclusive(
       operationKey(prepared.chain, prepared.wallet),
       async () => {
         assertOperationActive(cb)
         // Keep the final safety check, nonce read, and wallet request in one
         // cross-tab critical section so two tabs cannot send concurrently.
+        log('Checking unresolved local transaction records...')
         const unresolvedLocal = countUnresolvedPendingOps(prepared.chain, prepared.wallet)
         if (unresolvedLocal > 0) {
           throw new Error(
             `LOCAL_PENDING_UNRESOLVED: ${unresolvedLocal} local transaction record(s) still require reconciliation. Recheck pending operations before submitting another transaction.`
           )
         }
+        log('No unresolved local transaction record was found.', 'done')
 
+        log('Rechecking RPC availability and pending nonce...')
         await ensureHealthyReadProvider(prepared.chain)
         const inflight = await getPendingTxCount(prepared.chain, prepared.wallet)
+        assertOperationActive(cb)
         if (inflight > 0) {
           throw new Error(
             `PENDING_TX: ${inflight} transaction(s) still pending on-chain. Wait for confirmation (or Speed up / Cancel in MetaMask) before submitting another.`
           )
         }
+        log('RPC and pending nonce checks passed.', 'done')
 
-        const [injectedAccount, injectedChainId] = await Promise.all([
-          getInjectedAccount(),
-          getInjectedChainId()
-        ])
+        log('Checking active wallet account and network...')
+        const [injectedAccount, injectedChainId] = await withTimeout(
+          Promise.all([getInjectedAccount(), getInjectedChainId()]),
+          PREFLIGHT_TIMEOUT_MS,
+          'Wallet account and network check'
+        )
         if (!injectedAccount) throw new Error('No wallet account available. Reconnect your wallet.')
         assertPreparedContext(prepared, injectedAccount, injectedChainId)
+        log('Active wallet account and network match the prepared operation.', 'done')
 
         const units =
           prepared.op === 'GENERAL_MINT' || prepared.op === 'CREATE_EMPTY_SLOT'
@@ -653,13 +740,19 @@ export async function sendPreparedOperation(
             prepared.op === 'MINT_EMPTY_SLOT' ||
             prepared.op === 'CLAIM_REUSE')
 
-        const [walletNonce, walletFee, preVmuCount] = await Promise.all([
-          getInjectedPendingNonce(prepared.wallet),
-          feeApplies ? readInjectedFactoryFee(prepared.factoryAddress) : Promise.resolve(0n),
-          allocatesVmuIds(prepared.op)
-            ? readInjectedVmuCount(prepared.factoryAddress, prepared.wallet)
-            : Promise.resolve(undefined)
-        ])
+        log('Reading the current wallet nonce and contract data...')
+        const [walletNonce, walletFee, preVmuCount] = await withTimeout(
+          Promise.all([
+            getInjectedPendingNonce(prepared.wallet),
+            feeApplies ? readInjectedFactoryFee(prepared.factoryAddress) : Promise.resolve(0n),
+            allocatesVmuIds(prepared.op)
+              ? readInjectedVmuCount(prepared.factoryAddress, prepared.wallet)
+              : Promise.resolve(undefined)
+          ]),
+          PREFLIGHT_CONTRACT_TIMEOUT_MS,
+          'Wallet transaction data read'
+        )
+        assertOperationActive(cb)
         prepared.preVmuCount = preVmuCount
         const nonce = walletNonce
         broadcastNonce = nonce
@@ -668,11 +761,26 @@ export async function sendPreparedOperation(
           units,
           feeApplies
         })
+        log('Current nonce, fee, and contract data loaded.', 'done')
 
         // Preparation can be seconds old by the time the user confirms. Re-read
         // selected IDs inside the cross-tab lock at the actual send boundary.
-        await assertIdsStillValid(prepared.chain, prepared.wallet, prepared.op, prepared.ids)
-        await simulatePreparedWithWallet(prepared, value)
+        log('Revalidating selected VMUs before sending...')
+        await withTimeout(
+          assertIdsStillValid(prepared.chain, prepared.wallet, prepared.op, prepared.ids),
+          PREFLIGHT_CONTRACT_TIMEOUT_MS,
+          'Selected VMU revalidation'
+        )
+        assertOperationActive(cb)
+        log('Selected VMUs passed the final validation.', 'done')
+        log('Simulating transaction with MetaMask...')
+        await withTimeout(
+          simulatePreparedWithWallet(prepared, value),
+          PREFLIGHT_CONTRACT_TIMEOUT_MS,
+          'Wallet transaction simulation'
+        )
+        assertOperationActive(cb)
+        log('Transaction simulation succeeded.', 'done')
 
         return writeFactory({
           chainId: prepared.chainId,
@@ -688,7 +796,8 @@ export async function sendPreparedOperation(
             assertOperationActive(cb)
             assertPreparedContext(prepared, prepared.wallet, prepared.chainId)
             state.send = 'process'
-            emit()
+            state.walletPrompted = true
+            log('MetaMask request opened. Review the details and confirm or reject it.')
             recordPendingOp({
               id: prepared.batch,
               chain: prepared.chain,
@@ -714,6 +823,7 @@ export async function sendPreparedOperation(
     const txHash = await walletSend
     broadcasted = true
     state.txHash = txHash
+    state.walletPrompted = false
     if (prepared.lockIds.length) attachTxHash(prepared.batch, txHash)
     // Persist for the Pending Ops panel (survives reload until mined).
     recordPendingOp({
@@ -729,10 +839,10 @@ export async function sendPreparedOperation(
       phase: 'broadcast'
     })
     state.send = 'done'
-    emit()
+    log(`Transaction submitted: ${txHash.slice(0, 10)}...${txHash.slice(-8)}.`, 'done')
 
     state.confirm = 'process'
-    emit()
+    log('Waiting for the transaction to be confirmed on-chain...')
     const readProvider = await ensureHealthyReadProvider(prepared.chain)
     const confirmMs = CONFIRM_TIMEOUT_MS[prepared.chain]
     let receipt
@@ -755,6 +865,7 @@ export async function sendPreparedOperation(
 
     if (!receipt) throw new Error('Transaction receipt missing')
     if (receipt.status === 0) {
+      log('The transaction receipt reports an on-chain revert.', 'error')
       recordPendingOp({
         id: prepared.batch,
         chain: prepared.chain,
@@ -770,6 +881,7 @@ export async function sendPreparedOperation(
       resolved = true
       throw new Error('Transaction reverted on-chain')
     }
+    log('Transaction confirmed on-chain. Verifying the resulting VMU state.', 'done')
     recordPendingOp({
       id: prepared.batch,
       chain: prepared.chain,
@@ -791,7 +903,13 @@ export async function sendPreparedOperation(
       state.outcome = uncertainOperationOutcome(prepared)
     }
     state.confirm = 'done'
-    emit()
+    if (state.outcome.classification === 'full') {
+      log('Transaction result verified.', 'done')
+    } else if (state.outcome.classification === 'partial') {
+      log('Transaction confirmed, but result verification found partial success.', 'info')
+    } else {
+      log('Transaction confirmed, but the final result could not be fully verified.', 'info')
+    }
     return state
   } catch (err: any) {
     if (!broadcasted && awaitingWalletRecorded && isDefinitiveWalletRejection(err)) {
@@ -812,7 +930,7 @@ export async function sendPreparedOperation(
     if (!broadcasted && state.send !== 'done') state.send = 'error'
     else if (state.confirm === 'process') state.confirm = 'error'
     if (!state.error) state.error = normalizeError(err)
-    emit()
+    log(`Transaction stopped: ${state.error}`, 'error')
     throw err
   } finally {
     if (

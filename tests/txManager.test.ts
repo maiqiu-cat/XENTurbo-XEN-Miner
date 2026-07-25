@@ -1,13 +1,38 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   assertPreparedContext,
   assertFitsBlockGasLimit,
   authoritativeServiceValue,
   estimateWithProbe,
+  getPendingTxCount,
   isRetryableEstimateError,
   strictSimulationFunction,
   validateOperationParams
 } from '@/core/txManager'
+
+afterEach(() => {
+  vi.useRealTimers()
+  vi.unstubAllGlobals()
+})
+
+describe('wallet preflight timeout', () => {
+  it('fails instead of waiting forever when the injected wallet stops responding', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('window', {
+      ethereum: {
+        request: () => new Promise<never>(() => {})
+      }
+    })
+
+    const result = getPendingTxCount('eth', '0x0000000000000000000000000000000000000001')
+    const rejection = expect(result).rejects.toThrow(
+      'Wallet network and pending transaction check timed out after 15s'
+    )
+
+    await vi.advanceTimersByTimeAsync(15_000)
+    await rejection
+  })
+})
 
 describe('gas estimation fallback', () => {
   it('does not replace a contract revert with a probe projection', async () => {

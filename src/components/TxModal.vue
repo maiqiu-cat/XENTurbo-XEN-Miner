@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import type { TxStepState } from '@/core/txManager'
 import { CHAINS, type ChainKey } from '@/config/chains'
 
@@ -34,7 +34,33 @@ const failed = computed(
   () => props.state?.estimate === 'error' || props.state?.send === 'error' || props.state?.confirm === 'error'
 )
 const readyToSign = computed(() => !!props.state?.readyToSign && props.state?.estimate === 'done')
-const waitingWallet = computed(() => props.state?.send === 'process' && !props.state?.txHash)
+const waitingWallet = computed(
+  () => !!props.state?.walletPrompted && props.state?.send === 'process' && !props.state?.txHash
+)
+const preparing = computed(
+  () =>
+    !props.state?.txHash &&
+    props.state?.send === 'wait' &&
+    (props.state?.estimate === 'wait' || props.state?.estimate === 'process')
+)
+const logList = ref<HTMLOListElement | null>(null)
+
+watch(
+  () => props.state?.logs?.length,
+  async () => {
+    await nextTick()
+    if (logList.value) logList.value.scrollTop = logList.value.scrollHeight
+  }
+)
+
+function formatLogTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  })
+}
 
 function formatAffected(ids: number[], count: number): string {
   if (!count) return '0'
@@ -66,7 +92,7 @@ const outcomeMessage = computed(() => {
 })
 
 function dismiss(): void {
-  if (readyToSign.value) emit('cancel')
+  if (readyToSign.value || preparing.value) emit('cancel')
   else emit('close')
 }
 
@@ -83,7 +109,13 @@ function icon(status: string): string {
     <div class="card modal-body">
       <div class="row between">
         <strong>{{ title }}</strong>
-        <button class="btn btn-ghost" :title="waitingWallet ? 'Hide' : 'Close'" @click="dismiss">x</button>
+        <button
+          class="btn btn-ghost"
+          :title="waitingWallet ? 'Hide' : preparing || readyToSign ? 'Cancel' : 'Close'"
+          @click="dismiss"
+        >
+          x
+        </button>
       </div>
       <hr class="hr" />
       <ul class="steps">
@@ -100,6 +132,28 @@ function icon(status: string): string {
           >
         </li>
       </ul>
+
+      <section
+        v-if="state?.logs?.length"
+        data-testid="tx-log"
+        class="tx-log"
+        aria-label="Transaction activity"
+        aria-live="polite"
+      >
+        <div class="tx-log-title">Activity</div>
+        <ol ref="logList">
+          <li
+            v-for="(entry, index) in state.logs"
+            :key="`${entry.at}-${index}`"
+            data-testid="tx-log-entry"
+            :class="entry.status"
+          >
+            <time :datetime="new Date(entry.at).toISOString()">{{ formatLogTime(entry.at) }}</time>
+            <span class="tx-log-marker">{{ icon(entry.status) }}</span>
+            <span>{{ entry.message }}</span>
+          </li>
+        </ol>
+      </section>
 
       <p v-if="readyToSign" class="hint-text">
         Gas estimated. Click below to open MetaMask.
@@ -121,7 +175,7 @@ function icon(status: string): string {
       <div class="row" style="margin-top: 14px">
         <a v-if="explorerTxUrl" :href="explorerTxUrl" target="_blank" rel="noreferrer">View on explorer</a>
         <span class="grow" />
-        <button v-if="readyToSign" class="btn" @click="emit('cancel')">Cancel</button>
+        <button v-if="readyToSign || preparing" class="btn" @click="emit('cancel')">Cancel</button>
         <button v-else-if="waitingWallet" class="btn" @click="emit('close')">Hide</button>
         <button v-if="readyToSign" class="btn btn-primary" @click="emit('sign')">Open MetaMask &amp; Sign</button>
         <button v-if="done || failed" class="btn btn-primary" @click="emit('close')">Close</button>
@@ -164,6 +218,51 @@ function icon(status: string): string {
 }
 .step-icon.err {
   color: var(--danger);
+}
+.tx-log {
+  margin-top: 16px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.tx-log-title {
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.tx-log ol {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0 4px 0 0;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.tx-log li {
+  display: grid;
+  grid-template-columns: 62px 24px minmax(0, 1fr);
+  gap: 6px;
+  align-items: start;
+  padding: 5px 0;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.tx-log li.process {
+  color: var(--warn);
+}
+.tx-log li.error {
+  color: var(--danger);
+}
+.tx-log li.info {
+  color: var(--warn);
+}
+.tx-log time {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.tx-log-marker {
+  font-weight: 700;
+  text-align: center;
 }
 .hint-text {
   color: var(--warn);

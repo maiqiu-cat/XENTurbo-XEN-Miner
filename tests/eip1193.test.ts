@@ -260,7 +260,8 @@ describe('authoritative pre-send state', () => {
       readRpcFee: 30_000n
     })
 
-    await sendPreparedOperation(preparedOperation())
+    const onStep = vi.fn()
+    await sendPreparedOperation(preparedOperation(), { onStep })
 
     expect(readProvider.getTransactionCount).not.toHaveBeenCalled()
     expect(ensureHealthyReadProvider).toHaveBeenCalledWith('eth')
@@ -277,6 +278,13 @@ describe('authoritative pre-send state', () => {
     const sent = writeFactory.mock.calls[0][0]
     expect(sent).not.toHaveProperty('maxFeePerGas')
     expect(sent).not.toHaveProperty('maxPriorityFeePerGas')
+    const messages = onStep.mock.calls
+      .flatMap(([state]) => state.logs ?? [])
+      .map((entry) => entry.message)
+    expect(messages).toContain('Checking active wallet account and network...')
+    expect(messages).toContain('Simulating transaction with MetaMask...')
+    expect(messages).toContain('Waiting for the transaction to be confirmed on-chain...')
+    expect(messages).toContain('Transaction result verified.')
   })
 
   it('does not open a wallet send when the injected strict simulation rejects', async () => {

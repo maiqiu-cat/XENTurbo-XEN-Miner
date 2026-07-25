@@ -33,6 +33,7 @@ declare global {
     __walletMock: {
       emitAccounts(accounts: string[]): void
       emitChain(chainId: string): void
+      setStalled(method: string, stalled: boolean): void
       stats(): WalletMockStats
     }
   }
@@ -217,6 +218,7 @@ async function installInjectedWallet(page: Page): Promise<void> {
       let chainId = '0x1'
       let sendAttempts = 0
       let successfulBroadcasts = 0
+      const stalledMethods = new Set<string>()
 
       const emit = (event: string, value: unknown) => {
         for (const listener of listeners.get(event) ?? []) listener(value)
@@ -224,6 +226,7 @@ async function installInjectedWallet(page: Page): Promise<void> {
 
       const provider = {
         async request({ method }: { method: string; params?: unknown[] }): Promise<unknown> {
+          if (stalledMethods.has(method)) return new Promise(() => {})
           switch (method) {
             case 'eth_accounts':
               return [...accounts]
@@ -271,6 +274,10 @@ async function installInjectedWallet(page: Page): Promise<void> {
         emitChain(nextChainId: string) {
           chainId = nextChainId
           emit('chainChanged', nextChainId)
+        },
+        setStalled(method: string, stalled: boolean) {
+          if (stalled) stalledMethods.add(method)
+          else stalledMethods.delete(method)
         },
         stats() {
           return { sendAttempts, successfulBroadcasts }
@@ -431,6 +438,45 @@ test('claim selection is cleared when the connected wallet changes', async ({ pa
   await expect(page.getByRole('button', { name: '0x2222...2222' }).first()).toBeVisible()
   await expect(page.getByText('1 VMUs selected')).toHaveCount(0)
   await expect(checkbox).not.toBeChecked()
+})
+
+test('a stalled wallet nonce read times out without opening a transaction request', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page)
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+
+  const checkbox = page.locator('tbody input[type="checkbox"]').first()
+  await expect(checkbox).toBeVisible()
+  await checkbox.click()
+  await page.evaluate(() => window.__walletMock.setStalled('eth_getTransactionCount', true))
+
+  await page.getByRole('button', { name: 'Claim & Re-Mint (100d)' }).click()
+
+  await expect(page.getByText('Estimate gas')).toBeVisible()
+  await expect(page.locator('.steps .step-icon.run')).toHaveText('...')
+  await expect(page.getByText('Checking configured RPC availability...')).toBeVisible()
+  await expect(page.getByText('Configured RPC is available.')).toBeVisible()
+  await expect(page.getByText('Checking wallet network and pending transactions...')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Cancel' })).toBeVisible()
+  await expect(
+    page.getByText('Wallet network and pending transaction check timed out after 15s', {
+      exact: true
+    })
+  ).toBeVisible({ timeout: 17_000 })
+  await expect(
+    page.getByText(
+      'Preparation failed: Wallet network and pending transaction check timed out after 15s'
+    )
+  ).toBeVisible()
+  expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+    sendAttempts: 0,
+    successfulBroadcasts: 0
+  })
+  await expect(page.getByRole('button', { name: 'Close' })).toBeVisible()
 })
 
 test('an unsigned prepared operation is invalidated by an account change', async ({ page }) => {
