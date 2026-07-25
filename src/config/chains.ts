@@ -19,7 +19,12 @@ export const CHAINS: Record<ChainKey, ChainConfig> = {
     chainId: 1,
     name: 'Ethereum',
     nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
-    defaultRpcUrls: ['https://ethereum.publicnode.com', 'https://ethereum-rpc.publicnode.com'],
+    defaultRpcUrls: [
+      'https://ethereum.publicnode.com',
+      'https://ethereum-rpc.publicnode.com',
+      'https://rpc.mevblocker.io',
+      'https://public.1rpc.io/eth'
+    ],
     blockExplorerUrl: 'https://etherscan.io'
   },
   polygon: {

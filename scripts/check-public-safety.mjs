@@ -1,7 +1,8 @@
 import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 
-const allowedEmail = /@(?:users\.noreply\.github\.com|cryptocell\.cloud)$/i
+const allowedEmail =
+  /^(?:(?:noreply|support)@github\.com|[^@\s]+@(?:users\.noreply\.github\.com|cryptocell\.cloud))$/i
 const blockedHistoryPaths = new Set(['DEPLOY-TENCENT.md', 'RELEASE-FOR-CODEX.txt'])
 const gitOutputLimit = 64 * 1024 * 1024
 const secretPatterns = [

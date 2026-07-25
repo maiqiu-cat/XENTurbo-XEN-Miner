@@ -6,7 +6,9 @@ export const CHAIN_CONFIG = Object.freeze({
     chainId: 1,
     rpcUrls: Object.freeze([
       'https://ethereum.publicnode.com',
-      'https://ethereum-rpc.publicnode.com'
+      'https://ethereum-rpc.publicnode.com',
+      'https://rpc.mevblocker.io',
+      'https://public.1rpc.io/eth'
     ]),
     factory: '0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2',
     xenCrypto: '0x06450dEe7FD2Fb8E39061434BAbCFC05599a6Fb8',

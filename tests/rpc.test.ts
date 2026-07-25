@@ -88,6 +88,16 @@ afterEach(() => {
 })
 
 describe('custom RPC validation', () => {
+  it('keeps the diversified Ethereum defaults in the intended failover order', () => {
+    expect(CHAINS.eth.defaultRpcUrls).toEqual([
+      'https://ethereum.publicnode.com',
+      'https://ethereum-rpc.publicnode.com',
+      'https://rpc.mevblocker.io',
+      'https://public.1rpc.io/eth'
+    ])
+    expect(new Set(CHAINS.eth.defaultRpcUrls).size).toBe(4)
+  })
+
   it.each(['http://rpc.example', 'ws://rpc.example', 'not-a-url'])(
     'rejects non-HTTPS endpoint %s',
     async (url) => {

@@ -190,10 +190,16 @@ async function handleRpcRoute(route: Route): Promise<void> {
   return handleRpcRouteWithState(route, {})
 }
 
+const ETHEREUM_RPC_ROUTES = [
+  /^https:\/\/ethereum\.publicnode\.com(?:\/.*)?$/,
+  /^https:\/\/ethereum-rpc\.publicnode\.com(?:\/.*)?$/,
+  /^https:\/\/rpc\.mevblocker\.io(?:\/.*)?$/,
+  /^https:\/\/public\.1rpc\.io\/eth(?:[/?].*)?$/
+]
+
 async function mockSameOriginRpc(page: Page, state?: RpcMockState): Promise<void> {
   for (const endpoint of [
-    'https://ethereum.publicnode.com/**',
-    'https://ethereum-rpc.publicnode.com/**',
+    ...ETHEREUM_RPC_ROUTES,
     'https://polygon-bor-rpc.publicnode.com/**',
     'https://polygon.publicnode.com/**',
     'https://polygon.drpc.org/**',
@@ -210,10 +216,7 @@ async function mockControllableEthereumRpc(page: Page): Promise<{
 }> {
   let requests = 0
   let available = false
-  for (const endpoint of [
-    'https://ethereum.publicnode.com/**',
-    'https://ethereum-rpc.publicnode.com/**'
-  ]) {
+  for (const endpoint of ETHEREUM_RPC_ROUTES) {
     await page.route(endpoint, async (route) => {
       requests += 1
       if (available) await handleRpcRoute(route)
@@ -400,7 +403,7 @@ test('all unavailable RPC endpoints block chain actions and can be rechecked', a
 
   await page.goto('/')
 
-  await expect(page.getByText(/No usable Ethereum RPC endpoints \(0\/2\)/)).toBeVisible()
+  await expect(page.getByText(/No usable Ethereum RPC endpoints \(0\/4\)/)).toBeVisible()
   await expect(page.getByText(/Your RPC list was not changed/)).toBeVisible()
   await expect(page.getByText(/DNS, firewall, and proxy\/VPN settings/)).toBeVisible()
   await expect(page.getByRole('button', { name: 'RPC', exact: true })).toBeVisible()
@@ -573,10 +576,7 @@ test('an account change during the initial pending check cancels the requested o
     }
     await handleRpcRoute(route)
   }
-  for (const endpoint of [
-    'https://ethereum.publicnode.com/**',
-    'https://ethereum-rpc.publicnode.com/**'
-  ]) {
+  for (const endpoint of ETHEREUM_RPC_ROUTES) {
     await page.unroute(endpoint, handleRpcRoute)
     await page.route(endpoint, blockPendingCheck)
   }
@@ -624,10 +624,7 @@ test('cancel during the final pending check never opens a wallet request', async
     }
     await handleRpcRoute(route)
   }
-  for (const endpoint of [
-    'https://ethereum.publicnode.com/**',
-    'https://ethereum-rpc.publicnode.com/**'
-  ]) {
+  for (const endpoint of ETHEREUM_RPC_ROUTES) {
     await page.unroute(endpoint, handleRpcRoute)
     await page.route(endpoint, blockPendingCheck)
   }
