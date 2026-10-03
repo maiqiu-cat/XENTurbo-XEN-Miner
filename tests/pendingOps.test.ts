@@ -411,7 +411,7 @@ describe('pending operation reconciliation', () => {
     expect(pending.listPendingOps('eth', WALLET)).toHaveLength(1)
   })
 
-  it('coalesces a tracked hash into the awaiting-wallet record with the same nonce', async () => {
+  it('keeps a tracked hash separate from an unsigned request with the same nonce', async () => {
     const data = new Interface(['function bulkClaimMintReward(uint256[] ids)']).encodeFunctionData(
       'bulkClaimMintReward',
       [[7n]]
@@ -437,17 +437,92 @@ describe('pending operation reconciliation', () => {
       term: 0,
       txHash: '',
       nonce: 7,
-      phase: 'awaiting-wallet'
+      phase: 'awaiting-wallet',
+      nonceAuthoritative: false
     })
 
     const tracked = await pending.trackPendingTxHash('eth', WALLET, HASH)
     const stored = pending.listPendingOps('eth', WALLET)
 
-    expect(tracked).toMatchObject({ id: 'batch-1', txHash: HASH, nonce: 7, phase: 'broadcast' })
-    expect(stored).toHaveLength(1)
-    expect(stored[0]).toMatchObject({ id: 'batch-1', txHash: HASH, nonce: 7 })
-    expect(attachTxHash).toHaveBeenCalledWith('batch-1', HASH)
+    expect(tracked.id).not.toBe('batch-1')
+    expect(tracked).toMatchObject({ txHash: HASH, nonce: 7, phase: 'broadcast' })
+    expect(stored).toHaveLength(2)
+    expect(stored.find((record) => record.id === 'batch-1')).toMatchObject({
+      txHash: '',
+      phase: 'awaiting-wallet'
+    })
+    expect(attachTxHash).toHaveBeenCalledWith(tracked.id, HASH)
+    pending.recordPendingOp({
+      ...stored.find((record) => record.id === 'batch-1')!,
+      phase: 'dropped'
+    })
+    expect(
+      pending.listPendingOps('eth', WALLET).find((record) => record.txHash === HASH)?.phase
+    ).toBe('broadcast')
     expect(ensureHealthyReadProvider).toHaveBeenCalledWith('eth')
+  })
+
+  it('keeps a receipt-only authenticated legacy record terminal after subsequent storage reads', async () => {
+    const { pending } = await installPendingHarness({
+      latestNonce: 8,
+      pendingNonce: 8,
+      walletReceipt: { status: 1 },
+      walletTransaction: null
+    })
+    recordBroadcast(pending, { origin: 'legacy-unknown', nonceAuthoritative: false })
+    await pending.refreshPendingOps('eth', WALLET)
+    expect(pending.listPendingOps('eth', WALLET)[0]).toMatchObject({
+      phase: 'confirmed',
+      origin: 'wallet-verified'
+    })
+    expect((await pending.refreshPendingOps('eth', WALLET)).unresolvedCount).toBe(0)
+  })
+
+  it('never inherits an old receipt or terminal phase for a different hash at the same client id', async () => {
+    const { pending } = await installPendingHarness({
+      latestNonce: 8,
+      pendingNonce: 8,
+      walletReceipt: { status: 1 }
+    })
+    const { readWalletEvidence } = await import('../src/core/walletEvidence')
+    const { settlement } = await readWalletEvidence('eth', WALLET, HASH)
+    recordBroadcast(pending, { id: 'batch-1', phase: 'confirmed', settlement })
+    const later = recordBroadcast(pending, {
+      id: 'batch-1',
+      txHash: `0x${'2'.repeat(64)}`,
+      nonceAuthoritative: false
+    })
+    expect(later.id).not.toBe('batch-1')
+    expect(later.phase).toBe('broadcast')
+    expect(later.receipt).toBeUndefined()
+    expect(pending.listPendingOps('eth', WALLET)).toHaveLength(2)
+  })
+
+  it('does not release a later broadcast lock that reused an old client id', async () => {
+    const { pending, releaseLock, releaseLocksByTxHash } = await installPendingHarness({
+      latestNonce: 8,
+      pendingNonce: 8,
+      walletReceipt: { status: 1 }
+    })
+    const locks = await import('../src/core/localLock')
+    vi.mocked(locks.pendingLocks).mockReturnValue([
+      {
+        chain: 'eth',
+        wallet: WALLET,
+        ids: [8],
+        txHash: `0x${'2'.repeat(64)}`,
+        batch: 'batch-1',
+        lockedAt: Date.now()
+      }
+    ])
+    const { settlement } = await (
+      await import('../src/core/walletEvidence')
+    ).readWalletEvidence('eth', WALLET, HASH)
+
+    recordBroadcast(pending, { id: 'batch-1', phase: 'confirmed', settlement })
+
+    expect(releaseLock).not.toHaveBeenCalled()
+    expect(releaseLocksByTxHash).toHaveBeenCalledWith(HASH, { chain: 'eth', wallet: WALLET })
   })
 
   it('uses the wallet address explorer URL when a record has no transaction hash', async () => {
@@ -522,7 +597,7 @@ describe('pending operation reconciliation', () => {
     expect(stored.phase).toBe('confirmed')
     expect(stored.updatedAt).toBeGreaterThan(stored.submittedAt)
     expect(result.unresolvedCount).toBe(0)
-    expect(releaseLocksByTxHash).toHaveBeenCalledWith(HASH)
+    expect(releaseLocksByTxHash).toHaveBeenCalledWith(HASH, { chain: 'eth', wallet: WALLET })
   })
 
   it('marks a reverted receipt reverted and releases its VMU lock', async () => {
@@ -538,7 +613,7 @@ describe('pending operation reconciliation', () => {
 
     expect(stored.phase).toBe('reverted')
     expect(result.unresolvedCount).toBe(0)
-    expect(releaseLocksByTxHash).toHaveBeenCalledWith(HASH)
+    expect(releaseLocksByTxHash).toHaveBeenCalledWith(HASH, { chain: 'eth', wallet: WALLET })
   })
 
   it('keeps a missing transaction unresolved while pending nonce covers its nonce', async () => {
@@ -616,7 +691,7 @@ describe('pending operation reconciliation', () => {
 
     expect(stored.phase).toBe('replaced')
     expect(result.unresolvedCount).toBe(0)
-    expect(releaseLocksByTxHash).toHaveBeenCalledWith(HASH)
+    expect(releaseLocksByTxHash).toHaveBeenCalledWith(HASH, { chain: 'eth', wallet: WALLET })
   })
 
   it('does not infer dropped from one temporarily lower pending nonce', async () => {
@@ -777,7 +852,7 @@ describe('pending operation reconciliation', () => {
 
     expect(dropped?.phase).toBe('dropped')
     expect(releaseLock).toHaveBeenCalledWith('batch-1')
-    expect(releaseLocksByTxHash).toHaveBeenCalledWith(HASH)
+    expect(releaseLocksByTxHash).toHaveBeenCalledWith(HASH, { chain: 'eth', wallet: WALLET })
   })
 
   it('refuses to downgrade a record that another tab already resolved', async () => {
@@ -826,6 +901,27 @@ describe('pending operation reconciliation', () => {
 })
 
 describe('broadcast VMU locks', () => {
+  it('releases a matching hash only for the authenticated wallet and chain', async () => {
+    vi.resetModules()
+    vi.doUnmock('../src/core/localLock')
+    const locks = await import('../src/core/localLock')
+    const otherWallet = '0x00000000000000000000000000000000000000cd'
+    for (const [chain, wallet, batch] of [
+      ['eth', WALLET, 'eth-batch'],
+      ['polygon', WALLET, 'polygon-batch'],
+      ['eth', otherWallet, 'other-batch']
+    ] as const) {
+      expect(locks.tryAcquireLock({ chain, wallet, batch, ids: [7] })).toBe(true)
+      locks.attachTxHash(batch, HASH)
+    }
+
+    locks.releaseLocksByTxHash(HASH, { chain: 'eth', wallet: WALLET.toUpperCase() })
+
+    expect(locks.pendingLocks('eth', WALLET)).toEqual([])
+    expect(locks.pendingLocks('polygon', WALLET)).toHaveLength(1)
+    expect(locks.pendingLocks('eth', otherWallet)).toHaveLength(1)
+  })
+
   it('does not expire a broadcast lock based on elapsed time alone', async () => {
     vi.resetModules()
     vi.doUnmock('../src/core/localLock')

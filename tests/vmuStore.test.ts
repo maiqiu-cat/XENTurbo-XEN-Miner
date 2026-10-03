@@ -145,6 +145,38 @@ describe('vmu store request invalidation', () => {
     store.detach()
   })
 
+  it('serializes overlapping incremental updates without losing the first affected ids', async () => {
+    const store = useVmuStore()
+    store.$patch({
+      chain: 'eth',
+      wallet: walletA,
+      vmus: [mintingVmu(1), mintingVmu(2)],
+      vmuCount: 2,
+      syncedAt: Date.now()
+    })
+    chainReader.readVmuCount.mockResolvedValue(2)
+    chainReader.readGlobalRank.mockResolvedValue(200)
+    const first = deferred<Vmu[]>()
+    chainReader.readVmuStates
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce([{ ...mintingVmu(2), rank: 0, maturityTs: 0, status: 'EMPTY' }])
+    const a = store.refreshAffected([1])
+    await vi.waitFor(() => expect(chainReader.readVmuStates).toHaveBeenCalledTimes(1))
+    const b = store.refreshAffected([2])
+    expect(chainReader.readVmuStates).toHaveBeenCalledTimes(1)
+    first.resolve([{ ...mintingVmu(1), rank: 0, maturityTs: 0, status: 'EMPTY' }])
+    await Promise.all([a, b])
+    expect(chainReader.readVmuStates).toHaveBeenNthCalledWith(
+      2,
+      'eth',
+      walletA,
+      [2],
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    )
+    expect(store.vmus.map((vmu) => vmu.status)).toEqual(['EMPTY', 'EMPTY'])
+    store.detach()
+  })
+
   it('coalesces overlapping full refreshes for the same wallet and chain', async () => {
     const walletRead = deferred<Vmu[]>()
     chainReader.readVmuCount.mockResolvedValue(1)

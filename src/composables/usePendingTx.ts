@@ -146,7 +146,9 @@ export function usePendingTx(
     const addr = address()
     const key = chain()
     if (!addr || !key) throw new Error('Connect wallet first')
-    await trackPendingTxHash(key, addr, txHash, seenText)
+    const tracked = await trackPendingTxHash(key, addr, txHash, seenText)
+    if (tracked?.status === 'confirmed' && address() === addr && chain() === key)
+      onConfirmed?.([tracked])
     await check()
   }
 

@@ -144,11 +144,18 @@ export function releaseLock(batch: string): void {
   writeAll(readAll().filter((l) => l.batch !== batch))
 }
 
-export function releaseLocksByTxHash(txHash: string): void {
+export function releaseLocksByTxHash(
+  txHash: string,
+  context?: { chain: ChainKey; wallet: string }
+): void {
   const normalized = txHash.toLowerCase()
   writeAll(
     readAll().filter(
-      (l) => typeof l.txHash !== 'string' || l.txHash.toLowerCase() !== normalized
+      (l) =>
+        (context &&
+          (l.chain !== context.chain || l.wallet.toLowerCase() !== context.wallet.toLowerCase())) ||
+        typeof l.txHash !== 'string' ||
+        l.txHash.toLowerCase() !== normalized
     )
   )
 }

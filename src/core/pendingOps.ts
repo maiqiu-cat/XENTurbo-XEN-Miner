@@ -350,6 +350,13 @@ function toView(
   }
 }
 
+function releaseRecordLocks(record: PendingOpRecord): void {
+  const bound = pendingLocks(record.chain, record.wallet).find((lock) => lock.batch === record.id)
+  if (!bound || bound.txHash.toLowerCase() === record.txHash.toLowerCase()) releaseLock(record.id)
+  if (record.txHash)
+    releaseLocksByTxHash(record.txHash, { chain: record.chain, wallet: record.wallet })
+}
+
 export function recordPendingOp(params: {
   /** Stable client operation id, normally the local VMU lock batch id. */
   id?: string
@@ -382,26 +389,25 @@ export function recordPendingOp(params: {
     }
   }
   const all = readAll()
+  const validatedSettlement = isWalletSettlement(params.settlement, params)
+    ? params.settlement
+    : undefined
   const normalizedHash = params.txHash.toLowerCase()
-  const directMatch = all.find(
+  const scoped = all.filter(
     (record) =>
-      record.chain === params.chain &&
-      record.wallet.toLowerCase() === params.wallet.toLowerCase() &&
-      ((params.id && record.id === params.id) ||
-        (normalizedHash.length > 0 && record.txHash.toLowerCase() === normalizedHash))
+      record.chain === params.chain && record.wallet.toLowerCase() === params.wallet.toLowerCase()
   )
-  const awaitingNonceMatch =
-    normalizedHash.length > 0 && params.nonce != null
-      ? all.find(
-          (record) =>
-            record.chain === params.chain &&
-            record.wallet.toLowerCase() === params.wallet.toLowerCase() &&
-            record.nonce === params.nonce &&
-            record.phase === 'awaiting-wallet' &&
-            record.txHash.length === 0
-        )
-      : undefined
-  const existing = directMatch ?? awaitingNonceMatch
+  const owned = params.id ? scoped.find((record) => record.id === params.id) : undefined
+  const conflictingHash = owned?.txHash && owned.txHash.toLowerCase() !== normalizedHash
+  if (conflictingHash && !normalizedHash)
+    throw new Error(
+      'PENDING_IDENTITY_CONFLICT: A recorded broadcast cannot be overwritten by an unsigned request.'
+    )
+  const hashMatch = normalizedHash
+    ? scoped.find((record) => record.txHash.toLowerCase() === normalizedHash)
+    : undefined
+  // Requested nonces are not transaction identities. Preserve independent wallet requests.
+  const existing = conflictingHash ? hashMatch : (owned ?? hashMatch)
   const submittedAt = Math.min(
     existing?.submittedAt ?? Number.POSITIVE_INFINITY,
     params.submittedAt ?? Date.now()
@@ -416,7 +422,10 @@ export function recordPendingOp(params: {
       ? existing.phase
       : requestedPhase
   const rec: PendingOpRecord = {
-    id: existing?.id ?? params.id ?? `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    id:
+      existing?.id ??
+      (conflictingHash ? `${params.id}:hash:${normalizedHash}` : params.id) ??
+      `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     chain: params.chain,
     wallet: params.wallet,
     op: params.op,
@@ -426,12 +435,14 @@ export function recordPendingOp(params: {
     txHash: params.txHash,
     nonce: params.nonce ?? existing?.nonce ?? null,
     phase,
-    origin: params.origin ?? existing?.origin ?? 'local',
+    origin: validatedSettlement
+      ? 'wallet-verified'
+      : (params.origin ?? existing?.origin ?? 'local'),
     nonceAuthoritative:
       params.nonceAuthoritative ??
       existing?.nonceAuthoritative ??
       (params.origin !== 'legacy-unknown' && params.nonce != null),
-    receipt: params.settlement?.receipt ?? existing?.receipt,
+    receipt: validatedSettlement?.receipt ?? existing?.receipt,
     preVmuCount: params.preVmuCount ?? existing?.preVmuCount,
     beforeRanks: params.beforeRanks ?? existing?.beforeRanks,
     outcome: params.outcome ?? existing?.outcome,
@@ -455,8 +466,7 @@ export function recordPendingOp(params: {
   if (rec.txHash && isUnresolvedPending(rec)) {
     attachTxHash(rec.id, rec.txHash)
   } else if (!isUnresolvedPending(rec)) {
-    releaseLock(rec.id)
-    if (rec.txHash) releaseLocksByTxHash(rec.txHash)
+    releaseRecordLocks(rec)
   }
   return rec
 }
@@ -490,8 +500,7 @@ function transitionPendingOp(
   }
   appendRecord(updated)
   if (!isUnresolvedPending(updated)) {
-    releaseLock(updated.id)
-    if (updated.txHash) releaseLocksByTxHash(updated.txHash)
+    releaseRecordLocks(updated)
   }
   return updated
 }
@@ -507,8 +516,7 @@ export function removePendingOpRecord(identifier: string): boolean {
   )
   for (const record of matches) {
     appendTombstone(record)
-    releaseLock(record.id)
-    if (record.txHash) releaseLocksByTxHash(record.txHash)
+    releaseRecordLocks(record)
   }
   return matches.length > 0
 }
@@ -576,7 +584,8 @@ export async function trackPendingTxHash(
     const existing = listPendingOps(chain, wallet).find(
       (record) => record.txHash.toLowerCase() === hash.toLowerCase()
     )
-    if (existing) recordPendingOp({ ...existing, phase: settlement.phase, settlement })
+    if (existing)
+      return toView(recordPendingOp({ ...existing, phase: settlement.phase, settlement }))
     throw new Error('This transaction is already mined (no longer pending)')
   }
   if (!tx) throw new Error('Transaction not found through the wallet. Check the hash / network.')
@@ -652,6 +661,7 @@ export function reconcilePendingOp(
     ...record,
     nonce,
     phase,
+    origin: isWalletSettlement(observation.settlement, record) ? 'wallet-verified' : record.origin,
     receipt: observation.settlement?.receipt ?? record.receipt,
     updatedAt: now
   }
@@ -987,8 +997,7 @@ async function refreshPendingOpsWithinDeadline(
       if (!sameRecordRevision(current, candidate.record)) appendRecord(candidate.record)
       if (candidate.record.phase === 'confirmed') confirmedOps.push(candidate.record)
       if (!isUnresolvedPending(candidate.record)) {
-        releaseLock(current.id)
-        if (current.txHash) releaseLocksByTxHash(current.txHash)
+        releaseRecordLocks(candidate.record)
       }
     }
     const unresolved = listPendingOps(chain, wallet).filter(isUnresolvedPending)

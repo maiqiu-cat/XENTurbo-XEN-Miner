@@ -315,8 +315,20 @@ export const useVmuStore = defineStore('vmu', {
     },
 
     /** Re-read only the affected ids when the cached wallet inventory is complete. */
-    async refreshAffected(ids: number[]) {
+    async refreshAffected(ids: number[]): Promise<void> {
       if (!this.chain || !this.wallet) return
+      const active = refreshFlights.get(this)
+      if (
+        active &&
+        active.chain === this.chain &&
+        active.wallet === this.wallet &&
+        !active.controller.signal.aborted
+      ) {
+        await active.promise
+        if (this.chain === active.chain && this.wallet === active.wallet)
+          return this.refreshAffected(ids)
+        return
+      }
       const selected = [...new Set(ids)]
       if (
         !selected.length ||

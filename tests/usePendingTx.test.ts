@@ -2,7 +2,7 @@
 
 import { effectScope, nextTick, ref } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { refreshPendingOps } from '../src/core/pendingOps'
+import { refreshPendingOps, trackPendingTxHash } from '../src/core/pendingOps'
 import { usePendingTx } from '../src/composables/usePendingTx'
 
 vi.mock('../src/core/pendingOps', () => ({
@@ -21,6 +21,46 @@ function deferred<T>() {
 }
 
 describe('usePendingTx', () => {
+  it('refreshes mining inventory when manual Track authenticates an already mined record', async () => {
+    const wallet = '0x0000000000000000000000000000000000000001'
+    const record = {
+      id: 'tracked',
+      chain: 'eth',
+      wallet,
+      op: 'CLAIM',
+      ids: [1],
+      count: 0,
+      term: 0,
+      txHash: `0x${'a'.repeat(64)}`,
+      nonce: 0,
+      phase: 'confirmed',
+      status: 'confirmed',
+      label: 'Claim',
+      detail: '',
+      explorerUrl: 'https://etherscan.io/',
+      submittedAt: Date.now(),
+      updatedAt: Date.now()
+    } as const
+    vi.mocked(trackPendingTxHash).mockResolvedValue({ ...record, ids: [1] })
+    vi.mocked(refreshPendingOps).mockResolvedValue({
+      views: [],
+      pendingNonceGap: 0,
+      unresolvedCount: 0,
+      confirmedOps: []
+    })
+    const onConfirmed = vi.fn()
+    const scope = effectScope()
+    const state = scope.run(() =>
+      usePendingTx(
+        () => wallet,
+        () => 'eth',
+        onConfirmed
+      )
+    )!
+    await state.trackHash(record.txHash)
+    expect(onConfirmed).toHaveBeenCalledWith([{ ...record, ids: [1] }])
+    scope.stop()
+  })
   beforeEach(() => {
     vi.clearAllMocks()
     Object.defineProperty(document, 'visibilityState', {
