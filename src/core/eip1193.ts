@@ -38,6 +38,59 @@ export function getInjectedProvider(): InjectedProvider | undefined {
   return ethereum
 }
 
+const contextWatches = new WeakMap<
+  InjectedProvider,
+  {
+    revision: number
+    users: number
+    changed: (...args: unknown[]) => void
+  }
+>()
+
+/** Share temporary listeners so a switch-and-return invalidates in-flight reads. */
+export function captureInjectedContext(provider: InjectedProvider) {
+  const observed = !!provider.on && !!provider.removeListener
+  let watch = contextWatches.get(provider)
+  if (!watch) {
+    const slot = { revision: 0, users: 0, changed: () => {} }
+    slot.changed = () => {
+      slot.revision += 1
+    }
+    watch = slot
+    contextWatches.set(provider, watch)
+    if (observed) {
+      provider.on!('chainChanged', watch.changed)
+      provider.on!('accountsChanged', watch.changed)
+      provider.on!('disconnect', watch.changed)
+    }
+  }
+  watch.users += 1
+  const revision = watch.revision
+  let disposed = false
+  return {
+    observed,
+    assertStable() {
+      if (provider !== getInjectedProvider() || watch.revision !== revision)
+        throw new Error(
+          'WALLET_CONTEXT_CHANGED: Wallet context changed during validation. Recheck before retrying.'
+        )
+    },
+    dispose() {
+      if (disposed) return
+      disposed = true
+      watch.users -= 1
+      if (watch.users === 0) {
+        if (observed) {
+          provider.removeListener!('chainChanged', watch.changed)
+          provider.removeListener!('accountsChanged', watch.changed)
+          provider.removeListener!('disconnect', watch.changed)
+        }
+        contextWatches.delete(provider)
+      }
+    }
+  }
+}
+
 function requireInjectedProvider(): InjectedProvider {
   const provider = getInjectedProvider()
   if (!provider) throw new Error('No injected wallet found')

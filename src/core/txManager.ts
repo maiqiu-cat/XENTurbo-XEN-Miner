@@ -10,7 +10,9 @@ import {
   DEFAULT_TERM_MAX
 } from '@/config/miner'
 import { writeFactory, warmUpInjected } from './wallet'
-import { readFee, readVmuStatuses } from './chainReader'
+import { readFee, readVmuStatuses, readVmuStates } from './chainReader'
+import { readWalletEvidence, type WalletReceipt } from './walletEvidence'
+import { mapWithConcurrency } from '@/utils/concurrency'
 import { ensureHealthyReadProvider, getReadProvider } from './rpc'
 import {
   attachTxHash,
@@ -549,6 +551,8 @@ export interface PreparedOp {
   state: TxStepState
   /** VMU count immediately before an allocating transaction is sent. */
   preVmuCount?: number
+  receipt?: WalletReceipt
+  beforeRanks?: Record<number, number>
 }
 
 /**
@@ -764,7 +768,10 @@ export async function sendPreparedOperation(
       term: prepared.term,
       txHash,
       nonce: broadcastNonce,
-      phase: 'broadcast'
+      phase: 'broadcast',
+      nonceAuthoritative: false,
+      preVmuCount: prepared.preVmuCount,
+      beforeRanks: prepared.beforeRanks
     })
   }
 
@@ -872,6 +879,17 @@ export async function sendPreparedOperation(
         )
         assertOperationActive(cb)
         log('Selected VMUs passed the final validation.', 'done')
+        if (prepared.op === 'CLAIM_REUSE') {
+          const before = await withTimeout(
+            readVmuStates(prepared.chain, prepared.wallet, prepared.ids),
+            PREFLIGHT_CONTRACT_TIMEOUT_MS,
+            'Pre-remint VMU state'
+          )
+          if (before.some((vmu) => !vmu.readOk))
+            throw new Error('Selected VMU state could not be read before re-minting')
+          prepared.beforeRanks = Object.fromEntries(before.map((vmu) => [vmu.id, vmu.rank]))
+          assertOperationActive(cb)
+        }
         log('Simulating transaction with MetaMask...')
         await withTimeout(
           simulatePreparedWithWallet(prepared, value),
@@ -887,9 +905,9 @@ export async function sendPreparedOperation(
             address: prepared.factoryAddress,
             abi: XENFactoryABI,
             functionName: prepared.fnName,
+            simulationFunctionName: strictSimulationFunction(prepared.op),
             args: prepared.args,
             value,
-            gas: prepared.gasLimit,
             nonce,
             expectedFrom: prepared.wallet,
             onRequestStart: () => {
@@ -908,7 +926,8 @@ export async function sendPreparedOperation(
                 term: prepared.term,
                 txHash: '',
                 nonce,
-                phase: 'awaiting-wallet'
+                phase: 'awaiting-wallet',
+                nonceAuthoritative: false
               })
               awaitingWalletRecorded = true
             },
@@ -961,21 +980,43 @@ export async function sendPreparedOperation(
     }
 
     if (!receipt) throw new Error('Transaction receipt missing')
-    if (receipt.status === 0) {
-      log('The transaction receipt reports an on-chain revert.', 'error')
-      recordPendingOp({
-        id: prepared.batch,
-        chain: prepared.chain,
-        wallet: prepared.wallet,
-        op: prepared.op,
-        ids: prepared.ids,
-        count: prepared.count,
-        term: prepared.term,
-        txHash,
+    log('Cross-checking the receipt through the wallet...')
+    let settlement
+    for (const delay of [0, 500, 1_500, 3_000]) {
+      if (delay) await new Promise<void>((resolve) => setTimeout(resolve, delay))
+      const evidence = await readWalletEvidence(prepared.chain, prepared.wallet, txHash, {
         nonce: broadcastNonce,
-        phase: 'reverted'
+        nonceAuthoritative: false
       })
-      resolved = true
+      settlement = evidence.settlement
+      if (settlement) break
+    }
+    if (!settlement)
+      throw new Error(
+        'WALLET_EVIDENCE_UNAVAILABLE: The wallet has not confirmed this receipt yet. Keep the transaction pending and recheck; do not resend.'
+      )
+    recordPendingOp({
+      id: prepared.batch,
+      chain: prepared.chain,
+      wallet: prepared.wallet,
+      op: prepared.op,
+      ids: prepared.ids,
+      count: prepared.count,
+      term: prepared.term,
+      txHash,
+      nonce: broadcastNonce,
+      phase: settlement.phase,
+      settlement,
+      preVmuCount: prepared.preVmuCount
+    })
+    resolved = true
+    if (settlement.phase === 'replaced')
+      throw new Error(
+        'The wallet confirms this nonce was consumed by another transaction. Check wallet Activity before preparing again.'
+      )
+    prepared.receipt = settlement.receipt
+    if (settlement.phase === 'reverted') {
+      log('The transaction receipt reports an on-chain revert.', 'error')
       throw new Error('Transaction reverted on-chain')
     }
     log('Transaction confirmed on-chain. Verifying the resulting VMU state.', 'done')
@@ -989,7 +1030,9 @@ export async function sendPreparedOperation(
       term: prepared.term,
       txHash,
       nonce: broadcastNonce,
-      phase: 'confirmed'
+      phase: 'confirmed',
+      settlement,
+      preVmuCount: prepared.preVmuCount
     })
     resolved = true
     try {
@@ -1000,6 +1043,22 @@ export async function sendPreparedOperation(
       state.outcome = uncertainOperationOutcome(prepared)
     }
     state.confirm = 'done'
+    recordPendingOp({
+      id: prepared.batch,
+      chain: prepared.chain,
+      wallet: prepared.wallet,
+      op: prepared.op,
+      ids: prepared.ids,
+      count: prepared.count,
+      term: prepared.term,
+      txHash,
+      nonce: broadcastNonce,
+      phase: 'confirmed',
+      settlement,
+      preVmuCount: prepared.preVmuCount,
+      beforeRanks: prepared.beforeRanks,
+      outcome: state.outcome
+    })
     if (state.outcome.classification === 'full') {
       log('Transaction result verified.', 'done')
     } else if (state.outcome.classification === 'partial') {
@@ -1053,31 +1112,19 @@ export async function resumePendingLocks(chain: ChainKey, wallet: string): Promi
   clearSoftLocks(chain, wallet)
   const pending = pendingLocks(chain, wallet)
   if (!pending.length) return false
-  const provider = await ensureHealthyReadProvider(chain)
+  await ensureHealthyReadProvider(chain)
   let resolvedAny = false
-  await Promise.all(
-    pending.map(async (lock) => {
-      try {
-        const receipt = await provider.getTransactionReceipt(lock.txHash)
-        if (receipt) {
-          resolvedAny = true
-          releaseLock(lock.batch)
-          return
-        }
-        const waited = await provider.waitForTransaction(
-          lock.txHash,
-          1,
-          Math.min(CONFIRM_TIMEOUT_MS[chain], 30_000)
-        )
-        if (waited) {
-          resolvedAny = true
-          releaseLock(lock.batch)
-        }
-      } catch {
-        // keep lock
+  await mapWithConcurrency(pending, 4, async (lock) => {
+    try {
+      const { settlement } = await readWalletEvidence(chain, wallet, lock.txHash)
+      if (settlement) {
+        resolvedAny = true
+        releaseLock(lock.batch)
       }
-    })
-  )
+    } catch {
+      // keep lock
+    }
+  })
   return resolvedAny
 }
 

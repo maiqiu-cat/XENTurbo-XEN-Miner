@@ -40,8 +40,9 @@ const waitingWallet = computed(
 const preparing = computed(
   () =>
     !props.state?.txHash &&
-    props.state?.send === 'wait' &&
-    (props.state?.estimate === 'wait' || props.state?.estimate === 'process')
+    !props.state?.walletPrompted &&
+    ((props.state?.send === 'wait' && (props.state?.estimate === 'wait' || props.state?.estimate === 'process')) ||
+      props.state?.send === 'process')
 )
 const logList = ref<HTMLOListElement | null>(null)
 

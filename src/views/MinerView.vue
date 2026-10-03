@@ -96,12 +96,43 @@ const {
   localUnresolvedCount,
   ops: pendingOps,
   checking: pendingChecking,
+  error: pendingError,
   check: checkPending,
   trackHash: trackPendingHash,
   markDropped: markPendingDropped
 } = usePendingTx(
   () => wallet.address,
-  () => activeChain.value
+  () => activeChain.value,
+  (operations) => {
+    const matching = operations.filter(
+      (operation) =>
+        operation.chain === activeChain.value &&
+        operation.wallet.toLowerCase() === wallet.address?.toLowerCase()
+    )
+    if (!matching.length) return
+    if (
+      matching.some(
+        (operation) =>
+          (operation.op === 'GENERAL_MINT' || operation.op === 'CREATE_EMPTY_SLOT') &&
+          (!Number.isSafeInteger(operation.preVmuCount) ||
+            operation.preVmuCount! < 0 ||
+            operation.preVmuCount! > 100_000 ||
+            !Number.isSafeInteger(operation.count) ||
+            operation.count <= 0 ||
+            operation.count > 1_000 ||
+            operation.preVmuCount! + operation.count > 100_000)
+      )
+    ) {
+      void store.refresh()
+      return
+    }
+    const ids = matching.flatMap((operation) =>
+      operation.op === 'GENERAL_MINT' || operation.op === 'CREATE_EMPTY_SLOT'
+        ? Array.from({ length: operation.count }, (_, index) => operation.preVmuCount! + index + 1)
+        : operation.ids
+    )
+    void store.refreshAffected(ids)
+  }
 )
 
 const pendingBlockedReason = computed(() => {
@@ -175,7 +206,12 @@ const txVisible = ref(false)
 const txState = ref<TxStepState | null>(null)
 const txTitle = ref('')
 const busy = ref(false)
-const waitingWallet = computed(() => txState.value?.send === 'process' && !txState.value?.txHash)
+const waitingWallet = computed(
+  () =>
+    txState.value?.walletPrompted === true &&
+    txState.value.send === 'process' &&
+    !txState.value.txHash
+)
 
 const canOperate = computed(
   () =>
@@ -204,23 +240,20 @@ function trackOperationStage(context: OperationAnalytics, stage: OperationStage)
   trackAnalyticsEvent('miner_operation', { operation: context.operation, stage })
 }
 
-// Invalidate only work that has not reached the wallet. Once an EIP-1193
-// request is open or a hash exists, keep tracking it until the wallet settles.
+// Detach the old UI context, but preserve records for non-cancellable wallet sends.
 watch([() => wallet.address, () => wallet.chainKey, () => wallet.contextGen], () => {
-  const walletRequestOpen = txState.value?.send === 'process'
+  const walletRequestOpen = txState.value?.walletPrompted === true
   const broadcasted =
     Boolean(txState.value?.txHash) ||
     txState.value?.send === 'done' ||
     txState.value?.confirm === 'process' ||
     txState.value?.confirm === 'done'
-  if (walletRequestOpen || broadcasted) return
-
   opSeq += 1
   if (!busy.value && !prepared.value) {
     activeOperationAnalytics = null
     return
   }
-  abortPrepared(prepared.value)
+  if (!walletRequestOpen && !broadcasted) abortPrepared(prepared.value)
   prepared.value = null
   activeOperationAnalytics = null
   busy.value = false
@@ -244,6 +277,22 @@ async function operate(
     sentStages: new Set()
   }
   activeOperationAnalytics = analyticsContext
+  busy.value = true
+  prepared.value = null
+  txTitle.value = title
+  txVisible.value = true
+  txState.value = {
+    estimate: 'process',
+    send: 'wait',
+    confirm: 'wait',
+    logs: [
+      {
+        at: Date.now(),
+        status: 'process',
+        message: 'Checking pending transactions through the wallet...'
+      }
+    ]
+  }
   // Fresh check right before starting — polling may be a few seconds stale.
   const n = await checkPending()
   if (
@@ -253,6 +302,21 @@ async function operate(
     wallet.address?.toLowerCase() !== requestedWallet.toLowerCase()
   ) {
     if (activeOperationAnalytics === analyticsContext) activeOperationAnalytics = null
+    return
+  }
+  if (pendingError?.value) {
+    trackOperationStage(analyticsContext, 'failed')
+    activeOperationAnalytics = null
+    busy.value = false
+    txState.value = {
+      estimate: 'error',
+      send: 'wait',
+      confirm: 'wait',
+      error: pendingError.value,
+      logs: [
+        { at: Date.now(), status: 'error', message: `Pending check failed: ${pendingError.value}` }
+      ]
+    }
     return
   }
   if (n > 0) {
@@ -266,6 +330,7 @@ async function operate(
       error: `Blocked: ${n} pending tx on-chain. Wait, Speed up, or Cancel in MetaMask first.`
     }
     txVisible.value = true
+    busy.value = false
     return
   }
 
@@ -281,7 +346,8 @@ async function operate(
       {
         onStep: (s) => {
           if (seq === opSeq && wallet.contextGen === requestedContextGen) txState.value = s
-        }
+        },
+        isCancelled: () => seq !== opSeq || wallet.contextGen !== requestedContextGen
       }
     )
     if (seq !== opSeq || wallet.contextGen !== requestedContextGen) {
@@ -316,7 +382,7 @@ async function signPrepared() {
   const requestedContextGen = wallet.contextGen
   const n = await checkPending()
   if (seq !== opSeq || wallet.contextGen !== requestedContextGen || prepared.value !== prep) return
-  if (n > 0) {
+  if (n > 0 || pendingError?.value) {
     trackOperationStage(analyticsContext, 'failed')
     if (activeOperationAnalytics === analyticsContext) activeOperationAnalytics = null
     abortPrepared(prep)
@@ -327,7 +393,9 @@ async function signPrepared() {
       send: 'error',
       confirm: 'wait',
       readyToSign: false,
-      error: `A previous transaction is still pending (${n}). Wait for it in MetaMask, then retry.`
+      error:
+        pendingError?.value ??
+        `A previous transaction is still pending (${n}). Wait for it in MetaMask, then retry.`
     }
     return
   }
@@ -337,7 +405,7 @@ async function signPrepared() {
       onStep: (s) => {
         if (seq === opSeq && wallet.contextGen === requestedContextGen) {
           txState.value = s
-          if (s.send === 'process') trackOperationStage(analyticsContext, 'wallet_opened')
+          if (s.walletPrompted) trackOperationStage(analyticsContext, 'wallet_opened')
           if (s.txHash) trackOperationStage(analyticsContext, 'submitted')
           if (s.confirm === 'done') trackOperationStage(analyticsContext, 'confirmed')
         }
@@ -350,7 +418,13 @@ async function signPrepared() {
   } finally {
     if (seq === opSeq && wallet.contextGen === requestedContextGen) {
       busy.value = false
-      store.refresh()
+      if (prep.receipt) {
+        const affectedIds =
+          prep.op === 'GENERAL_MINT' || prep.op === 'CREATE_EMPTY_SLOT'
+            ? Array.from({ length: prep.count }, (_, index) => (prep.preVmuCount ?? 0) + index + 1)
+            : prep.ids
+        void store.refreshAffected(affectedIds)
+      }
       void checkPending()
     }
     if (activeOperationAnalytics === analyticsContext) activeOperationAnalytics = null
@@ -506,7 +580,7 @@ const explorerAddrUrl = computed(() => {
         :ops="pendingOps"
         :pending-count="pendingCount"
         :checking="pendingChecking"
-        @recheck="checkPending"
+        @recheck="checkPending({ reverifyResults: true })"
         @track="onTrackHash"
         @mark-dropped="onMarkPendingDropped"
       />

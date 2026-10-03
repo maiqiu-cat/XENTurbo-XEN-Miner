@@ -7,6 +7,8 @@ import {
   getInjectedProvider,
   type InjectedProvider
 } from './eip1193'
+import { validatedWalletGas } from './walletEvidence'
+import { withReadDeadline } from './readDeadline'
 
 export { getInjectedProvider } from './eip1193'
 
@@ -282,6 +284,7 @@ export async function writeFactory(params: {
   address: `0x${string}`
   abi: any
   functionName: string
+  simulationFunctionName?: string
   args: readonly unknown[]
   value?: bigint
   gas?: bigint
@@ -299,7 +302,7 @@ export async function writeFactory(params: {
     throw new Error('No injected wallet found. Install MetaMask (or similar) and reconnect.')
   }
 
-  let from = await getInjectedAccount()
+  let from = await withReadDeadline(getInjectedAccount, 'Wallet account')
   if (!from) {
     from = firstAccount(await provider.request({ method: 'eth_requestAccounts' }))
   }
@@ -308,7 +311,7 @@ export async function writeFactory(params: {
     throw new Error('Wallet account changed during the operation. Reconnect and retry.')
   }
 
-  const currentChainId = await getInjectedChainId()
+  const currentChainId = await withReadDeadline(getInjectedChainId, 'Wallet network')
   if (currentChainId !== params.chainId) {
     throw new Error('Wallet is on the wrong network. Switch networks and retry.')
   }
@@ -323,12 +326,19 @@ export async function writeFactory(params: {
     data
   }
   if (params.value !== undefined) txParams.value = toHex(params.value)
-  if (params.gas !== undefined) txParams.gas = toHex(params.gas)
   if (params.nonce !== undefined) txParams.nonce = toHex(BigInt(params.nonce))
   if (params.maxFeePerGas !== undefined) txParams.maxFeePerGas = toHex(params.maxFeePerGas)
   if (params.maxPriorityFeePerGas !== undefined) {
     txParams.maxPriorityFeePerGas = toHex(params.maxPriorityFeePerGas)
   }
+  // Public estimates are advisory. Validate the exact serialized send with the wallet.
+  const strictData = params.simulationFunctionName
+    ? new Interface(params.abi).encodeFunctionData(
+        params.simulationFunctionName,
+        params.args as any[]
+      )
+    : undefined
+  txParams.gas = toHex(await validatedWalletGas(provider, params.chainId, txParams, strictData))
 
   try {
     const send = beginWalletSend(() => {

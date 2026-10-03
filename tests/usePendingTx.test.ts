@@ -34,7 +34,8 @@ describe('usePendingTx', () => {
     vi.mocked(refreshPendingOps).mockResolvedValue({
       views: [],
       pendingNonceGap: 0,
-      unresolvedCount: 0
+      unresolvedCount: 0,
+      confirmedOps: []
     })
     const address = ref('0x0000000000000000000000000000000000000001')
     const chain = ref<'eth'>('eth')
@@ -51,7 +52,7 @@ describe('usePendingTx', () => {
     expect(refreshPendingOps).toHaveBeenLastCalledWith(
       'eth',
       '0x0000000000000000000000000000000000000001',
-      { freshRpc: false }
+      expect.objectContaining({ freshRpc: false, signal: expect.any(AbortSignal) })
     )
     await vi.advanceTimersByTimeAsync(29_999)
     expect(refreshPendingOps).toHaveBeenCalledTimes(1)
@@ -66,7 +67,8 @@ describe('usePendingTx', () => {
     vi.mocked(refreshPendingOps).mockResolvedValue({
       views: [],
       pendingNonceGap: 0,
-      unresolvedCount: 0
+      unresolvedCount: 0,
+      confirmedOps: []
     })
     Object.defineProperty(document, 'visibilityState', {
       configurable: true,
@@ -96,11 +98,7 @@ describe('usePendingTx', () => {
   })
 
   it('ignores an in-flight refresh after the wallet disconnects', async () => {
-    const refresh = deferred<{
-      views: any[]
-      pendingNonceGap: number
-      unresolvedCount: number
-    }>()
+    const refresh = deferred<Awaited<ReturnType<typeof refreshPendingOps>>>()
     vi.mocked(refreshPendingOps).mockReturnValueOnce(refresh.promise)
     const address = ref<string | null>('0x0000000000000000000000000000000000000001')
     const chain = ref<'eth' | null>('eth')
@@ -117,9 +115,29 @@ describe('usePendingTx', () => {
     await nextTick()
 
     refresh.resolve({
-      views: [{ id: 'stale-op' }],
+      views: [
+        {
+          id: 'stale-op',
+          chain: 'eth',
+          wallet: '0x0000000000000000000000000000000000000001',
+          op: 'CLAIM',
+          ids: [1],
+          count: 0,
+          term: 0,
+          txHash: '',
+          nonce: 1,
+          phase: 'broadcast',
+          submittedAt: 0,
+          updatedAt: 0,
+          label: 'Claim',
+          detail: '',
+          explorerUrl: 'https://etherscan.io/',
+          status: 'pending'
+        }
+      ],
       pendingNonceGap: 1,
-      unresolvedCount: 1
+      unresolvedCount: 1,
+      confirmedOps: []
     })
     await refresh.promise
     await nextTick()
@@ -133,8 +151,8 @@ describe('usePendingTx', () => {
   })
 
   it('keeps slow checks single-flight and performs one trailing refresh', async () => {
-    const first = deferred<{ views: any[]; pendingNonceGap: number; unresolvedCount: number }>()
-    const second = deferred<{ views: any[]; pendingNonceGap: number; unresolvedCount: number }>()
+    const first = deferred<Awaited<ReturnType<typeof refreshPendingOps>>>()
+    const second = deferred<Awaited<ReturnType<typeof refreshPendingOps>>>()
     vi.mocked(refreshPendingOps)
       .mockReturnValueOnce(first.promise)
       .mockReturnValueOnce(second.promise)
@@ -153,12 +171,46 @@ describe('usePendingTx', () => {
     const overlappingB = state.check()
     expect(refreshPendingOps).toHaveBeenCalledTimes(1)
 
-    first.resolve({ views: [], pendingNonceGap: 0, unresolvedCount: 0 })
+    first.resolve({ views: [], pendingNonceGap: 0, unresolvedCount: 0, confirmedOps: [] })
     await Promise.all([first.promise, overlappingA, overlappingB])
     await vi.waitFor(() => expect(refreshPendingOps).toHaveBeenCalledTimes(2))
 
-    second.resolve({ views: [], pendingNonceGap: 0, unresolvedCount: 0 })
+    second.resolve({ views: [], pendingNonceGap: 0, unresolvedCount: 0, confirmedOps: [] })
     await second.promise
+    scope.stop()
+  })
+
+  it('notifies the mining inventory after delayed confirmation is authenticated', async () => {
+    const confirmed = {
+      id: 'confirmed',
+      chain: 'eth',
+      wallet: '0x0000000000000000000000000000000000000001',
+      op: 'CLAIM',
+      ids: [1],
+      count: 0,
+      term: 0,
+      txHash: `0x${'a'.repeat(64)}`,
+      nonce: 0,
+      phase: 'confirmed',
+      submittedAt: Date.now(),
+      updatedAt: Date.now()
+    } as const
+    vi.mocked(refreshPendingOps).mockResolvedValue({
+      views: [],
+      pendingNonceGap: 0,
+      unresolvedCount: 0,
+      confirmedOps: [{ ...confirmed, ids: [1] }]
+    })
+    const onConfirmed = vi.fn()
+    const scope = effectScope()
+    scope.run(() =>
+      usePendingTx(
+        () => confirmed.wallet,
+        () => 'eth',
+        onConfirmed
+      )
+    )
+    await vi.waitFor(() => expect(onConfirmed).toHaveBeenCalledWith([{ ...confirmed, ids: [1] }]))
     scope.stop()
   })
 })

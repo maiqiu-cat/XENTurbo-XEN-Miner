@@ -1,4 +1,5 @@
 import type { ChainKey } from '@/config/chains'
+import { shallowRef } from 'vue'
 
 // Client-side VMU lock (localStorage). Replaces the server-side lock of the
 // original platform. It prevents the same browser from double-spending VMU ids
@@ -65,8 +66,22 @@ function readAll(): LockRecord[] {
   }
 }
 
+const lockRevision = shallowRef(0)
+const subscribedWindows = new WeakSet<Window>()
+
+function observeLockChanges(): void {
+  void lockRevision.value
+  if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return
+  if (subscribedWindows.has(window)) return
+  subscribedWindows.add(window)
+  window.addEventListener('storage', (event) => {
+    if (event.key === KEY || event.key === null) lockRevision.value += 1
+  })
+}
+
 function writeAll(list: LockRecord[]): void {
   localStorage.setItem(KEY, JSON.stringify(list))
+  lockRevision.value += 1
 }
 
 const scope = (chain: ChainKey, wallet: string) => (l: LockRecord) =>
@@ -87,6 +102,7 @@ export function lockedIds(chain: ChainKey, wallet: string): Set<number> {
  * stays visible while the user confirms in MetaMask.
  */
 export function broadcastLockedIds(chain: ChainKey, wallet: string): Set<number> {
+  observeLockChanges()
   const set = new Set<number>()
   readAll()
     .filter(scope(chain, wallet))

@@ -5,6 +5,20 @@ import { describe, expect, it } from 'vitest'
 import TxModal from '@/components/TxModal.vue'
 
 describe('transaction modal cancellation', () => {
+  it('permits cancelling final send preflight before the wallet request opens', async () => {
+    const wrapper = mount(TxModal, {
+      props: {
+        visible: true,
+        chain: 'eth',
+        title: 'Claim',
+        state: { estimate: 'done', send: 'process', confirm: 'wait', walletPrompted: false }
+      }
+    })
+    const cancel = wrapper.findAll('button').find((button) => button.text() === 'Cancel')!
+    await cancel.trigger('click')
+    expect(wrapper.emitted('cancel')).toHaveLength(1)
+    expect(wrapper.text()).not.toContain('Waiting for MetaMask')
+  })
   it('lets the user cancel while transaction preparation is still running', async () => {
     const wrapper = mount(TxModal, {
       props: {

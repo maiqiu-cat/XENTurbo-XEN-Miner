@@ -1,5 +1,6 @@
 import type { ChainKey } from '@/config/chains'
 import type { Vmu } from './types'
+import { withReadDeadline } from './readDeadline'
 
 // Minimal IndexedDB wrapper used as a read-only cache of derived on-chain state.
 // The cache is always reconstructible from the chain, so it is safe to clear.
@@ -20,25 +21,55 @@ export interface CachedSnapshot {
 }
 
 let dbPromise: Promise<IDBDatabase> | null = null
+const CACHE_TIMEOUT_MS = 2_000
 
 function openDb(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise
-  dbPromise = new Promise((resolve, reject) => {
+  const flight = new Promise<IDBDatabase>((resolve, reject) => {
     if (typeof indexedDB === 'undefined') {
       reject(new Error('IndexedDB unavailable'))
       return
     }
     const req = indexedDB.open(DB_NAME, DB_VERSION)
+    let settled = false
+    const fail = (error: unknown) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(error)
+    }
+    const timer = setTimeout(() => fail(new Error('IndexedDB open timed out')), CACHE_TIMEOUT_MS)
+    req.onblocked = () => fail(new Error('IndexedDB upgrade is blocked by another tab'))
     req.onupgradeneeded = () => {
       const db = req.result
+      if (settled) {
+        req.transaction?.abort()
+        return
+      }
       if (!db.objectStoreNames.contains(STORE)) {
         db.createObjectStore(STORE, { keyPath: 'key' })
       }
     }
-    req.onsuccess = () => resolve(req.result)
-    req.onerror = () => reject(req.error)
+    req.onsuccess = () => {
+      if (settled) {
+        req.result.close()
+        return
+      }
+      settled = true
+      clearTimeout(timer)
+      req.result.onversionchange = () => {
+        req.result.close()
+        if (dbPromise === flight) dbPromise = null
+      }
+      resolve(req.result)
+    }
+    req.onerror = () => fail(req.error)
   })
-  return dbPromise
+  dbPromise = flight
+  void flight.catch(() => {
+    if (dbPromise === flight) dbPromise = null
+  })
+  return flight
 }
 
 const cacheKey = (chain: ChainKey, wallet: string) => `${chain}:${wallet.toLowerCase()}`
@@ -83,6 +114,7 @@ export function isCachedSnapshot(
     snapshot.wallet.toLowerCase() !== expectedWallet.toLowerCase() ||
     snapshot.key !== cacheKey(expectedChain, expectedWallet) ||
     !isNonNegativeSafeNumber(snapshot.vmuCount) ||
+    snapshot.vmuCount > 100_000 ||
     !Array.isArray(snapshot.vmus) ||
     snapshot.vmus.length !== snapshot.vmuCount ||
     !isNonNegativeSafeNumber(snapshot.syncedAt) ||
@@ -104,25 +136,31 @@ export async function loadSnapshot(
 ): Promise<CachedSnapshot | null> {
   try {
     const db = await openDb()
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, 'readonly')
-      const req = tx.objectStore(STORE).get(cacheKey(chain, wallet))
-      req.onsuccess = () => {
-        if (req.result == null) {
-          resolve(null)
-          return
-        }
-        if (isCachedSnapshot(req.result, chain, wallet)) {
-          resolve(req.result)
-          return
-        }
-        const cleanup = db.transaction(STORE, 'readwrite')
-        cleanup.objectStore(STORE).delete(cacheKey(chain, wallet))
-        cleanup.oncomplete = () => resolve(null)
-        cleanup.onerror = () => resolve(null)
-      }
-      req.onerror = () => reject(req.error)
-    })
+    return await withReadDeadline(
+      () =>
+        new Promise<CachedSnapshot | null>((resolve, reject) => {
+          const tx = db.transaction(STORE, 'readonly')
+          const req = tx.objectStore(STORE).get(cacheKey(chain, wallet))
+          req.onsuccess = () => {
+            if (req.result == null) {
+              resolve(null)
+              return
+            }
+            if (isCachedSnapshot(req.result, chain, wallet)) {
+              resolve(req.result)
+              return
+            }
+            const cleanup = db.transaction(STORE, 'readwrite')
+            cleanup.objectStore(STORE).delete(cacheKey(chain, wallet))
+            cleanup.oncomplete = () => resolve(null)
+            cleanup.onerror = () => resolve(null)
+          }
+          req.onerror = () => reject(req.error)
+          tx.onabort = () => reject(tx.error ?? new Error('IndexedDB read aborted'))
+        }),
+      'IndexedDB snapshot read',
+      { timeoutMs: CACHE_TIMEOUT_MS }
+    )
   } catch {
     return null
   }
@@ -138,16 +176,22 @@ export async function saveSnapshot(snapshot: {
 }): Promise<void> {
   try {
     const db = await openDb()
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(STORE, 'readwrite')
-      tx.objectStore(STORE).put({
-        ...snapshot,
-        version: 2,
-        key: cacheKey(snapshot.chain, snapshot.wallet)
-      })
-      tx.oncomplete = () => resolve()
-      tx.onerror = () => reject(tx.error)
-    })
+    await withReadDeadline(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          const tx = db.transaction(STORE, 'readwrite')
+          tx.objectStore(STORE).put({
+            ...snapshot,
+            version: 2,
+            key: cacheKey(snapshot.chain, snapshot.wallet)
+          })
+          tx.oncomplete = () => resolve()
+          tx.onerror = () => reject(tx.error)
+          tx.onabort = () => reject(tx.error ?? new Error('IndexedDB write aborted'))
+        }),
+      'IndexedDB snapshot write',
+      { timeoutMs: CACHE_TIMEOUT_MS }
+    )
   } catch {
     // Cache failures are non-fatal - state can always be re-read from chain.
   }
@@ -156,12 +200,18 @@ export async function saveSnapshot(snapshot: {
 export async function clearSnapshot(chain: ChainKey, wallet: string): Promise<void> {
   try {
     const db = await openDb()
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(STORE, 'readwrite')
-      tx.objectStore(STORE).delete(cacheKey(chain, wallet))
-      tx.oncomplete = () => resolve()
-      tx.onerror = () => reject(tx.error)
-    })
+    await withReadDeadline(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          const tx = db.transaction(STORE, 'readwrite')
+          tx.objectStore(STORE).delete(cacheKey(chain, wallet))
+          tx.oncomplete = () => resolve()
+          tx.onerror = () => reject(tx.error)
+          tx.onabort = () => reject(tx.error ?? new Error('IndexedDB delete aborted'))
+        }),
+      'IndexedDB snapshot delete',
+      { timeoutMs: CACHE_TIMEOUT_MS }
+    )
   } catch {
     // ignore
   }

@@ -1,5 +1,15 @@
 # XENTurbo XEN Miner
 
+Current release: **v1.1.3**. The page header displays the same version as the source package and Git release tag.
+
+### v1.1.3 Reliability And Security
+
+- Final transaction gas is estimated and simulated through the injected wallet. Configured RPC estimates remain advisory; gas prices remain wallet-selected.
+- Remote pending candidates are authenticated through the wallet before persistence. Receipt and replacement reconciliation use chain-bound wallet evidence; ambiguous and legacy records remain conservative.
+- Reads have bounded timeouts and cancellation. Corrupted RPC settings or blocked IndexedDB caches no longer prevent recovery; configured RPC lists are preserved on network failure.
+- Result verification reads the receipt block and checks requested mint terms, maturity and changed rank. Selected VMUs refresh incrementally when the wallet inventory is complete.
+- Existing contracts, chain support, wallet-signing consent and automatic GA loading are unchanged.
+
 A pure-frontend, open-source batch miner for XEN.
 
 XENTurbo Miner has no application backend and no user database. Mining state is

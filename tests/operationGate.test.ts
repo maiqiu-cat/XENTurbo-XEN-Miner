@@ -121,7 +121,7 @@ describe('operation gate', () => {
       writeFactory: vi.fn(async (params: { onRequestStart?: () => void }) => {
         params.onRequestStart?.()
         events.push('send')
-        return '0xhash'
+        return `0x${'a'.repeat(64)}`
       })
     }))
     vi.doMock('../src/core/rpc', () => ({
@@ -170,6 +170,16 @@ describe('operation gate', () => {
           events.push(`wallet:${method}`)
           if (method === 'eth_accounts') return [walletAddress]
           if (method === 'eth_chainId') return '0x1'
+          if (method === 'eth_getTransactionByHash') return null
+          if (method === 'eth_getTransactionReceipt')
+            return {
+              transactionHash: `0x${'a'.repeat(64)}`,
+              from: walletAddress,
+              to: '0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2',
+              status: '0x1',
+              blockNumber: '0x1',
+              blockHash: `0x${'b'.repeat(64)}`
+            }
           if (method === 'eth_getTransactionCount') return '0x7'
           if (method === 'eth_call') return feeResult
           throw new Error(`Unexpected wallet method: ${method}`)
@@ -186,7 +196,7 @@ describe('operation gate', () => {
       count: 1,
       term: 100,
       chainId: 1,
-      factoryAddress: '0x0000000000000000000000000000000000000001',
+      factoryAddress: '0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2',
       ...preparedContext(),
       gasLimit: 100_000n,
       fnName: 'bulkClaimRank',
@@ -196,7 +206,7 @@ describe('operation gate', () => {
       state: { estimate: 'done', send: 'wait', confirm: 'wait' }
     })
 
-    expect(events).toEqual([
+    expect(events.slice(0, events.indexOf('confirm') + 1)).toEqual([
       'lock:start',
       'local:pending',
       'wallet:eth_chainId',

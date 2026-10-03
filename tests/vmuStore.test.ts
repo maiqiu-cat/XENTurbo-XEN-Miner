@@ -7,6 +7,7 @@ const chainReader = vi.hoisted(() => ({
   readGlobalRank: vi.fn(),
   readChainTimestamp: vi.fn(),
   readWalletVmus: vi.fn(),
+  readVmuStates: vi.fn(),
   classifyVmuStatus: vi.fn((rank: number, maturityMs: number, chainTimestampMs: number) => {
     if (rank === 0) return 'EMPTY'
     return maturityMs + 1_000 > chainTimestampMs ? 'MINTING' : 'CLAIMABLE'
@@ -93,6 +94,55 @@ describe('vmu store request invalidation', () => {
     expect(rpcHealth.ensureHealthyReadProvider.mock.invocationCallOrder[0]).toBeLessThan(
       chainReader.readVmuCount.mock.invocationCallOrder[0]
     )
+  })
+
+  it.each([100, 1_000, 10_000])(
+    'refreshes one VMU without rescanning a complete %i-VMU wallet',
+    async (size) => {
+      const store = useVmuStore()
+      const vmus = Array.from({ length: size }, (_, index) => mintingVmu(index + 1))
+      store.$patch({
+        chain: 'eth',
+        wallet: walletA,
+        vmus,
+        vmuCount: vmus.length,
+        syncedAt: Date.now()
+      })
+      chainReader.readVmuCount.mockResolvedValue(vmus.length)
+      chainReader.readGlobalRank.mockResolvedValue(200)
+      chainReader.readVmuStates.mockResolvedValue([
+        { ...vmus[size - 1], status: 'EMPTY', rank: 0, maturityTs: 0 }
+      ])
+      await store.refreshAffected([size])
+      expect(chainReader.readWalletVmus).not.toHaveBeenCalled()
+      expect(chainReader.readVmuStates).toHaveBeenCalledWith(
+        'eth',
+        walletA,
+        [size],
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      )
+      expect(store.vmus).toHaveLength(size)
+      expect(store.vmus[size - 1].status).toBe('EMPTY')
+      store.detach()
+    }
+  )
+
+  it('falls back to a full scan when an external transaction changes the inventory', async () => {
+    const store = useVmuStore()
+    store.$patch({
+      chain: 'eth',
+      wallet: walletA,
+      vmus: [mintingVmu()],
+      vmuCount: 1,
+      syncedAt: Date.now()
+    })
+    chainReader.readVmuCount.mockResolvedValue(2)
+    chainReader.readGlobalRank.mockResolvedValue(200)
+    chainReader.readWalletVmus.mockResolvedValue([mintingVmu(1), mintingVmu(2)])
+    await store.refreshAffected([1])
+    expect(chainReader.readWalletVmus).toHaveBeenCalledOnce()
+    expect(store.vmuCount).toBe(2)
+    store.detach()
   })
 
   it('coalesces overlapping full refreshes for the same wallet and chain', async () => {

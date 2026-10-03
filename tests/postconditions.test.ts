@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const rpcHealth = vi.hoisted(() => ({
-  ensureHealthyReadProvider: vi.fn()
+  ensureRecentReadProvider: vi.fn(),
+  getReadProvider: vi.fn(),
+  withRetry: vi.fn((read) => read())
 }))
 
 vi.mock('@/core/rpc', () => rpcHealth)
@@ -12,12 +14,12 @@ import {
   type OutcomeOperation,
   type OperationOutcome
 } from '@/core/postconditions'
-import type { VmuStatus } from '@/core/types'
+import type { Vmu, VmuStatus } from '@/core/types'
 
 const wallet = '0x0000000000000000000000000000000000000001'
 
 beforeEach(() => {
-  rpcHealth.ensureHealthyReadProvider.mockReset().mockResolvedValue({})
+  rpcHealth.ensureRecentReadProvider.mockReset().mockResolvedValue({})
 })
 
 function operation(overrides: Partial<OutcomeOperation>): OutcomeOperation {
@@ -57,6 +59,48 @@ async function verify(
 }
 
 describe('operation postconditions', () => {
+  const blockHash = `0x${'b'.repeat(64)}`
+  const receipt = {
+    transactionHash: `0x${'a'.repeat(64)}`,
+    blockHash,
+    blockNumber: 42,
+    status: 1 as const
+  }
+  const timestamp = 1_800_000_000
+
+  it.each([null, { hash: `0x${'c'.repeat(64)}`, number: 42, timestamp }])(
+    'does not classify a lagging or reorganized receipt block as partial success',
+    async (block) => {
+      rpcHealth.getReadProvider.mockReturnValue({ getBlock: vi.fn(async () => block) })
+      const readStatuses = vi.fn()
+      const result = await verifyOperationOutcome(operation({ op: 'CLAIM', ids: [1], receipt }), {
+        readStatuses
+      })
+      expect(result.classification).toBe('uncertain')
+      expect(readStatuses).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each([
+    { term: 10, rank: 200, maturityTs: (timestamp + 10 * 86_400) * 1000, expected: 'full' },
+    { term: 9, rank: 200, maturityTs: (timestamp + 10 * 86_400) * 1000, expected: 'partial' },
+    { term: 10, rank: 100, maturityTs: (timestamp + 10 * 86_400) * 1000, expected: 'partial' },
+    { term: 10, rank: 200, maturityTs: (timestamp + 9 * 86_400) * 1000, expected: 'partial' }
+  ])('checks the new remint term, rank and maturity at the receipt block', async (mint) => {
+    rpcHealth.getReadProvider.mockReturnValue({
+      getBlock: vi.fn(async () => ({ hash: blockHash, number: 42, timestamp }))
+    })
+    const readStatuses = vi.fn(async () => new Map([[1, 'MINTING' as const]]))
+    const readStates = vi.fn(async () => [{ id: 1, readOk: true, ...mint } as unknown as Vmu])
+    const result = await verifyOperationOutcome(
+      operation({ op: 'CLAIM_REUSE', ids: [1], term: 10, receipt, beforeRanks: { 1: 100 } }),
+      { readStatuses, readStates }
+    )
+    expect(result.classification).toBe(mint.expected)
+    expect(readStatuses).toHaveBeenCalledWith('eth', wallet, [1], { blockTag: 42 })
+    expect(readStates).toHaveBeenCalledWith('eth', wallet, [1], { blockTag: 42 })
+  })
+
   it.each([
     {
       op: operation({ op: 'GENERAL_MINT', count: 3, preVmuCount: 7 }),
@@ -214,8 +258,8 @@ describe('operation postconditions', () => {
     expect(result.classification).toBe('partial')
     expect(result.matchingIds).toEqual([11])
     expect(result.unexpectedIds).toEqual([12])
-    expect(readStatuses).toHaveBeenCalledWith('eth', wallet, [11])
-    expect(readProxyDeployments).toHaveBeenCalledWith('eth', wallet, [11])
+    expect(readStatuses).toHaveBeenCalledWith('eth', wallet, [11], { blockTag: undefined })
+    expect(readProxyDeployments).toHaveBeenCalledWith('eth', wallet, [11], { blockTag: undefined })
   })
 
   it('skips status and code reads when empty-slot creation did not increase the factory count', async () => {
@@ -295,7 +339,7 @@ describe('postcondition retry', () => {
     })
 
     expect(result.classification).toBe('full')
-    expect(rpcHealth.ensureHealthyReadProvider).toHaveBeenCalledTimes(3)
+    expect(rpcHealth.ensureRecentReadProvider).toHaveBeenCalledTimes(3)
     expect(verify).toHaveBeenCalledTimes(3)
     expect(sleep).toHaveBeenNthCalledWith(1, 500)
     expect(sleep).toHaveBeenNthCalledWith(2, 1_500)
@@ -313,5 +357,19 @@ describe('postcondition retry', () => {
     expect(result.classification).toBe('partial')
     expect(verify).toHaveBeenCalledTimes(4)
     expect(sleep.mock.calls).toEqual([[500], [1_500], [3_000]])
+  })
+
+  it('reports inconsistent mismatches as uncertain instead of choosing the last answer', async () => {
+    const verify = vi
+      .fn()
+      .mockResolvedValueOnce(partial)
+      .mockResolvedValueOnce({ ...partial, unexpectedIds: [2] })
+      .mockResolvedValueOnce(partial)
+      .mockResolvedValueOnce({ ...partial, unexpectedIds: [2] })
+    const result = await verifyOperationOutcomeWithRetry(operation({ count: 1 }), {
+      verify,
+      sleep: async () => {}
+    })
+    expect(result.classification).toBe('uncertain')
   })
 })

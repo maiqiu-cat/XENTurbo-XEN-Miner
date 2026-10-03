@@ -21,6 +21,8 @@ function deferred<T>() {
 class MockInjectedProvider {
   accounts = [ACCOUNT_A]
   chainId = '0x1'
+  gasEstimate: unknown = '0x186a0'
+  blockGasLimit: unknown = '0x1c9c380'
   readonly failures = new Map<string, Error>()
   readonly listeners = new Map<string, Set<Listener>>()
 
@@ -30,6 +32,9 @@ class MockInjectedProvider {
 
     if (method === 'eth_accounts' || method === 'eth_requestAccounts') return [...this.accounts]
     if (method === 'eth_chainId') return this.chainId
+    if (method === 'eth_estimateGas') return this.gasEstimate
+    if (method === 'eth_getBlockByNumber') return { gasLimit: this.blockGasLimit }
+    if (method === 'eth_call') return '0x'
     if (method === 'wallet_switchEthereumChain') {
       const target = (params?.[0] as { chainId?: string } | undefined)?.chainId
       if (!target) throw new Error('Missing chain id')
@@ -69,6 +74,70 @@ afterEach(() => {
 })
 
 describe('injected wallet integration', () => {
+  it('estimates the strict batch and simulates it with the exact final send gas', async () => {
+    const provider = new MockInjectedProvider()
+    const abi = [
+      'function bulkClaimRank(uint256 term,uint256 count)',
+      'function bulkClaimRank_(uint256 term,uint256 count)'
+    ]
+    const iface = new Interface(abi)
+    const strictData = iface.encodeFunctionData('bulkClaimRank_', [10, 2])
+    const actualData = iface.encodeFunctionData('bulkClaimRank', [10, 2])
+    const original = provider.request.getMockImplementation()!
+    provider.request.mockImplementation(async (args) => {
+      if (args.method === 'eth_estimateGas')
+        return (args.params?.[0] as { data: string }).data === strictData ? '0x30d40' : '0x186a0'
+      return original(args)
+    })
+    installProvider(provider)
+    const { writeFactory } = await loadWallet()
+    await writeFactory({
+      chainId: 1,
+      address: FACTORY,
+      abi,
+      functionName: 'bulkClaimRank',
+      simulationFunctionName: 'bulkClaimRank_',
+      args: [10, 2],
+      gas: 1n
+    })
+    const sent = provider.request.mock.calls.find(
+      ([args]) => args.method === 'eth_sendTransaction'
+    )![0].params![0] as Record<string, string>
+    expect(sent.data).toBe(actualData)
+    expect(sent.gas).toBe(`0x${260000n.toString(16)}`)
+    expect(provider.request).toHaveBeenCalledWith({
+      method: 'eth_call',
+      params: [{ ...sent, data: strictData }, 'latest']
+    })
+  })
+
+  it('does not send when a bounded strict simulation fails despite permissive success', async () => {
+    const provider = new MockInjectedProvider()
+    const abi = ['function createVMUs(uint256 count)', 'function createVMUs_(uint256 count)']
+    const strictData = new Interface(abi).encodeFunctionData('createVMUs_', [2])
+    const original = provider.request.getMockImplementation()!
+    provider.request.mockImplementation(async (args) => {
+      if (args.method === 'eth_call' && (args.params?.[0] as { data: string }).data === strictData)
+        throw new Error('CALL_FAILED: incomplete batch')
+      return original(args)
+    })
+    installProvider(provider)
+    const { writeFactory } = await loadWallet()
+    await expect(
+      writeFactory({
+        chainId: 1,
+        address: FACTORY,
+        abi,
+        functionName: 'createVMUs',
+        simulationFunctionName: 'createVMUs_',
+        args: [2]
+      })
+    ).rejects.toThrow('incomplete batch')
+    expect(
+      provider.request.mock.calls.some(([args]) => args.method === 'eth_sendTransaction')
+    ).toBe(false)
+  })
+
   it('loads the initial account and chain directly from the injected provider', async () => {
     const provider = new MockInjectedProvider()
     provider.chainId = '0x89'
@@ -271,7 +340,7 @@ describe('injected wallet integration', () => {
           to: FACTORY,
           data,
           value: '0x5',
-          gas: '0x1d4c0',
+          gas: '0x1fbd0',
           nonce: '0x9',
           maxFeePerGas: '0x1e',
           maxPriorityFeePerGas: '0x4'
@@ -285,6 +354,9 @@ describe('injected wallet integration', () => {
     provider.request.mockImplementation(({ method }: Eip1193Request) => {
       if (method === 'eth_accounts') return Promise.resolve([ACCOUNT_A])
       if (method === 'eth_chainId') return Promise.resolve('0x1')
+      if (method === 'eth_estimateGas') return Promise.resolve('0x186a0')
+      if (method === 'eth_getBlockByNumber') return Promise.resolve({ gasLimit: '0x1c9c380' })
+      if (method === 'eth_call') return Promise.resolve('0x')
       if (method === 'eth_sendTransaction') throw new Error('synchronous provider failure')
       return Promise.reject(new Error(`Unexpected method: ${method}`))
     })
@@ -308,5 +380,52 @@ describe('injected wallet integration', () => {
 
     expect(onRequestStart).toHaveBeenCalledOnce()
     expect(onRequestSyncError).toHaveBeenCalledOnce()
+  })
+
+  it.each(['0x0', '0xffffffffffffffffffff', 'garbage', null])(
+    'rejects a malformed wallet gas estimate before creating a pending record: %s',
+    async (estimate) => {
+      const provider = new MockInjectedProvider()
+      provider.gasEstimate = estimate
+      installProvider(provider)
+      const { writeFactory } = await loadWallet()
+      const onRequestStart = vi.fn()
+      await expect(
+        writeFactory({
+          chainId: 1,
+          address: FACTORY,
+          abi: ['function createVMUs(uint256 count)'],
+          functionName: 'createVMUs',
+          args: [1n],
+          gas: 1n,
+          onRequestStart
+        })
+      ).rejects.toThrow()
+      expect(onRequestStart).not.toHaveBeenCalled()
+      expect(
+        provider.request.mock.calls.some(([request]) => request.method === 'eth_sendTransaction')
+      ).toBe(false)
+    }
+  )
+
+  it('does not fall back to public gas when wallet estimation or budgeted simulation fails', async () => {
+    const provider = new MockInjectedProvider()
+    provider.failures.set('eth_estimateGas', new Error('Wallet estimate unavailable'))
+    installProvider(provider)
+    const { writeFactory } = await loadWallet()
+    const params = {
+      chainId: 1,
+      address: FACTORY,
+      abi: ['function createVMUs(uint256 count)'],
+      functionName: 'createVMUs',
+      args: [1n],
+      gas: 21_000n,
+      onRequestStart: vi.fn()
+    }
+    await expect(writeFactory(params)).rejects.toThrow('Wallet estimate unavailable')
+    provider.failures.delete('eth_estimateGas')
+    provider.failures.set('eth_call', new Error('out of gas'))
+    await expect(writeFactory(params)).rejects.toThrow('out of gas')
+    expect(params.onRequestStart).not.toHaveBeenCalled()
   })
 })

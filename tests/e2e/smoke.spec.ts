@@ -1,5 +1,6 @@
 import { expect, test, type Page, type Route } from '@playwright/test'
 import { Interface } from 'ethers'
+import { computeProxyAddress, minimalProxyRuntimeCode } from '../../src/core/create2'
 
 const ACCOUNT_A = '0x1111111111111111111111111111111111111111'
 const ACCOUNT_B = '0x2222222222222222222222222222222222222222'
@@ -7,6 +8,8 @@ const ZERO_HASH = `0x${'0'.repeat(64)}`
 const TX_HASH = `0x${'a'.repeat(64)}`
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
 const FACTORY = '0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2'
+const VMU_TEMPLATE = '0x1D65d25b1D90Ef6Dd9F64b10d6B079a015085855'
+const BLOCK_TIMESTAMP = Math.floor(Date.now() / 1000)
 const MULTICALL = '0xcA11bde05977b3631167028862bE2a173976CA11'
 const XEN_BY_CHAIN = {
   1: '0x06450dEe7FD2Fb8E39061434BAbCFC05599a6Fb8',
@@ -43,10 +46,10 @@ declare global {
 
 function blockResult(chainId: number) {
   return {
-    hash: ZERO_HASH,
+    hash: `0x${'b'.repeat(64)}`,
     parentHash: ZERO_HASH,
     number: '0x1',
-    timestamp: `0x${Math.floor(Date.now() / 1_000).toString(16)}`,
+    timestamp: `0x${BLOCK_TIMESTAMP.toString(16)}`,
     nonce: '0x0000000000000000',
     difficulty: '0x0',
     gasLimit: '0x1c9c380',
@@ -62,6 +65,7 @@ function blockResult(chainId: number) {
 interface RpcMockState {
   successfulTx?: boolean
   confirmed?: boolean
+  operation?: 'GENERAL_MINT' | 'CREATE_EMPTY_SLOT' | 'MINT_EMPTY_SLOT' | 'CLAIM' | 'CLAIM_REUSE'
 }
 
 function contractReadResult(chainId: 1 | 137, params: unknown[], state: RpcMockState = {}): string {
@@ -71,7 +75,10 @@ function contractReadResult(chainId: 1 | 137, params: unknown[], state: RpcMockS
   if (to === FACTORY.toLowerCase()) {
     const parsed = factoryInterface.parseTransaction({ data })
     if (parsed?.name === 'vmuCount') {
-      return factoryInterface.encodeFunctionResult('vmuCount', [1n])
+      const allocated =
+        state.confirmed &&
+        (state.operation === 'GENERAL_MINT' || state.operation === 'CREATE_EMPTY_SLOT')
+      return factoryInterface.encodeFunctionResult('vmuCount', [allocated ? 3n : 1n])
     }
     if (parsed?.name === 'FEE') {
       return factoryInterface.encodeFunctionResult('FEE', [18_000_000_000_000n])
@@ -88,13 +95,30 @@ function contractReadResult(chainId: 1 | 137, params: unknown[], state: RpcMockS
     const calls = decoded.calls as Array<{ callData: string }>
     const results = calls.map(({ callData }) => {
       const [proxy] = xenInterface.decodeFunctionData('userMints', callData)
+      const firstProxy = computeProxyAddress({
+        factory: FACTORY,
+        vmuTemplate: VMU_TEMPLATE,
+        wallet: ACCOUNT_A,
+        vmuId: 1
+      })
+      const allocated =
+        state.operation === 'GENERAL_MINT' || state.operation === 'CREATE_EMPTY_SLOT'
+      const changed =
+        state.confirmed && (!allocated || proxy.toLowerCase() !== firstProxy.toLowerCase())
+      const minting =
+        changed &&
+        (state.operation === 'GENERAL_MINT' ||
+          state.operation === 'MINT_EMPTY_SLOT' ||
+          state.operation === 'CLAIM_REUSE')
+      const empty =
+        (state.operation === 'MINT_EMPTY_SLOT' && !state.confirmed) || (changed && !minting)
       return [
         true,
         xenInterface.encodeFunctionResult('userMints', [
           proxy,
-          state.confirmed ? 0n : 100n,
-          state.confirmed ? 0n : 1_700_000_000n,
-          state.confirmed ? 0n : 100n,
+          minting ? 10n : empty ? 0n : 100n,
+          minting ? BigInt(BLOCK_TIMESTAMP + 10 * 86_400) : empty ? 0n : 1_700_000_000n,
+          minting ? 200n : empty ? 0n : 100n,
           3_000n,
           0n
         ])
@@ -121,6 +145,13 @@ function rpcResult(
     case 'eth_getTransactionCount':
       return '0x0'
     case 'eth_getCode':
+      if (
+        state.confirmed &&
+        state.operation === 'CREATE_EMPTY_SLOT' &&
+        params[0] !== ACCOUNT_A &&
+        params[0] !== ACCOUNT_B
+      )
+        return minimalProxyRuntimeCode(VMU_TEMPLATE)
       return '0x'
     case 'eth_gasPrice':
     case 'eth_maxPriorityFeePerGas':
@@ -251,7 +282,7 @@ async function installInjectedWallet(
   options: { successfulSend?: boolean } = {}
 ): Promise<void> {
   await page.addInitScript(
-    ({ accountA, successfulSend, txHash }) => {
+    ({ accountA, successfulSend, txHash, countSelector }) => {
       type Listener = (...args: unknown[]) => void
       const listeners = new Map<string, Set<Listener>>()
       let accounts: string[] = []
@@ -267,7 +298,13 @@ async function installInjectedWallet(
       }
 
       const provider = {
-        async request({ method }: { method: string; params?: unknown[] }): Promise<unknown> {
+        async request({
+          method,
+          params
+        }: {
+          method: string
+          params?: unknown[]
+        }): Promise<unknown> {
           if (stalledMethods.has(method)) return new Promise(() => {})
           switch (method) {
             case 'eth_accounts':
@@ -279,7 +316,26 @@ async function installInjectedWallet(
               return chainId
             case 'eth_getTransactionCount':
               return '0x0'
+            case 'eth_estimateGas':
+              return '0x4c4b40'
+            case 'eth_getBlockByNumber':
+              return { gasLimit: '0x1c9c380' }
+            case 'eth_getTransactionByHash':
+              return null
+            case 'eth_getTransactionReceipt':
+              return successfulBroadcasts > 0
+                ? {
+                    transactionHash: txHash,
+                    blockHash: `0x${'b'.repeat(64)}`,
+                    blockNumber: '0x1',
+                    status: '0x1',
+                    from: accountA,
+                    to: '0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2'
+                  }
+                : null
             case 'eth_call':
+              if ((params?.[0] as { data?: string })?.data?.startsWith(countSelector))
+                return `0x${1n.toString(16).padStart(64, '0')}`
               return `0x${18_000_000_000_000n.toString(16).padStart(64, '0')}`
             case 'wallet_switchEthereumChain':
               return null
@@ -336,7 +392,12 @@ async function installInjectedWallet(
         }
       }
     },
-    { accountA: ACCOUNT_A, successfulSend: options.successfulSend ?? false, txHash: TX_HASH }
+    {
+      accountA: ACCOUNT_A,
+      successfulSend: options.successfulSend ?? false,
+      txHash: TX_HASH,
+      countSelector: factoryInterface.getFunction('vmuCount')!.selector
+    }
   )
 }
 
@@ -466,7 +527,7 @@ test('wallet initialization, connect, account changes, and chain changes update 
   await expect(page.getByRole('button', { name: '0x1111...1111' }).first()).toBeVisible()
   await expect(page.getByRole('combobox')).toHaveValue('eth')
   await page.waitForTimeout(250)
-  expect(nonceReads).toBe(2)
+  expect(nonceReads).toBe(0)
 
   await page.evaluate((account) => window.__walletMock.emitAccounts([account]), ACCOUNT_B)
   await expect(page.getByRole('button', { name: '0x2222...2222' }).first()).toBeVisible()
@@ -511,18 +572,16 @@ test('a stalled wallet nonce read times out without opening a transaction reques
 
   await expect(page.getByText('Estimate gas')).toBeVisible()
   await expect(page.locator('.steps .step-icon.run')).toHaveText('...')
-  await expect(page.getByText('Checking configured RPC availability...')).toBeVisible()
-  await expect(page.getByText('Configured RPC is available.')).toBeVisible()
-  await expect(page.getByText('Checking wallet network and pending transactions...')).toBeVisible()
+  await expect(page.getByText('Checking pending transactions through the wallet...')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Cancel' })).toBeVisible()
   await expect(
-    page.getByText('Wallet network and pending transaction check timed out after 15s', {
-      exact: true
-    })
+    page
+      .getByText(/READ_TIMEOUT: Wallet eth_getTransactionCount exceeded 15000 ms/, { exact: false })
+      .first()
   ).toBeVisible({ timeout: 17_000 })
   await expect(
     page.getByText(
-      'Preparation failed: Wallet network and pending transaction check timed out after 15s'
+      'Pending check failed: READ_TIMEOUT: Wallet eth_getTransactionCount exceeded 15000 ms'
     )
   ).toBeVisible()
   expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
@@ -636,7 +695,8 @@ test('cancel during the final pending check never opens a wallet request', async
 
   await expect(page.getByRole('button', { name: 'Open MetaMask & Sign' })).toHaveCount(0)
   await page.waitForTimeout(750)
-  await expect(page.getByText('Preparation cancelled. No transaction was submitted.')).toBeVisible()
+  await expect(page.locator('.modal-mask')).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
   expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
 })
 
@@ -661,7 +721,7 @@ test('a code-4001 wallet rejection reports failure without a successful broadcas
 })
 
 test('a successful claim is confirmed and its on-chain result is verified', async ({ page }) => {
-  const rpcState: RpcMockState = { successfulTx: true, confirmed: false }
+  const rpcState: RpcMockState = { successfulTx: true, confirmed: false, operation: 'CLAIM' }
   await emulateDesktopGoogleChrome(page)
   await mockSameOriginRpc(page, rpcState)
   await installInjectedWallet(page, { successfulSend: true })
@@ -680,6 +740,46 @@ test('a successful claim is confirmed and its on-chain result is verified', asyn
     .poll(() => page.evaluate(() => window.__walletMock.stats()))
     .toEqual({ sendAttempts: 1, successfulBroadcasts: 1 })
 })
+
+for (const operation of [
+  'GENERAL_MINT',
+  'CREATE_EMPTY_SLOT',
+  'MINT_EMPTY_SLOT',
+  'CLAIM_REUSE'
+] as const) {
+  test(`a successful ${operation} verifies the exact receipt-block result`, async ({ page }) => {
+    const state: RpcMockState = { successfulTx: true, confirmed: false, operation }
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page, state)
+    await installInjectedWallet(page, { successfulSend: true })
+    await page.goto('/')
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    if (operation === 'GENERAL_MINT') {
+      await page.getByLabel(/^Mint VMUs/).fill('2')
+      await page.getByLabel(/^Term \(days, max/).fill('10')
+      await page.getByRole('button', { name: 'Confirm Mint' }).click()
+    } else if (operation === 'CREATE_EMPTY_SLOT') {
+      await page.getByRole('button', { name: 'Slots Management' }).click()
+      await page.getByLabel(/^Create Empty Slots/).fill('2')
+      await page.getByRole('button', { name: 'Create Slots', exact: true }).click()
+    } else if (operation === 'MINT_EMPTY_SLOT') {
+      await page.getByRole('button', { name: 'Empty Slots Mint', exact: true }).click()
+      await page.getByLabel(/^Empty VMUs/).fill('1')
+      await page.getByLabel('Term (days)', { exact: true }).fill('10')
+      await page.getByRole('button', { name: 'Re-Mint Empty Slots' }).click()
+    } else {
+      await page.locator('tbody input[type="checkbox"]').first().check()
+      await page.locator('.reuse-term input').fill('10')
+      await page.getByRole('button', { name: 'Claim & Re-Mint (10d)' }).click()
+    }
+    await page.getByRole('button', { name: 'Open MetaMask & Sign' }).click()
+    await expect(page.getByText('Transaction result verified.')).toBeVisible()
+    expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+      sendAttempts: 1,
+      successfulBroadcasts: 1
+    })
+  })
+}
 
 test('two tabs serialize wallet sends with a shared Web Lock', async ({ page, context }) => {
   const second = await context.newPage()

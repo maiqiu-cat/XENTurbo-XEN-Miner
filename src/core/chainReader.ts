@@ -19,6 +19,13 @@ export const MAX_WALLET_VMU_COUNT = 100_000
 
 export type ProxyDeploymentStatus = 'DEPLOYED' | 'MISSING' | 'READ_ERROR'
 
+export interface ChainReadContext {
+  blockTag?: number
+  signal?: AbortSignal
+}
+const blockOverrides = (context: ChainReadContext) =>
+  context.blockTag === undefined ? {} : { blockTag: context.blockTag }
+
 export interface ReadProgress {
   loaded: number
   total: number
@@ -54,14 +61,20 @@ function throwIfAborted(signal?: AbortSignal): void {
 }
 
 /** Read factory.vmuCount(wallet) - the on-chain source of truth for VMU count. */
-export async function readVmuCount(chain: ChainKey, wallet: string): Promise<number> {
+export async function readVmuCount(
+  chain: ChainKey,
+  wallet: string,
+  context: ChainReadContext = {}
+): Promise<number> {
   const provider = getReadProvider(chain)
   const factory = new Contract(
     CONTRACTS[chain].factory,
     XENFactoryABI as unknown as any[],
     provider
   )
-  const count = await withRetry(() => factory.vmuCount(wallet))
+  const count = await withRetry(() => factory.vmuCount(wallet, blockOverrides(context)), {
+    signal: context.signal
+  })
   return assertVmuCount(count)
 }
 
@@ -70,7 +83,10 @@ export async function readGlobalRank(chain: ChainKey): Promise<number> {
   const provider = getReadProvider(chain)
   const xen = new Contract(CONTRACTS[chain].xenCrypto, XENCryptoABI as unknown as any[], provider)
   const rank = await withRetry(() => xen.globalRank())
-  return Number(rank)
+  const result = Number(rank)
+  if (!Number.isSafeInteger(result) || result < 0)
+    throw new Error('Invalid global rank returned by RPC')
+  return result
 }
 
 /** Read the per-VMU service fee (wei) charged by the factory. */
@@ -85,8 +101,14 @@ export async function readFee(chain: ChainKey): Promise<bigint> {
 }
 
 /** Latest block timestamp is the authoritative clock for maturity decisions. */
-export async function readChainTimestamp(chain: ChainKey): Promise<number> {
-  const block = await withRetry(() => getReadProvider(chain).getBlock('latest'))
+export async function readChainTimestamp(
+  chain: ChainKey,
+  context: ChainReadContext = {}
+): Promise<number> {
+  const block = await withRetry(
+    () => getReadProvider(chain).getBlock(context.blockTag ?? 'latest'),
+    { signal: context.signal }
+  )
   const timestamp = block?.timestamp
   if (!Number.isSafeInteger(timestamp) || timestamp! <= 0) {
     throw new Error('Latest block returned an invalid timestamp')
@@ -140,6 +162,12 @@ function decodeUserMint(
     const rank = Number(decoded.rank)
     const amplifier = Number(decoded.amplifier)
     const eaaRate = Number(decoded.eaaRate)
+    if (
+      [term, maturityTs, rank, amplifier, eaaRate].some(
+        (value) => !Number.isSafeInteger(value) || value < 0
+      )
+    )
+      return emptyVmu(id, address, false)
     return {
       id,
       address,
@@ -162,7 +190,8 @@ async function readVmuIds(
   wallet: string,
   ids: number[],
   chainTimestampMs: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  blockTag?: number
 ): Promise<Vmu[]> {
   if (!ids.length) return []
   const provider = getReadProvider(chain)
@@ -181,7 +210,11 @@ async function readVmuIds(
       callData: xenIface.encodeFunctionData('userMints', [proxy.address])
     }))
     try {
-      const results = (await withRetry(() => multicall.aggregate3(calls), { signal })) as {
+      throwIfAborted(signal)
+      const results = (await withRetry(
+        () => multicall.aggregate3(calls, blockOverrides({ blockTag })),
+        { signal }
+      )) as {
         success: boolean
         returnData: string
       }[]
@@ -189,6 +222,7 @@ async function readVmuIds(
         vmus.push(decodeUserMint(proxy.id, proxy.address, results[index], chainTimestampMs))
       })
     } catch {
+      throwIfAborted(signal)
       slice.forEach((proxy) => vmus.push(emptyVmu(proxy.id, proxy.address, false)))
     }
   }
@@ -299,23 +333,51 @@ export async function readWalletVmus(
 export async function readVmuStatuses(
   chain: ChainKey,
   wallet: string,
-  ids: number[]
+  ids: number[],
+  context: ChainReadContext = {}
 ): Promise<Map<number, VmuStatus>> {
-  const chainTimestampMs = await readChainTimestamp(chain)
-  const list = await readVmuIds(chain, wallet, ids, chainTimestampMs)
+  const list = await readVmuStates(chain, wallet, ids, context)
+  return new Map(list.map((v) => [v.id, v.status]))
+}
+
+export async function readVmuStates(
+  chain: ChainKey,
+  wallet: string,
+  ids: number[],
+  context: ChainReadContext = {}
+): Promise<Vmu[]> {
+  if (ids.length > MAX_WALLET_VMU_COUNT || ids.some((id) => !Number.isSafeInteger(id) || id <= 0))
+    throw new Error('Invalid VMU ids for bounded read')
+  const chainTimestampMs = await readChainTimestamp(chain, context)
+  const list = await readVmuIds(
+    chain,
+    wallet,
+    ids,
+    chainTimestampMs,
+    context.signal,
+    context.blockTag
+  )
   const failedIds = list.filter((vmu) => !vmu.readOk).map((vmu) => vmu.id)
   if (failedIds.length) {
     try {
-      const retried = await readVmuIds(chain, wallet, failedIds, chainTimestampMs)
+      const retried = await readVmuIds(
+        chain,
+        wallet,
+        failedIds,
+        chainTimestampMs,
+        context.signal,
+        context.blockTag
+      )
       const byId = new Map(retried.map((vmu) => [vmu.id, vmu]))
       for (let index = 0; index < list.length; index++) {
         list[index] = byId.get(list[index].id) ?? list[index]
       }
     } catch {
+      throwIfAborted(context.signal)
       // Preserve the first READ_ERROR markers for the caller to classify.
     }
   }
-  return new Map(list.map((v) => [v.id, v.status]))
+  return list
 }
 
 /**
@@ -325,7 +387,8 @@ export async function readVmuStatuses(
 export async function readVmuProxyDeployments(
   chain: ChainKey,
   wallet: string,
-  ids: number[]
+  ids: number[],
+  context: ChainReadContext = {}
 ): Promise<Map<number, ProxyDeploymentStatus>> {
   const results = new Map<number, ProxyDeploymentStatus>()
   if (!ids.length) return results
@@ -343,7 +406,11 @@ export async function readVmuProxyDeployments(
     const codes = await Promise.all(
       slice.map(async ({ address }) => {
         try {
-          return (await withRetry(() => provider.getCode(address))).toLowerCase()
+          return (
+            await withRetry(() => provider.getCode(address, context.blockTag), {
+              signal: context.signal
+            })
+          ).toLowerCase()
         } catch {
           return null
         }

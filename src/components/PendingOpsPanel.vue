@@ -96,7 +96,7 @@ const needsHash =
             <div class="detail mono">{{ op.detail || '—' }}</div>
           </div>
           <div class="age-box">
-            <span class="age">{{ pendingFor(op.submittedAt) }}</span>
+            <span class="age">{{ op.status === 'confirmed' ? 'confirmed on-chain' : pendingFor(op.submittedAt) }}</span>
             <span class="dim seen" :title="'Explorer First/Last Seen (indexed pending time)'">
               {{ seenAt(op.submittedAt) }}
             </span>

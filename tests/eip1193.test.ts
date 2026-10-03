@@ -110,7 +110,7 @@ function preparedOperation() {
     count: 1,
     term: 100,
     chainId: 1,
-    factoryAddress: '0x0000000000000000000000000000000000000001' as const,
+    factoryAddress: '0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2' as const,
     contextKey: `1:${SEND_WALLET}`,
     preparedAt,
     expiresAt: preparedAt + 120_000,
@@ -167,6 +167,16 @@ async function installSendHarness(options: {
   installProvider(async ({ method, params }) => {
     if (method === 'eth_accounts') return [SEND_WALLET]
     if (method === 'eth_chainId') return '0x1'
+    if (method === 'eth_getTransactionByHash') return null
+    if (method === 'eth_getTransactionReceipt')
+      return {
+        transactionHash: params?.[0],
+        from: SEND_WALLET,
+        to: preparedOperation().factoryAddress,
+        status: '0x1',
+        blockNumber: '0x1',
+        blockHash: `0x${'b'.repeat(64)}`
+      }
     if (method === 'eth_getTransactionCount') {
       const tag = params?.[1]
       const nonce =

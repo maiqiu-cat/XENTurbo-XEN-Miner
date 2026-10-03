@@ -5,7 +5,8 @@ import {
   markPendingOpDropped,
   refreshPendingOps,
   trackPendingTxHash,
-  type PendingOpView
+  type PendingOpView,
+  type PendingOpRecord
 } from '@/core/pendingOps'
 
 /**
@@ -14,7 +15,8 @@ import {
  */
 export function usePendingTx(
   address: () => string | null | undefined,
-  chain: () => ChainKey | null | undefined
+  chain: () => ChainKey | null | undefined,
+  onConfirmed?: (operations: PendingOpRecord[]) => void
 ) {
   const pendingCount = ref(0)
   const localUnresolvedCount = ref(0)
@@ -25,7 +27,8 @@ export function usePendingTx(
 
   let timer: ReturnType<typeof setTimeout> | null = null
   let gen = 0
-  let active: { generation: number; promise: Promise<number> } | null = null
+  let active: { generation: number; promise: Promise<number>; controller: AbortController } | null =
+    null
   let trailing = false
   const activePollMs = 8_000
   const idlePollMs = 30_000
@@ -39,7 +42,7 @@ export function usePendingTx(
     ops.value = []
   }
 
-  function check(options: { freshRpc?: boolean } = {}): Promise<number> {
+  function check(options: { freshRpc?: boolean; reverifyResults?: boolean } = {}): Promise<number> {
     const addr = address()
     const key = chain()
     if (!addr || !key) {
@@ -54,13 +57,15 @@ export function usePendingTx(
 
     checking.value = true
     error.value = null
-    const promise = refreshPendingOps(key, addr, options)
-      .then(({ views, pendingNonceGap, unresolvedCount }) => {
+    const controller = new AbortController()
+    const promise = refreshPendingOps(key, addr, { ...options, signal: controller.signal })
+      .then(({ views, pendingNonceGap, unresolvedCount, confirmedOps }) => {
         if (myGen !== gen) return pendingCount.value
         pendingCount.value = pendingNonceGap
         localUnresolvedCount.value = unresolvedCount
         ops.value = views
         lastCheckedAt.value = Date.now()
+        if (confirmedOps?.length) onConfirmed?.(confirmedOps)
         return pendingNonceGap
       })
       .catch((err: any) => {
@@ -77,7 +82,7 @@ export function usePendingTx(
           void check()
         }
       })
-    active = { generation: myGen, promise }
+    active = { generation: myGen, promise, controller }
     return promise
   }
 
@@ -96,6 +101,7 @@ export function usePendingTx(
   }
 
   function stopPolling() {
+    active?.controller.abort()
     gen += 1
     trailing = false
     checking.value = false

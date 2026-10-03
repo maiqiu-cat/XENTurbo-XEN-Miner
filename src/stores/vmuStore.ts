@@ -6,6 +6,7 @@ import {
   readGlobalRank,
   readVmuCount,
   readChainTimestamp,
+  readVmuStates,
   classifyVmuStatus
 } from '@/core/chainReader'
 import { loadSnapshot, saveSnapshot, clearSnapshot } from '@/core/idb'
@@ -310,6 +311,94 @@ export const useVmuStore = defineStore('vmu', {
         if (refreshFlights.get(this) === flight) refreshFlights.delete(this)
       }
       void promise.then(clearFlight, clearFlight)
+      return promise
+    },
+
+    /** Re-read only the affected ids when the cached wallet inventory is complete. */
+    async refreshAffected(ids: number[]) {
+      if (!this.chain || !this.wallet) return
+      const selected = [...new Set(ids)]
+      if (
+        !selected.length ||
+        selected.some((id) => !Number.isSafeInteger(id) || id <= 0) ||
+        this.vmus.length !== this.vmuCount ||
+        this.syncedAt === null
+      )
+        return this.refresh()
+      const chain = this.chain
+      const wallet = this.wallet
+      const oldCount = this.vmuCount
+      const newIds = selected.filter((id) => id > oldCount).sort((a, b) => a - b)
+      abortRefresh(this)
+      const controller = new AbortController()
+      const gen = ++this.refreshGen
+      const isCurrent = () =>
+        !controller.signal.aborted &&
+        gen === this.refreshGen &&
+        this.chain === chain &&
+        this.wallet === wallet
+      const promise = (async () => {
+        this.loading = true
+        this.error = null
+        try {
+          await ensureHealthyReadProvider(chain)
+          const [count, rank, timestamp] = await Promise.all([
+            readVmuCount(chain, wallet, { signal: controller.signal }),
+            readGlobalRank(chain).catch(() => null),
+            readChainTimestamp(chain, { signal: controller.signal })
+          ])
+          if (!isCurrent()) return
+          if (
+            count !== oldCount + newIds.length ||
+            newIds.some((id, index) => id !== oldCount + index + 1)
+          ) {
+            refreshFlights.delete(this)
+            return this.refresh()
+          }
+          const affected = await readVmuStates(chain, wallet, selected, {
+            signal: controller.signal
+          })
+          if (!isCurrent()) return
+          const updates = new Map(affected.map((vmu) => [vmu.id, vmu]))
+          if (updates.size !== selected.length) throw new Error('Incomplete affected VMU result')
+          const vmus = this.vmus.map((vmu) => {
+            const value = updates.get(vmu.id) ?? vmu
+            return value.readOk
+              ? { ...value, status: classifyVmuStatus(value.rank, value.maturityTs, timestamp) }
+              : value
+          })
+          for (const id of newIds) vmus.push(updates.get(id)!)
+          this.vmus = vmus
+          this.vmuCount = count
+          this.chainTimestampMs = timestamp
+          this.globalRank = rank ?? 0
+          this.rankAvailable = rank !== null
+          this.rankError = rank === null ? 'Global rank is unavailable on the active chain' : null
+          this.syncedAt = Date.now()
+          this.readErrors = vmus.filter((vmu) => !vmu.readOk || vmu.status === 'READ_ERROR').length
+          if (this.readErrors)
+            this.error = `${this.readErrors} VMU(s) failed to read. Refresh or check RPC.`
+          await saveSnapshot({
+            chain,
+            wallet,
+            vmuCount: count,
+            vmus,
+            syncedAt: this.syncedAt,
+            chainTimestampMs: timestamp
+          })
+          if (isCurrent()) this.scheduleMaturityRefresh()
+        } catch (error) {
+          if (isCurrent())
+            this.error = error instanceof Error ? error.message : 'Failed to refresh affected VMUs'
+        } finally {
+          if (isCurrent()) this.loading = false
+        }
+      })()
+      const flight = { chain, wallet, controller, promise }
+      refreshFlights.set(this, flight)
+      void promise.finally(() => {
+        if (refreshFlights.get(this) === flight) refreshFlights.delete(this)
+      })
       return promise
     },
 

@@ -69,7 +69,15 @@ const RPC_STORAGE_KEY = 'sm.customRpc'
 function readAllCustomRpc(): Record<string, string[]> {
   try {
     const raw = localStorage.getItem(RPC_STORAGE_KEY)
-    return raw ? (JSON.parse(raw) as Record<string, string[]>) : {}
+    const parsed: unknown = raw ? JSON.parse(raw) : {}
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const result: Record<string, string[]> = {}
+    for (const key of CHAIN_KEYS) {
+      const urls = (parsed as Record<string, unknown>)[key]
+      if (Array.isArray(urls))
+        result[key] = urls.filter((url): url is string => typeof url === 'string')
+    }
+    return result
   } catch {
     return {}
   }

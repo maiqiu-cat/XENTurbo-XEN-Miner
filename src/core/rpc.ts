@@ -1,5 +1,7 @@
-import { JsonRpcProvider, FallbackProvider, Network } from 'ethers'
+import { JsonRpcProvider, FallbackProvider, FetchRequest, Network } from 'ethers'
 import { CHAINS, getRpcUrls, normalizeHttpsRpcUrl, type ChainKey } from '@/config/chains'
+import { CONTRACTS } from '@/config/contracts'
+import { withReadDeadline } from './readDeadline'
 
 export type ReadProvider = JsonRpcProvider | FallbackProvider
 
@@ -88,10 +90,15 @@ export function onRpcHealthChange(listener: RpcHealthListener): () => void {
 
 function buildReadProvider(key: ChainKey, urls: string[]): ReadProvider {
   const network = Network.from(CHAINS[key].chainId)
-  if (urls.length === 1) return new JsonRpcProvider(urls[0], network)
+  const endpoint = (url: string) => {
+    const request = new FetchRequest(url)
+    request.timeout = 12_000
+    return new JsonRpcProvider(request, network)
+  }
+  if (urls.length === 1) return endpoint(urls[0])
 
   const configs = urls.map((url, index) => ({
-    provider: new JsonRpcProvider(url, network),
+    provider: endpoint(url),
     priority: index + 1,
     stallTimeout: 2500,
     weight: 1
@@ -148,7 +155,49 @@ async function requestChainId(url: string, timeoutMs = 8_000): Promise<unknown> 
   }
 }
 
-const requestHealthChainId: RpcChainIdRequest = (url) => requestChainId(url, RPC_HEALTH_TIMEOUT_MS)
+const requestHealthChainId: RpcChainIdRequest = async (url) => {
+  const chainId = await requestChainId(url, RPC_HEALTH_TIMEOUT_MS)
+  const chain = (Object.keys(CHAINS) as ChainKey[]).find(
+    (key) => CHAINS[key].chainId === parseRpcChainId(chainId)
+  )
+  if (!chain) throw new Error('Unsupported RPC chain')
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), RPC_HEALTH_TIMEOUT_MS)
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify([
+        { jsonrpc: '2.0', id: 2, method: 'eth_getBlockByNumber', params: ['latest', false] },
+        {
+          jsonrpc: '2.0',
+          id: 3,
+          method: 'eth_call',
+          params: [{ to: CONTRACTS[chain].factory, data: '0xc57981b5' }, 'latest']
+        }
+      ]),
+      signal: controller.signal
+    })
+    if (!response.ok) throw new Error(`RPC returned HTTP ${response.status}`)
+    const payload: unknown = await response.json()
+    if (!Array.isArray(payload)) throw new Error('RPC did not return health probe results')
+    const block = payload.find((item) => item?.id === 2)?.result
+    const fee = payload.find((item) => item?.id === 3)?.result
+    if (
+      !block ||
+      !/^0x[0-9a-f]+$/i.test(block.number) ||
+      !/^0x[0-9a-f]+$/i.test(block.timestamp) ||
+      !/^0x[0-9a-f]{64}$/i.test(block.hash)
+    ) {
+      throw new Error('RPC cannot read the latest block')
+    }
+    if (typeof fee !== 'string' || !/^0x[0-9a-f]{64}$/i.test(fee))
+      throw new Error('RPC cannot read the miner contract')
+    return chainId
+  } finally {
+    clearTimeout(timer)
+  }
+}
 
 function parseRpcChainId(value: unknown): number {
   if (typeof value !== 'string' || !/^0x[0-9a-f]+$/i.test(value)) {
@@ -387,6 +436,8 @@ export async function withRetry<T>(
     signal?: AbortSignal
     sleep?: (delayMs: number) => Promise<void>
     random?: () => number
+    timeoutMs?: number
+    totalTimeoutMs?: number
   } = {}
 ): Promise<T> {
   const retries = opts.retries ?? 3
@@ -396,13 +447,20 @@ export async function withRetry<T>(
   const random = opts.random ?? Math.random
   const sleep = opts.sleep ?? ((delayMs: number) => retryDelay(delayMs, opts.signal))
   let lastErr: unknown
+  const deadline = Date.now() + (opts.totalTimeoutMs ?? 30_000)
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (opts.signal?.aborted) throw abortReason(opts.signal)
     try {
-      return await fn()
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) throw new Error('READ_TIMEOUT: RPC retry deadline exceeded')
+      return await withReadDeadline(fn, 'RPC read', {
+        timeoutMs: Math.min(opts.timeoutMs ?? 12_000, remaining),
+        signal: opts.signal
+      })
     } catch (err) {
       lastErr = err
       if (attempt === retries || !isRetryableRpcError(err)) break
+      if (Date.now() >= deadline) break
       const exponential = Math.min(maxDelay, base * 2 ** attempt)
       const serverDelay = retryAfterMs(err)
       const nominal = serverDelay === null ? exponential : Math.min(maxDelay, serverDelay)

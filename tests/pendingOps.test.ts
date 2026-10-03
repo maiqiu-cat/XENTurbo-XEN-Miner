@@ -74,7 +74,12 @@ async function installPendingHarness(options: {
   receipt?: { status: number } | null | (() => Promise<{ status: number } | null>)
   transaction?: PendingTransaction | null | Promise<PendingTransaction | null>
   pendingBlock?: { transactions: unknown[] }
+  walletReceipt?: { status: number } | null
+  walletLatestNonce?: number
+  walletTransaction?: PendingTransaction | null
+  switchAndReturnDuringNonce?: boolean
 }) {
+  const walletListeners = new Map<string, (...args: unknown[]) => void>()
   const provider = {
     getTransactionCount: vi.fn(async (_wallet: string, tag: 'latest' | 'pending') =>
       tag === 'latest' ? options.latestNonce : options.pendingNonce
@@ -91,17 +96,61 @@ async function installPendingHarness(options: {
   const releaseLocksByTxHash = vi.fn()
   const releaseLock = vi.fn()
   const attachTxHash = vi.fn()
+  vi.stubGlobal('window', {
+    ethereum: {
+      on: vi.fn((event: string, listener: (...args: unknown[]) => void) =>
+        walletListeners.set(event, listener)
+      ),
+      removeListener: vi.fn((event: string) => walletListeners.delete(event)),
+      request: vi.fn(async ({ method, params }: { method: string; params?: unknown[] }) => {
+        if (method === 'eth_chainId') return '0x1'
+        if (method === 'eth_getTransactionCount') {
+          if (options.switchAndReturnDuringNonce) {
+            walletListeners.get('chainChanged')?.('0x89')
+            walletListeners.get('chainChanged')?.('0x1')
+          }
+          return `0x${(params?.[1] === 'latest' ? (options.walletLatestNonce ?? options.latestNonce) : options.pendingNonce).toString(16)}`
+        }
+        if (method === 'eth_getTransactionByHash') {
+          const tx = Object.hasOwn(options, 'walletTransaction')
+            ? options.walletTransaction
+            : await provider.getTransaction()
+          return tx
+            ? { ...tx, hash: params?.[0], input: tx.data, nonce: `0x${tx.nonce.toString(16)}` }
+            : null
+        }
+        if (method === 'eth_getTransactionReceipt') {
+          const receipt = Object.hasOwn(options, 'walletReceipt')
+            ? options.walletReceipt
+            : await provider.getTransactionReceipt()
+          return receipt
+            ? {
+                transactionHash: params?.[0],
+                from: WALLET,
+                to: CONTRACTS.eth.factory,
+                status: `0x${receipt.status.toString(16)}`,
+                blockNumber: '0x1',
+                blockHash: `0x${'b'.repeat(64)}`
+              }
+            : null
+        }
+        throw new Error(`Unexpected wallet method ${method}`)
+      })
+    }
+  })
 
   const ensureHealthyReadProvider = vi.fn(async () => provider)
   vi.doMock('../src/core/rpc', () => ({
     ensureHealthyReadProvider,
+    ensureRecentReadProvider: ensureHealthyReadProvider,
     getReadProvider: () => provider
   }))
   vi.doMock('../src/core/localLock', () => ({
     attachTxHash,
     pendingLocks: vi.fn(() => []),
     releaseLock,
-    releaseLocksByTxHash
+    releaseLocksByTxHash,
+    clearSoftLocks: vi.fn()
   }))
 
   const pending = await import('../src/core/pendingOps')
@@ -145,6 +194,190 @@ afterEach(() => {
 })
 
 describe('pending operation reconciliation', () => {
+  it.each([null, { status: 1 }])(
+    'legacy lock recovery requires wallet receipt evidence',
+    async (walletReceipt) => {
+      const { releaseLock } = await installPendingHarness({
+        latestNonce: 7,
+        pendingNonce: 8,
+        receipt: { status: 1 },
+        walletReceipt
+      })
+      const locks = await import('../src/core/localLock')
+      vi.mocked(locks.pendingLocks).mockReturnValue([
+        {
+          batch: 'old-lock',
+          chain: 'eth',
+          wallet: WALLET,
+          txHash: HASH,
+          ids: [7],
+          lockedAt: Date.now()
+        }
+      ])
+      const { resumePendingLocks } = await import('../src/core/txManager')
+      expect(await resumePendingLocks('eth', WALLET)).toBe(walletReceipt !== null)
+      if (walletReceipt) expect(releaseLock).toHaveBeenCalledWith('old-lock')
+      else expect(releaseLock).not.toHaveBeenCalled()
+    }
+  )
+
+  it('rejects replacement evidence when the wallet switches networks and switches back', async () => {
+    await installPendingHarness({
+      latestNonce: 8,
+      pendingNonce: 8,
+      switchAndReturnDuringNonce: true
+    })
+    const { readWalletEvidence } = await import('../src/core/walletEvidence')
+    await expect(
+      readWalletEvidence('eth', WALLET, HASH, { nonce: 7, nonceAuthoritative: true })
+    ).rejects.toThrow('WALLET_CONTEXT_CHANGED')
+  })
+
+  it('does not treat a requested but unobserved transaction nonce as replacement proof', async () => {
+    const { pending, releaseLocksByTxHash } = await installPendingHarness({
+      latestNonce: 8,
+      pendingNonce: 9
+    })
+    recordBroadcast(pending, { nonceAuthoritative: false })
+    await pending.refreshPendingOps('eth', WALLET)
+    expect(pending.listPendingOps('eth', WALLET)[0].phase).toBe('broadcast')
+    expect(releaseLocksByTxHash).not.toHaveBeenCalled()
+  })
+
+  it('reauthenticates old RPC-settled terminal records before tracking can release their locks', async () => {
+    const old = {
+      id: 'old-unverified',
+      chain: 'eth',
+      wallet: WALLET,
+      op: 'CLAIM',
+      ids: [7],
+      count: 0,
+      term: 0,
+      txHash: HASH,
+      nonce: 7,
+      phase: 'confirmed',
+      submittedAt: Date.now(),
+      updatedAt: Date.now()
+    }
+    vi.stubGlobal('localStorage', createStorage({ 'sm.pendingOps': JSON.stringify([old]) }))
+    const iface = new Interface(['function bulkClaimMintReward(uint256[] ids)'])
+    const { pending, releaseLocksByTxHash } = await installPendingHarness({
+      latestNonce: 7,
+      pendingNonce: 8,
+      walletReceipt: null,
+      walletTransaction: {
+        from: WALLET,
+        to: CONTRACTS.eth.factory,
+        data: iface.encodeFunctionData('bulkClaimMintReward', [[7]]),
+        nonce: 7
+      }
+    })
+    expect(pending.countUnresolvedPendingOps('eth', WALLET)).toBe(1)
+    await pending.trackPendingTxHash('eth', WALLET, HASH)
+    expect(pending.listPendingOps('eth', WALLET)[0].phase).toBe('broadcast')
+    expect(releaseLocksByTxHash).not.toHaveBeenCalled()
+  })
+
+  it('restores confirmed result warnings and only revalidates them on explicit recheck', async () => {
+    const { pending } = await installPendingHarness({
+      latestNonce: 8,
+      pendingNonce: 8,
+      walletReceipt: { status: 1 }
+    })
+    const { readWalletEvidence } = await import('../src/core/walletEvidence')
+    const { settlement } = await readWalletEvidence('eth', WALLET, HASH)
+    recordBroadcast(pending, { phase: 'confirmed', settlement, beforeRanks: { 7: 100 } })
+    const result = await pending.refreshPendingOps('eth', WALLET)
+    expect(result.unresolvedCount).toBe(0)
+    expect(result.views[0].status).toBe('confirmed')
+    expect(result.views[0].detail).toContain('result verification incomplete')
+    expect(pending.listPendingOps('eth', WALLET)[0].beforeRanks).toEqual({ 7: 100 })
+  })
+
+  it('does not settle or unlock from a public-only receipt or advanced nonce', async () => {
+    const { pending, releaseLocksByTxHash } = await installPendingHarness({
+      latestNonce: 8,
+      pendingNonce: 8,
+      walletLatestNonce: 7,
+      receipt: { status: 1 },
+      walletReceipt: null
+    })
+    recordBroadcast(pending)
+    await pending.refreshPendingOps('eth', WALLET)
+    expect(pending.listPendingOps('eth', WALLET)[0].phase).toBe('broadcast')
+    expect(releaseLocksByTxHash).not.toHaveBeenCalled()
+  })
+
+  it('rejects terminal phases without opaque wallet evidence at the shared write boundary', async () => {
+    const { pending } = await installPendingHarness({ latestNonce: 7, pendingNonce: 7 })
+    recordBroadcast(pending)
+    expect(() =>
+      recordBroadcast(pending, {
+        phase: 'confirmed',
+        settlement: { chain: 'eth', wallet: WALLET, txHash: HASH, nonce: 7, phase: 'confirmed' }
+      })
+    ).toThrow('WALLET_EVIDENCE_REQUIRED')
+    expect(pending.countUnresolvedPendingOps('eth', WALLET)).toBe(1)
+  })
+
+  it('does not promote forged remote discovery candidates to permanent blockers', async () => {
+    const data = new Interface(['function bulkClaimMintReward(uint256[] ids)']).encodeFunctionData(
+      'bulkClaimMintReward',
+      [[7n]]
+    )
+    const { pending } = await installPendingHarness({
+      latestNonce: 7,
+      pendingNonce: 8,
+      walletTransaction: null,
+      pendingBlock: {
+        transactions: [
+          { hash: HASH, from: WALLET, to: CONTRACTS.eth.factory, input: data, nonce: '0x7' }
+        ]
+      }
+    })
+    const result = await pending.refreshPendingOps('eth', WALLET)
+    expect(result.pendingNonceGap).toBe(1)
+    expect(result.views[0].id).toBe('unknown-pending')
+    expect(pending.listPendingOps('eth', WALLET)).toEqual([])
+  })
+
+  it('does not remove a manually tracked record based on a forged public receipt', async () => {
+    const { pending } = await installPendingHarness({
+      latestNonce: 7,
+      pendingNonce: 8,
+      receipt: { status: 1 },
+      walletReceipt: null,
+      walletTransaction: null
+    })
+    recordBroadcast(pending)
+    await expect(pending.trackPendingTxHash('eth', WALLET, HASH)).rejects.toThrow(
+      'Transaction not found through the wallet'
+    )
+    expect(pending.countUnresolvedPendingOps('eth', WALLET)).toBe(1)
+  })
+
+  it('does not treat an unauthenticated legacy nonce as replacement evidence', async () => {
+    const { pending } = await installPendingHarness({ latestNonce: 8, pendingNonce: 8 })
+    recordBroadcast(pending, { origin: 'legacy-unknown', nonceAuthoritative: false })
+    await pending.refreshPendingOps('eth', WALLET)
+    expect(pending.listPendingOps('eth', WALLET)[0].phase).toBe('broadcast')
+  })
+
+  it('bounds calldata and rejects unsafe or duplicate ids', async () => {
+    const { pending } = await installPendingHarness({ latestNonce: 0, pendingNonce: 0 })
+    const iface = new Interface(['function bulkClaimMintReward(uint256[] ids)'])
+    for (const ids of [
+      [1n, 1n],
+      [2n ** 60n],
+      [0n],
+      Array.from({ length: 1_001 }, (_, index) => BigInt(index + 1))
+    ]) {
+      expect(
+        pending.decodeFactoryCalldata(iface.encodeFunctionData('bulkClaimMintReward', [ids]))
+      ).toBeNull()
+    }
+  })
+
   it('persists awaiting-wallet and upgrades the same operation after broadcast', async () => {
     const { pending } = await installPendingHarness({ latestNonce: 7, pendingNonce: 7 })
 
@@ -503,6 +736,7 @@ describe('pending operation reconciliation', () => {
       txHash: `0x${(index + 2).toString(16).padStart(64, '0')}`,
       nonce: index,
       phase: 'confirmed',
+      origin: 'local',
       submittedAt: now - index * 1_000,
       updatedAt: now - index * 1_000
     }))
@@ -547,8 +781,15 @@ describe('pending operation reconciliation', () => {
   })
 
   it('refuses to downgrade a record that another tab already resolved', async () => {
-    const { pending } = await installPendingHarness({ latestNonce: 8, pendingNonce: 8 })
+    const { pending } = await installPendingHarness({
+      latestNonce: 8,
+      pendingNonce: 8,
+      receipt: { status: 1 }
+    })
     recordBroadcast(pending, { id: 'batch-1' })
+    const { settlement } = await (
+      await import('../src/core/walletEvidence')
+    ).readWalletEvidence('eth', WALLET, HASH)
     pending.recordPendingOp({
       id: 'batch-1',
       chain: 'eth',
@@ -559,7 +800,8 @@ describe('pending operation reconciliation', () => {
       term: 0,
       txHash: HASH,
       nonce: 7,
-      phase: 'confirmed'
+      phase: 'confirmed',
+      settlement
     })
 
     expect(pending.markPendingOpDropped('batch-1')).toBeNull()
@@ -567,8 +809,15 @@ describe('pending operation reconciliation', () => {
   })
 
   it('does not downgrade a confirmed record when a late broadcast event arrives', async () => {
-    const { pending } = await installPendingHarness({ latestNonce: 8, pendingNonce: 8 })
-    recordBroadcast(pending, { id: 'batch-1', phase: 'confirmed' })
+    const { pending } = await installPendingHarness({
+      latestNonce: 8,
+      pendingNonce: 8,
+      receipt: { status: 1 }
+    })
+    const { settlement } = await (
+      await import('../src/core/walletEvidence')
+    ).readWalletEvidence('eth', WALLET, HASH)
+    recordBroadcast(pending, { id: 'batch-1', phase: 'confirmed', settlement })
 
     recordBroadcast(pending, { id: 'batch-1', phase: 'broadcast' })
 
