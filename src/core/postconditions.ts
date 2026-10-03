@@ -81,7 +81,9 @@ function expectedStatusFor(op: OpType): ExpectedVmuStatus {
 function expectedIdsFor(prepared: OutcomeOperation): number[] {
   if (prepared.op !== 'GENERAL_MINT' && prepared.op !== 'CREATE_EMPTY_SLOT') {
     if (
+      prepared.ids.length === 0 ||
       prepared.ids.length > 1_000 ||
+      new Set(prepared.ids).size !== prepared.ids.length ||
       prepared.ids.some((id) => !Number.isSafeInteger(id) || id <= 0 || id > 100_000)
     )
       throw new Error('POSTCONDITION_INPUT_INVALID: VMU ids are outside the supported range')

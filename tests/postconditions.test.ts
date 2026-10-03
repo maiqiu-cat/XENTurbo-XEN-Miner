@@ -59,6 +59,17 @@ async function verify(
 }
 
 describe('operation postconditions', () => {
+  it.each([{ ids: [] }, { ids: [1, 1] }])(
+    'never reports a full result for empty or duplicate VMU ids $ids',
+    async ({ ids }) => {
+      const readStatuses = vi.fn()
+      await expect(
+        verifyOperationOutcome(operation({ op: 'CLAIM', ids }), { readStatuses })
+      ).rejects.toThrow('POSTCONDITION_INPUT_INVALID')
+      expect(readStatuses).not.toHaveBeenCalled()
+    }
+  )
+
   const blockHash = `0x${'b'.repeat(64)}`
   const receipt = {
     transactionHash: `0x${'a'.repeat(64)}`,

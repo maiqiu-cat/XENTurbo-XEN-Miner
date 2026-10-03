@@ -478,6 +478,88 @@ describe('pending operation reconciliation', () => {
     expect((await pending.refreshPendingOps('eth', WALLET)).unresolvedCount).toBe(0)
   })
 
+  it('does not verify cached operation metadata when only a wallet receipt is available', async () => {
+    const { pending } = await installPendingHarness({
+      latestNonce: 8,
+      pendingNonce: 8,
+      walletReceipt: { status: 1 },
+      walletTransaction: null
+    })
+    recordBroadcast(pending, { ids: [], origin: 'legacy-unknown', nonceAuthoritative: false })
+    await pending.refreshPendingOps('eth', WALLET)
+    const verify = vi.spyOn(
+      await import('../src/core/postconditions'),
+      'verifyOperationOutcomeWithRetry'
+    )
+
+    const result = await pending.refreshPendingOps('eth', WALLET, { reverifyResults: true })
+
+    expect(verify).not.toHaveBeenCalled()
+    expect(result.views[0].detail).toContain('verification incomplete')
+    expect(pending.listPendingOps('eth', WALLET)[0].outcome).toBeUndefined()
+  })
+
+  it('re-decodes authenticated wallet calldata before rechecking a cached confirmed operation', async () => {
+    const data = new Interface(['function bulkClaimMintReward(uint256[] ids)']).encodeFunctionData(
+      'bulkClaimMintReward',
+      [[9]]
+    )
+    const { pending } = await installPendingHarness({
+      latestNonce: 8,
+      pendingNonce: 8,
+      walletReceipt: { status: 1 },
+      walletTransaction: { from: WALLET, to: CONTRACTS.eth.factory, data, nonce: 7 }
+    })
+    const { settlement } = await (
+      await import('../src/core/walletEvidence')
+    ).readWalletEvidence('eth', WALLET, HASH)
+    recordBroadcast(pending, { ids: [], phase: 'confirmed', settlement })
+    const verify = vi
+      .spyOn(await import('../src/core/postconditions'), 'verifyOperationOutcomeWithRetry')
+      .mockResolvedValue({
+        classification: 'full',
+        expectedStatus: 'EMPTY',
+        expectedCount: 1,
+        expectedIds: [9],
+        matchingCount: 1,
+        matchingIds: [9],
+        unexpectedCount: 0,
+        unexpectedIds: [],
+        readErrorCount: 0,
+        readErrorIds: []
+      })
+
+    await pending.refreshPendingOps('eth', WALLET, { reverifyResults: true })
+
+    expect(verify).toHaveBeenCalledWith(
+      expect.objectContaining({ op: 'CLAIM', ids: [9] }),
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    )
+    expect(pending.listPendingOps('eth', WALLET)[0]).toMatchObject({
+      ids: [9],
+      outcome: { classification: 'full' }
+    })
+  })
+
+  it('re-decodes a mined transaction when manually tracking an old operation description', async () => {
+    const data = new Interface(['function bulkClaimMintReward(uint256[] ids)']).encodeFunctionData(
+      'bulkClaimMintReward',
+      [[9]]
+    )
+    const { pending } = await installPendingHarness({
+      latestNonce: 8,
+      pendingNonce: 8,
+      walletReceipt: { status: 1 },
+      walletTransaction: { from: WALLET, to: CONTRACTS.eth.factory, data, nonce: 7 }
+    })
+    recordBroadcast(pending, { ids: [7], origin: 'legacy-unknown', nonceAuthoritative: false })
+
+    expect(await pending.trackPendingTxHash('eth', WALLET, HASH)).toMatchObject({
+      ids: [9],
+      phase: 'confirmed'
+    })
+  })
+
   it('never inherits an old receipt or terminal phase for a different hash at the same client id', async () => {
     const { pending } = await installPendingHarness({
       latestNonce: 8,

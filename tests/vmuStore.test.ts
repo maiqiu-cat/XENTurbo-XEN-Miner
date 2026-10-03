@@ -196,6 +196,37 @@ describe('vmu store request invalidation', () => {
     await Promise.all([first, overlapping])
   })
 
+  it('queues a requested full scan after an in-flight targeted refresh', async () => {
+    const store = useVmuStore()
+    const selectedRead = deferred<Vmu[]>()
+    store.$patch({
+      chain: 'eth',
+      wallet: walletA,
+      vmus: [mintingVmu()],
+      vmuCount: 1,
+      syncedAt: Date.now()
+    })
+    chainReader.readVmuCount.mockResolvedValueOnce(1).mockResolvedValue(2)
+    chainReader.readGlobalRank.mockResolvedValue(100)
+    chainReader.readVmuStates.mockReturnValueOnce(selectedRead.promise)
+    chainReader.readWalletVmus.mockResolvedValue([mintingVmu(1), mintingVmu(2)])
+
+    const targeted = store.refreshAffected([1])
+    await vi.waitFor(() => expect(chainReader.readVmuStates).toHaveBeenCalled())
+    const full = store.refresh()
+    expect(chainReader.readWalletVmus).not.toHaveBeenCalled()
+    selectedRead.resolve([{ ...mintingVmu(), rank: 0, maturityTs: 0, status: 'EMPTY' }])
+    await Promise.all([targeted, full])
+
+    expect(chainReader.readWalletVmus).toHaveBeenCalledOnce()
+    expect(store.vmuCount).toBe(2)
+    expect(store.vmus.map((vmu) => vmu.id)).toEqual([1, 2])
+    expect(snapshots.saveSnapshot).toHaveBeenLastCalledWith(
+      expect.objectContaining({ vmuCount: 2 })
+    )
+    store.detach()
+  })
+
   it('does not apply a cached snapshot that resolves after detach', async () => {
     const cached = deferred<WalletSnapshot | null>()
     snapshots.loadSnapshot.mockReturnValueOnce(cached.promise)

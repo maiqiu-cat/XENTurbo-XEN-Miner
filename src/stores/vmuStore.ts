@@ -37,7 +37,13 @@ const OPERABLE: VmuStatus[] = ['EMPTY', 'MINTING', 'CLAIMABLE']
 let maturityTimer: ReturnType<typeof setTimeout> | null = null
 const refreshFlights = new WeakMap<
   object,
-  { chain: ChainKey; wallet: string; controller: AbortController; promise: Promise<void> }
+  {
+    chain: ChainKey
+    wallet: string
+    kind: 'full' | 'affected'
+    controller: AbortController
+    promise: Promise<void>
+  }
 >()
 
 function abortRefresh(store: object): void {
@@ -212,13 +218,20 @@ export const useVmuStore = defineStore('vmu', {
     },
 
     /** Full re-read from chain (source of truth). */
-    async refresh() {
+    async refresh(): Promise<void> {
       if (!this.chain || !this.wallet) return
       const chain = this.chain
       const wallet = this.wallet
       const existing = refreshFlights.get(this)
-      if (existing?.chain === chain && existing.wallet.toLowerCase() === wallet.toLowerCase()) {
-        return existing.promise
+      if (
+        existing?.chain === chain &&
+        existing.wallet.toLowerCase() === wallet.toLowerCase() &&
+        !existing.controller.signal.aborted
+      ) {
+        if (existing.kind === 'full') return existing.promise
+        await existing.promise
+        if (this.chain === chain && this.wallet === wallet) return this.refresh()
+        return
       }
 
       const controller = new AbortController()
@@ -305,7 +318,7 @@ export const useVmuStore = defineStore('vmu', {
         }
       })()
 
-      const flight = { chain, wallet, controller, promise }
+      const flight = { chain, wallet, kind: 'full' as const, controller, promise }
       refreshFlights.set(this, flight)
       const clearFlight = () => {
         if (refreshFlights.get(this) === flight) refreshFlights.delete(this)
@@ -406,7 +419,7 @@ export const useVmuStore = defineStore('vmu', {
           if (isCurrent()) this.loading = false
         }
       })()
-      const flight = { chain, wallet, controller, promise }
+      const flight = { chain, wallet, kind: 'affected' as const, controller, promise }
       refreshFlights.set(this, flight)
       void promise.finally(() => {
         if (refreshFlights.get(this) === flight) refreshFlights.delete(this)

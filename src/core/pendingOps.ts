@@ -584,8 +584,12 @@ export async function trackPendingTxHash(
     const existing = listPendingOps(chain, wallet).find(
       (record) => record.txHash.toLowerCase() === hash.toLowerCase()
     )
-    if (existing)
-      return toView(recordPendingOp({ ...existing, phase: settlement.phase, settlement }))
+    if (existing) {
+      const decoded = tx ? decodeFactoryCalldata(tx.input) : null
+      return toView(
+        recordPendingOp({ ...existing, ...decoded, phase: settlement.phase, settlement })
+      )
+    }
     throw new Error('This transaction is already mined (no longer pending)')
   }
   if (!tx) throw new Error('Transaction not found through the wallet. Check the hash / network.')
@@ -1038,18 +1042,26 @@ async function refreshPendingOpsWithinDeadline(
     if (options.reverifyResults) {
       for (const source of unverified) {
         try {
-          const { settlement } = await readWalletEvidence(chain, wallet, source.txHash, {
+          const { transaction, settlement } = await readWalletEvidence(
+            chain,
+            wallet,
+            source.txHash,
+            {
+              signal: options.signal
+            }
+          )
+          if (settlement?.phase !== 'confirmed' || !settlement.receipt) continue
+          const decoded = transaction ? decodeFactoryCalldata(transaction.input) : null
+          // Receipt identity proves settlement, not the operation described by old storage.
+          if (!decoded) continue
+          const authenticated = { ...source, ...decoded, receipt: settlement.receipt }
+          const outcome = await verifyOperationOutcomeWithRetry(authenticated, {
             signal: options.signal
           })
-          if (settlement?.phase !== 'confirmed' || !settlement.receipt) continue
-          const outcome = await verifyOperationOutcomeWithRetry(
-            { ...source, receipt: settlement.receipt },
-            { signal: options.signal }
-          )
           assertReadActive(options.signal)
           const current = readAll().find((record) => record.id === source.id)
           if (current && sameRecordRevision(current, source))
-            recordPendingOp({ ...source, phase: 'confirmed', settlement, outcome })
+            recordPendingOp({ ...authenticated, phase: 'confirmed', settlement, outcome })
         } catch {
           assertReadActive(options.signal)
         }
