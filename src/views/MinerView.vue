@@ -123,7 +123,7 @@ const {
             operation.preVmuCount! + operation.count > 100_000)
       )
     ) {
-      void store.refresh()
+      void store.refresh({ afterCurrent: true })
       return
     }
     const ids = matching.flatMap((operation) =>
@@ -188,7 +188,8 @@ watch(
       void store.load(key, addr)
       void resumePendingLocks(key, addr)
         .then((resolved) => {
-          if (resolved && wallet.address === addr && wallet.chainKey === key) store.refresh()
+          if (resolved && wallet.address === addr && wallet.chainKey === key)
+            store.refresh({ afterCurrent: true })
         })
         .catch(() => {})
       void checkPending()

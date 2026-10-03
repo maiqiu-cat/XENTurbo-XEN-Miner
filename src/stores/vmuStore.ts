@@ -218,7 +218,7 @@ export const useVmuStore = defineStore('vmu', {
     },
 
     /** Full re-read from chain (source of truth). */
-    async refresh(): Promise<void> {
+    async refresh(options: { afterCurrent?: boolean } = {}): Promise<void> {
       if (!this.chain || !this.wallet) return
       const chain = this.chain
       const wallet = this.wallet
@@ -228,9 +228,9 @@ export const useVmuStore = defineStore('vmu', {
         existing.wallet.toLowerCase() === wallet.toLowerCase() &&
         !existing.controller.signal.aborted
       ) {
-        if (existing.kind === 'full') return existing.promise
+        if (existing.kind === 'full' && !options.afterCurrent) return existing.promise
         await existing.promise
-        if (this.chain === chain && this.wallet === wallet) return this.refresh()
+        if (this.chain === chain && this.wallet === wallet) return this.refresh(options)
         return
       }
 

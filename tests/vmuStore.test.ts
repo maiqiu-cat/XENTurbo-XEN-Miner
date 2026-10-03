@@ -227,6 +227,28 @@ describe('vmu store request invalidation', () => {
     store.detach()
   })
 
+  it('queues a confirmation scan after a full scan that already captured an older count', async () => {
+    const store = useVmuStore()
+    const firstRead = deferred<Vmu[]>()
+    store.$patch({ chain: 'eth', wallet: walletA })
+    chainReader.readVmuCount.mockResolvedValueOnce(1).mockResolvedValue(2)
+    chainReader.readGlobalRank.mockResolvedValue(100)
+    chainReader.readWalletVmus
+      .mockReturnValueOnce(firstRead.promise)
+      .mockResolvedValue([mintingVmu(1), mintingVmu(2)])
+
+    const earlier = store.refresh()
+    await vi.waitFor(() => expect(chainReader.readWalletVmus).toHaveBeenCalledOnce())
+    const confirmed = store.refresh({ afterCurrent: true })
+    firstRead.resolve([mintingVmu()])
+    await Promise.all([earlier, confirmed])
+
+    expect(chainReader.readWalletVmus).toHaveBeenCalledTimes(2)
+    expect(store.vmuCount).toBe(2)
+    expect(store.vmus.map((vmu) => vmu.id)).toEqual([1, 2])
+    store.detach()
+  })
+
   it('does not apply a cached snapshot that resolves after detach', async () => {
     const cached = deferred<WalletSnapshot | null>()
     snapshots.loadSnapshot.mockReturnValueOnce(cached.promise)
