@@ -24,8 +24,6 @@ import MintList from '@/components/MintList.vue'
 import PendingOpsPanel from '@/components/PendingOpsPanel.vue'
 import { CONTRACTS } from '@/config/contracts'
 import { APP_VERSION } from '@/config/version'
-import { analyticsOperationName, analyticsRpcHealthState } from '@/core/minerAnalytics'
-import { trackAnalyticsEvent, type AnalyticsEventPayloads } from '@/core/analytics'
 
 const wallet = useWalletStore()
 const store = useVmuStore()
@@ -39,14 +37,6 @@ const readChain = computed<ChainKey>(() => activeChain.value ?? 'eth')
 const { gwei, loading: gweiLoading, poll: pollGas } = useGasPrice(() => readChain.value)
 const { state: rpcHealth, unavailable: rpcUnavailable } = useRpcHealth(() => readChain.value)
 
-watch(
-  () =>
-    [readChain.value, rpcHealth.value.checkedAt, analyticsRpcHealthState(rpcHealth.value)] as const,
-  ([, checkedAt, state]) => {
-    if (checkedAt !== null && state) trackAnalyticsEvent('rpc_health_state', { state })
-  }
-)
-
 const rpcHealthMessage = computed(() => {
   const state = rpcHealth.value
   if (state.error || (state.checkedAt !== null && state.healthyUrls.length === 0)) {
@@ -58,13 +48,13 @@ const rpcHealthMessage = computed(() => {
   return null
 })
 
-async function recheckRpc() {
+async function recheckRpc(restartReads = false) {
   const checks: Promise<unknown>[] = [pollGas()]
   if (wallet.address && activeChain.value) {
     checks.push(
       wallet.detectContractWallet(wallet.address, CHAINS[activeChain.value].chainId),
       checkPending(),
-      store.refresh()
+      store.refresh({ restart: restartReads })
     )
   }
   await Promise.allSettled(checks)
@@ -83,9 +73,6 @@ async function onChainSelect(ev: Event) {
   }
   try {
     await wallet.switchChain(next)
-    trackAnalyticsEvent('chain_selected', {
-      chain: next === 'eth' ? 'ethereum' : 'polygon'
-    })
   } catch {
     /* switchError set in store; select already restored */
   }
@@ -227,20 +214,6 @@ const canOperate = computed(
 
 let opSeq = 0
 const prepared = ref<PreparedOp | null>(null)
-type OperationStage = AnalyticsEventPayloads['miner_operation']['stage']
-type OperationAnalytics = {
-  seq: number
-  operation: AnalyticsEventPayloads['miner_operation']['operation']
-  sentStages: Set<OperationStage>
-}
-let activeOperationAnalytics: OperationAnalytics | null = null
-
-function trackOperationStage(context: OperationAnalytics, stage: OperationStage) {
-  if (context.sentStages.has(stage)) return
-  context.sentStages.add(stage)
-  trackAnalyticsEvent('miner_operation', { operation: context.operation, stage })
-}
-
 // Detach the old UI context, but preserve records for non-cancellable wallet sends.
 watch([() => wallet.address, () => wallet.chainKey, () => wallet.contextGen], () => {
   const walletRequestOpen = txState.value?.walletPrompted === true
@@ -250,13 +223,9 @@ watch([() => wallet.address, () => wallet.chainKey, () => wallet.contextGen], ()
     txState.value?.confirm === 'process' ||
     txState.value?.confirm === 'done'
   opSeq += 1
-  if (!busy.value && !prepared.value) {
-    activeOperationAnalytics = null
-    return
-  }
+  if (!busy.value && !prepared.value) return
   if (!walletRequestOpen && !broadcasted) abortPrepared(prepared.value)
   prepared.value = null
-  activeOperationAnalytics = null
   busy.value = false
   txState.value = null
   txVisible.value = false
@@ -272,12 +241,6 @@ async function operate(
   const requestedWallet = wallet.address
   const requestedContextGen = wallet.contextGen
   const seq = ++opSeq
-  const analyticsContext: OperationAnalytics = {
-    seq,
-    operation: analyticsOperationName(op),
-    sentStages: new Set()
-  }
-  activeOperationAnalytics = analyticsContext
   busy.value = true
   prepared.value = null
   txTitle.value = title
@@ -302,12 +265,9 @@ async function operate(
     activeChain.value !== requestedChain ||
     wallet.address?.toLowerCase() !== requestedWallet.toLowerCase()
   ) {
-    if (activeOperationAnalytics === analyticsContext) activeOperationAnalytics = null
     return
   }
   if (pendingError?.value) {
-    trackOperationStage(analyticsContext, 'failed')
-    activeOperationAnalytics = null
     busy.value = false
     txState.value = {
       estimate: 'error',
@@ -321,8 +281,6 @@ async function operate(
     return
   }
   if (n > 0) {
-    trackOperationStage(analyticsContext, 'failed')
-    if (activeOperationAnalytics === analyticsContext) activeOperationAnalytics = null
     txTitle.value = title
     txState.value = {
       estimate: 'error',
@@ -353,15 +311,11 @@ async function operate(
     )
     if (seq !== opSeq || wallet.contextGen !== requestedContextGen) {
       abortPrepared(prep)
-      if (activeOperationAnalytics === analyticsContext) activeOperationAnalytics = null
       return
     }
     prepared.value = prep
-    trackOperationStage(analyticsContext, 'prepared')
     // Keep busy=true while waiting for the user to click "Open MetaMask & Sign".
   } catch {
-    trackOperationStage(analyticsContext, 'failed')
-    if (activeOperationAnalytics === analyticsContext) activeOperationAnalytics = null
     if (seq === opSeq && wallet.contextGen === requestedContextGen) busy.value = false
     void checkPending()
   }
@@ -372,20 +326,10 @@ async function signPrepared() {
   const prep = prepared.value
   if (!prep) return
   const seq = opSeq
-  const analyticsContext =
-    activeOperationAnalytics?.seq === seq
-      ? activeOperationAnalytics
-      : {
-          seq,
-          operation: analyticsOperationName(prep.op),
-          sentStages: new Set<OperationStage>()
-        }
   const requestedContextGen = wallet.contextGen
   const n = await checkPending()
   if (seq !== opSeq || wallet.contextGen !== requestedContextGen || prepared.value !== prep) return
   if (n > 0 || pendingError?.value) {
-    trackOperationStage(analyticsContext, 'failed')
-    if (activeOperationAnalytics === analyticsContext) activeOperationAnalytics = null
     abortPrepared(prep)
     prepared.value = null
     busy.value = false
@@ -406,15 +350,11 @@ async function signPrepared() {
       onStep: (s) => {
         if (seq === opSeq && wallet.contextGen === requestedContextGen) {
           txState.value = s
-          if (s.walletPrompted) trackOperationStage(analyticsContext, 'wallet_opened')
-          if (s.txHash) trackOperationStage(analyticsContext, 'submitted')
-          if (s.confirm === 'done') trackOperationStage(analyticsContext, 'confirmed')
         }
       },
       isCancelled: () => seq !== opSeq || wallet.contextGen !== requestedContextGen
     })
   } catch {
-    trackOperationStage(analyticsContext, 'failed')
     // error in txState
   } finally {
     if (seq === opSeq && wallet.contextGen === requestedContextGen) {
@@ -428,7 +368,6 @@ async function signPrepared() {
       }
       void checkPending()
     }
-    if (activeOperationAnalytics === analyticsContext) activeOperationAnalytics = null
   }
 }
 
@@ -440,7 +379,6 @@ function cancelTx() {
   opSeq++
   abortPrepared(prepared.value)
   prepared.value = null
-  activeOperationAnalytics = null
   busy.value = false
   if (activeChain.value && wallet.address)
     clearAbandonedSoftLocks(activeChain.value, wallet.address)
@@ -530,7 +468,7 @@ const explorerAddrUrl = computed(() => {
         >
           <option v-for="k in CHAIN_KEYS" :key="k" :value="k">{{ CHAINS[k].name }}</option>
         </select>
-        <RpcSettings :chain="readChain" @saved="recheckRpc" />
+        <RpcSettings :chain="readChain" @saved="recheckRpc(true)" />
         <WalletButton />
       </div>
     </header>
@@ -544,7 +482,7 @@ const explorerAddrUrl = computed(() => {
       role="status"
     >
       <span>{{ rpcHealthMessage }}</span>
-      <button class="btn" :disabled="rpcHealth.checking" @click="recheckRpc">
+      <button class="btn" :disabled="rpcHealth.checking" @click="recheckRpc()">
         {{ rpcHealth.checking ? 'Checking...' : 'Recheck RPC' }}
       </button>
     </div>
@@ -566,9 +504,19 @@ const explorerAddrUrl = computed(() => {
     </div>
     <div
       v-else-if="wallet.isConnected && !wallet.contractWalletChecked && !rpcUnavailable"
-      class="card warn-card"
+      class="card warn-card wallet-wait-banner"
     >
-      Wallet type could not be verified. Recheck RPC before starting a transaction.
+      <span>
+        {{
+          wallet.contractWalletChecking
+            ? 'Checking wallet type through the read RPC...'
+            : (wallet.contractWalletError ??
+              'Wallet type could not be verified. Recheck before starting a transaction.')
+        }}
+      </span>
+      <button class="btn" :disabled="wallet.contractWalletChecking" @click="recheckRpc()">
+        Recheck wallet
+      </button>
     </div>
     <div v-if="!wallet.isConnected" class="card connect-card">
       <p>Connect an EOA wallet to start batch minting XEN.</p>

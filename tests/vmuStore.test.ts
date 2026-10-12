@@ -1,6 +1,7 @@
 import { createPinia, setActivePinia } from 'pinia'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Vmu, WalletSnapshot } from '@/core/types'
+import { READ_TIMEOUT_MS } from '@/core/readDeadline'
 
 const chainReader = vi.hoisted(() => ({
   readVmuCount: vi.fn(),
@@ -94,6 +95,29 @@ describe('vmu store request invalidation', () => {
     expect(rpcHealth.ensureHealthyReadProvider.mock.invocationCallOrder[0]).toBeLessThan(
       chainReader.readVmuCount.mock.invocationCallOrder[0]
     )
+  })
+
+  it('restarts a stalled scan after RPC settings change and ignores the old result', async () => {
+    const oldScan = deferred<Vmu[]>()
+    const store = useVmuStore()
+    store.$patch({ chain: 'eth', wallet: walletA })
+    chainReader.readVmuCount.mockResolvedValue(1)
+    chainReader.readGlobalRank.mockResolvedValue(100)
+    chainReader.readWalletVmus
+      .mockReturnValueOnce(oldScan.promise)
+      .mockResolvedValueOnce([{ ...mintingVmu(), term: 10 }])
+    const first = store.refresh()
+    await vi.waitFor(() => expect(chainReader.readWalletVmus).toHaveBeenCalledOnce())
+    const oldSignal = chainReader.readWalletVmus.mock.calls[0][2].signal as AbortSignal
+
+    await store.refresh({ restart: true })
+    expect(oldSignal.aborted).toBe(true)
+    expect(store.vmus[0].term).toBe(10)
+    oldScan.resolve([{ ...mintingVmu(), term: 100 }])
+    await first
+    expect(store.vmus[0].term).toBe(10)
+    expect(store.loading).toBe(false)
+    expect(chainReader.readWalletVmus).toHaveBeenCalledTimes(2)
   })
 
   it.each([100, 1_000, 10_000])(
@@ -425,5 +449,133 @@ describe('vmu store request invalidation', () => {
     expect(chainReader.readChainTimestamp).toHaveBeenCalledTimes(2)
     expect(store.chainTimestampMs).toBe(5_000)
     expect(store.vmus[0].status).toBe('CLAIMABLE')
+  })
+})
+
+describe('chain clock recovery', () => {
+  let store: ReturnType<typeof useVmuStore>
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+    rpcHealth.ensureHealthyReadProvider.mockReset().mockResolvedValue({})
+    chainReader.readChainTimestamp.mockReset().mockResolvedValue(2_000)
+    store = useVmuStore()
+    store.$patch({
+      chain: 'eth',
+      wallet: walletA,
+      vmus: [mintingVmu()],
+      vmuCount: 1,
+      syncedAt: 123,
+      chainTimestampMs: 1_000
+    })
+  })
+
+  afterEach(() => {
+    store.detach()
+    vi.useRealTimers()
+  })
+
+  it('coalesces resume reads without scanning VMUs or clearing selection context', async () => {
+    const timestamp = deferred<number>()
+    chainReader.readChainTimestamp.mockReturnValueOnce(timestamp.promise)
+    const first = store.refreshChainTime()
+    const second = store.refreshChainTime()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(chainReader.readChainTimestamp).toHaveBeenCalledOnce()
+    timestamp.resolve(2_000)
+    expect(await first).toBe(2_000)
+    expect(await second).toBe(2_000)
+    expect(store.chainTimestampMs).toBe(2_000)
+    expect(store.syncedAt).toBe(123)
+    expect(chainReader.readWalletVmus).not.toHaveBeenCalled()
+    expect(chainReader.readVmuStates).not.toHaveBeenCalled()
+    expect(snapshots.saveSnapshot).not.toHaveBeenCalled()
+  })
+
+  it.each(['health', 'timestamp'] as const)(
+    'times out a stalled %s read, ignores its late result and allows retry',
+    async (stage) => {
+      const late = deferred<number>()
+      if (stage === 'health') rpcHealth.ensureHealthyReadProvider.mockReturnValueOnce(late.promise)
+      else chainReader.readChainTimestamp.mockReturnValueOnce(late.promise)
+      const result = expect(store.refreshChainTime()).rejects.toThrow('READ_TIMEOUT')
+      await vi.advanceTimersByTimeAsync(READ_TIMEOUT_MS + 1)
+      await result
+      expect(store.chainTimestampMs).toBe(1_000)
+      expect(await store.refreshChainTime()).toBe(2_000)
+      late.resolve(99_000)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(store.chainTimestampMs).toBe(2_000)
+      expect(chainReader.readChainTimestamp).toHaveBeenCalledTimes(stage === 'health' ? 1 : 2)
+    }
+  )
+
+  it('does not replace chain time with the local clock after an RPC failure', async () => {
+    vi.setSystemTime(1_900_000_000_000)
+    chainReader.readChainTimestamp.mockRejectedValueOnce(new Error('RPC unavailable'))
+    await expect(store.refreshChainTime()).rejects.toThrow('RPC unavailable')
+    expect(store.chainTimestampMs).toBe(1_000)
+    expect(store.vmus[0].status).toBe('MINTING')
+    expect(store.syncedAt).toBe(123)
+  })
+
+  it('cancels a component-owned read and does not apply its late result', async () => {
+    const late = deferred<number>()
+    chainReader.readChainTimestamp.mockReturnValueOnce(late.promise)
+    const controller = new AbortController()
+    const first = store.refreshChainTime(controller.signal)
+    await vi.advanceTimersByTimeAsync(0)
+    controller.abort()
+    expect(await first).toBeNull()
+    expect(await store.refreshChainTime()).toBe(2_000)
+    late.resolve(99_000)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(store.chainTimestampMs).toBe(2_000)
+  })
+
+  it('does not apply an old account clock to a new wallet context', async () => {
+    const late = deferred<number>()
+    chainReader.readChainTimestamp.mockReturnValueOnce(late.promise)
+    const first = store.refreshChainTime()
+    await vi.advanceTimersByTimeAsync(0)
+    store.detach()
+    store.$patch({ chain: 'polygon', wallet: walletB, chainTimestampMs: 3_000 })
+    late.resolve(99_000)
+    expect(await first).toBeNull()
+    expect(store.chainTimestampMs).toBe(3_000)
+  })
+
+  it('lets a new full refresh supersede an in-flight clock read', async () => {
+    const late = deferred<number>()
+    chainReader.readChainTimestamp.mockReturnValueOnce(late.promise)
+    const clock = store.refreshChainTime()
+    await vi.advanceTimersByTimeAsync(0)
+    chainReader.readVmuCount.mockResolvedValue(1)
+    chainReader.readGlobalRank.mockResolvedValue(100)
+    chainReader.readWalletVmus.mockResolvedValue([mintingVmu()])
+    await store.refresh()
+    late.resolve(99_000)
+    expect(await clock).toBeNull()
+    expect(store.chainTimestampMs).toBe(2_000)
+    expect(chainReader.readWalletVmus).toHaveBeenCalledOnce()
+  })
+
+  it('waits for an existing scan before reading fresh chain time', async () => {
+    const scan = deferred<Vmu[]>()
+    chainReader.readVmuCount.mockResolvedValue(1)
+    chainReader.readGlobalRank.mockResolvedValue(100)
+    chainReader.readWalletVmus.mockReturnValueOnce(scan.promise)
+    const full = store.refresh()
+    await vi.advanceTimersByTimeAsync(0)
+    const clock = store.refreshChainTime()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(chainReader.readChainTimestamp).toHaveBeenCalledTimes(1)
+    scan.resolve([mintingVmu()])
+    await full
+    expect(await clock).toBe(2_000)
+    expect(chainReader.readChainTimestamp).toHaveBeenCalledTimes(3)
+    expect(chainReader.readWalletVmus).toHaveBeenCalledOnce()
   })
 })

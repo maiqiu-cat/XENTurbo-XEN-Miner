@@ -160,8 +160,8 @@ export async function initWallet(): Promise<void> {
   const initialAddressVersion = addressVersion
   const initialChainVersion = chainVersion
   const [accounts, rawChainId] = await Promise.all([
-    provider.request({ method: 'eth_accounts' }),
-    provider.request({ method: 'eth_chainId' })
+    withReadDeadline(() => provider.request({ method: 'eth_accounts' }), 'Initial wallet accounts'),
+    withReadDeadline(() => provider.request({ method: 'eth_chainId' }), 'Initial wallet network')
   ])
   if (getInjectedProvider() !== provider) {
     ensureObservedProvider()
@@ -197,7 +197,12 @@ export async function connectInjected(): Promise<void> {
   const accounts = await provider.request({ method: 'eth_requestAccounts' })
   const address = firstAccount(accounts)
   if (!address) throw new Error('No wallet account available. Reconnect your wallet.')
-  const chainId = parseChainId(await provider.request({ method: 'eth_chainId' }))
+  const chainId = parseChainId(
+    await withReadDeadline(
+      () => provider.request({ method: 'eth_chainId' }),
+      'Connected wallet network'
+    )
+  )
   if (getInjectedProvider() !== provider) {
     ensureObservedProvider()
     throw new Error('Wallet provider changed during connection. Retry the connection.')

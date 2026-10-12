@@ -16,11 +16,14 @@ const rpc = vi.hoisted(() => ({
 }))
 
 vi.mock('@/core/wallet', () => walletApi)
-vi.mock('@/core/rpc', () => ({
-  ensureHealthyReadProvider: rpc.ensureHealthyReadProvider
+vi.mock('@/core/rpc', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/core/rpc')>()),
+  ensureHealthyReadProvider: rpc.ensureHealthyReadProvider,
+  withRetry: (read: () => Promise<unknown>) => read()
 }))
 
 import { useWalletStore } from '@/stores/walletStore'
+import { resetProviders } from '@/core/rpc'
 
 const walletA = '0x0000000000000000000000000000000000000001'
 const walletB = '0x0000000000000000000000000000000000000002'
@@ -147,6 +150,67 @@ describe('wallet store request invalidation', () => {
     expect(store.isContractWallet).toBe(false)
     expect(store.contractWalletChecked).toBe(false)
   })
+
+  it.each([
+    { code: '0x', contractWallet: false },
+    { code: '0x6001600055', contractWallet: true },
+    { code: `0xef0100${'1'.repeat(40)}`, contractWallet: false }
+  ])(
+    'preserves EOA, contract-wallet and EIP-7702 detection for $code',
+    async ({ code, contractWallet }) => {
+      rpc.getCode.mockResolvedValue(code)
+      const store = useWalletStore()
+      await store.applyAccount(walletA, 1)
+      expect(store.contractWalletChecked).toBe(true)
+      expect(store.isContractWallet).toBe(contractWallet)
+      expect(store.contractWalletError).toBeNull()
+    }
+  )
+
+  it('coalesces repeated wallet type checks in the same context', async () => {
+    const detection = deferred<string>()
+    rpc.getCode.mockReturnValue(detection.promise)
+    const store = useWalletStore()
+    const apply = store.applyAccount(walletA, 1)
+    const recheck = store.detectContractWallet(walletA, 1)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(rpc.ensureHealthyReadProvider).toHaveBeenCalledOnce()
+    expect(rpc.getCode).toHaveBeenCalledOnce()
+    expect(store.contractWalletChecking).toBe(true)
+    expect(store.contractWalletChecked).toBe(false)
+
+    detection.resolve('0x')
+    await Promise.all([apply, recheck])
+    expect(store.contractWalletChecking).toBe(false)
+    expect(store.contractWalletChecked).toBe(true)
+  })
+
+  it.each(['success', 'failure'] as const)(
+    'rechecks a replacement RPC without applying a late old-provider %s',
+    async (outcome) => {
+      const oldDetection = deferred<string>()
+      const replacement = { getCode: vi.fn().mockResolvedValue('0x') }
+      rpc.getCode.mockReturnValueOnce(oldDetection.promise)
+      const store = useWalletStore()
+      const first = store.applyAccount(walletA, 1)
+      await vi.waitFor(() => expect(rpc.getCode).toHaveBeenCalledOnce())
+
+      resetProviders('eth')
+      rpc.ensureHealthyReadProvider.mockResolvedValue(replacement)
+      const recheck = store.detectContractWallet(walletA, 1)
+      if (outcome === 'success') oldDetection.resolve('0x6001600055')
+      else oldDetection.reject(new Error('Old provider was destroyed'))
+      await Promise.all([first, recheck])
+
+      expect(replacement.getCode).toHaveBeenCalledOnce()
+      expect(store.contractWalletChecked).toBe(true)
+      expect(store.isContractWallet).toBe(false)
+      expect(store.contractWalletChecking).toBe(false)
+      expect(store.contractWalletError).toBeNull()
+    }
+  )
 
   it('does not let an old switch rejection clear or overwrite a newer switch', async () => {
     rpc.getCode.mockResolvedValue('0x')

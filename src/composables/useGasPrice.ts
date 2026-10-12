@@ -2,32 +2,44 @@ import { ref, watch, onMounted, onUnmounted, type Ref } from 'vue'
 import { formatUnits } from 'ethers'
 import { ensureRecentReadProvider } from '@/core/rpc'
 import type { ChainKey } from '@/config/chains'
+import { assertReadActive, withReadDeadline } from '@/core/readDeadline'
 
 // Reads native gas price directly from RPC (no platform price API).
 export function useGasPrice(getChain: () => ChainKey | null) {
   const gwei = ref<string>('--')
   const loading = ref(false)
   let timer: ReturnType<typeof setInterval> | null = null
-  let active: { chain: ChainKey; promise: Promise<void> } | null = null
+  let active: { chain: ChainKey; controller: AbortController; promise: Promise<void> } | null = null
   /** Ignore stale responses after a fast chain switch. */
   let reqSeq = 0
 
   function poll(): Promise<void> {
     const chain = getChain()
     if (!chain) {
+      active?.controller.abort()
+      active = null
       reqSeq += 1
       gwei.value = '--'
       loading.value = false
       return Promise.resolve()
     }
     if (active?.chain === chain) return active.promise
+    active?.controller.abort()
 
     const seq = ++reqSeq
+    const controller = new AbortController()
     loading.value = true
     const promise = (async () => {
       try {
-        const provider = await ensureRecentReadProvider(chain, 30_000)
-        const fee = await provider.getFeeData()
+        const fee = await withReadDeadline(
+          async () => {
+            const provider = await ensureRecentReadProvider(chain, 30_000)
+            assertReadActive(controller.signal)
+            return provider.getFeeData()
+          },
+          'Gas price',
+          { signal: controller.signal }
+        )
         if (seq !== reqSeq || getChain() !== chain) return
         const price = fee.gasPrice ?? fee.maxFeePerGas
         gwei.value = price ? formatGwei(Number(formatUnits(price, 'gwei'))) : '--'
@@ -38,9 +50,10 @@ export function useGasPrice(getChain: () => ChainKey | null) {
         if (seq === reqSeq) loading.value = false
       }
     })()
-    const flight = { chain, promise }
+    const flight = { chain, controller, promise }
     active = flight
     const clearFlight = () => {
+      controller.abort()
       if (active === flight) active = null
     }
     void promise.then(clearFlight, clearFlight)
@@ -87,6 +100,10 @@ export function useGasPrice(getChain: () => ChainKey | null) {
   })
   onUnmounted(() => {
     stop()
+    reqSeq += 1
+    active?.controller.abort()
+    active = null
+    loading.value = false
     if (typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', onVisibilityChange)
     }

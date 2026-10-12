@@ -2,7 +2,6 @@
 import { computed } from 'vue'
 import { useWalletStore } from '@/stores/walletStore'
 import { shortenAddress } from '@/utils/format'
-import { trackAnalyticsEvent } from '@/core/analytics'
 
 const wallet = useWalletStore()
 const label = computed(() =>
@@ -13,18 +12,8 @@ async function connectWallet() {
   try {
     await wallet.connect()
   } catch {
-    trackAnalyticsEvent('wallet_connect_result', { result: 'error' })
-    return
+    // The wallet store owns the user-facing connection error.
   }
-
-  const result = wallet.isConnected
-    ? 'success'
-    : /rejected/i.test(wallet.connectError ?? '')
-      ? 'rejected'
-      : /no injected wallet/i.test(wallet.connectError ?? '')
-        ? 'no_wallet'
-        : 'error'
-  trackAnalyticsEvent('wallet_connect_result', { result })
 }
 </script>
 

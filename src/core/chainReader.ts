@@ -197,13 +197,13 @@ async function readVmuIds(
   const provider = getReadProvider(chain)
   const { factory, vmuTemplate, xenCrypto, multicall3 } = CONTRACTS[chain]
   const multicall = new Contract(multicall3, Multicall3ABI as unknown as any[], provider)
-  const proxies = ids.map((id) => ({
-    id,
-    address: computeProxyAddress({ factory, vmuTemplate, wallet, vmuId: id })
-  }))
   const vmus: Vmu[] = []
-  for (let start = 0; start < proxies.length; start += BATCH_SIZE) {
-    const slice = proxies.slice(start, start + BATCH_SIZE)
+  for (let start = 0; start < ids.length; start += BATCH_SIZE) {
+    throwIfAborted(signal)
+    const slice = ids.slice(start, start + BATCH_SIZE).map((id) => ({
+      id,
+      address: computeProxyAddress({ factory, vmuTemplate, wallet, vmuId: id })
+    }))
     const calls = slice.map((proxy) => ({
       target: xenCrypto,
       allowFailure: true,
@@ -218,6 +218,7 @@ async function readVmuIds(
         success: boolean
         returnData: string
       }[]
+      throwIfAborted(signal)
       slice.forEach((proxy, index) => {
         vmus.push(decodeUserMint(proxy.id, proxy.address, results[index], chainTimestampMs))
       })

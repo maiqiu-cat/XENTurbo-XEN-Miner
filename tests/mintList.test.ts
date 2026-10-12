@@ -1,12 +1,24 @@
 // @vitest-environment happy-dom
 
 import { createPinia, setActivePinia } from 'pinia'
-import { mount } from '@vue/test-utils'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { nextTick } from 'vue'
 import MintList from '@/components/MintList.vue'
 import { useVmuStore } from '@/stores/vmuStore'
 import { useWalletStore } from '@/stores/walletStore'
+
+const chainClock = vi.hoisted(() => ({ readChainTimestamp: vi.fn() }))
+vi.mock('@/core/chainReader', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/core/chainReader')>()),
+  readChainTimestamp: chainClock.readChainTimestamp
+}))
+vi.mock('@/core/rpc', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/core/rpc')>()),
+  ensureHealthyReadProvider: vi.fn().mockResolvedValue({})
+}))
+
+enableAutoUnmount(afterEach)
 
 const ACCOUNT_A = '0x1111111111111111111111111111111111111111'
 const ACCOUNT_B = '0x2222222222222222222222222222222222222222'
@@ -47,6 +59,11 @@ function mountClaimableList() {
 
 describe('MintList selection context', () => {
   beforeEach(() => setActivePinia(createPinia()))
+  afterEach(() => {
+    useVmuStore().detach()
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
 
   it('clears selected VMUs when the wallet account changes', async () => {
     const { wrapper, wallet } = mountClaimableList()
@@ -96,5 +113,132 @@ describe('MintList selection context', () => {
     await wrapper.get('button[aria-label="Next page"]').trigger('click')
     expect(wrapper.findAll('tbody tr')).toHaveLength(100)
     expect(wrapper.text()).toContain('Page 2 of 3')
+  })
+
+  it('uses chain time for the countdown even if the system clock is days ahead', async () => {
+    vi.useFakeTimers()
+    const chainTime = 1_800_000_000_000
+    vi.setSystemTime(chainTime + 2 * 86_400_000)
+    const { wrapper, store } = mountClaimableList()
+    store.$patch({
+      chainTimestampMs: chainTime,
+      syncedAt: Date.now(),
+      vmus: [{ ...store.vmus[0], status: 'MINTING', maturityTs: chainTime + 3_600_000 }]
+    })
+    await nextTick()
+
+    const row = wrapper.get('tbody tr')
+    expect(row.text()).toContain('Maturing')
+    expect(row.text()).toContain('1h 0m')
+    expect(row.text()).not.toContain('Matured')
+    expect(wrapper.find('input[type="checkbox"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('advances with a monotonic clock and waits for chain confirmation at maturity', async () => {
+    vi.useFakeTimers()
+    const chainTime = 1_800_000_000_000
+    let elapsed = 100
+    vi.spyOn(performance, 'now').mockImplementation(() => elapsed)
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    const { wrapper, store } = mountClaimableList()
+    store.$patch({
+      chainTimestampMs: chainTime,
+      vmus: [{ ...store.vmus[0], status: 'MINTING', maturityTs: chainTime + 60_000 }]
+    })
+    await nextTick()
+
+    elapsed += 30_000
+    vi.setSystemTime(chainTime + 20 * 86_400_000)
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(wrapper.get('tbody tr').text()).toContain('0m')
+    expect(wrapper.get('tbody tr').text()).not.toContain('Matured')
+
+    elapsed += 30_000
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(wrapper.get('tbody tr').text()).toContain('Awaiting chain confirmation')
+    expect(store.vmus[0].status).toBe('MINTING')
+    expect(wrapper.find('input[type="checkbox"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('reanchors to fresh chain time after sleep without rescanning VMUs', async () => {
+    vi.useFakeTimers()
+    const chainTime = 1_800_000_000_000
+    vi.setSystemTime(chainTime)
+    vi.spyOn(performance, 'now').mockReturnValue(100)
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    chainClock.readChainTimestamp.mockResolvedValue(chainTime + 3_600_000)
+    const { wrapper, store } = mountClaimableList()
+    store.$patch({
+      chainTimestampMs: chainTime,
+      vmus: [{ ...store.vmus[0], status: 'MINTING', maturityTs: chainTime + 7_200_000 }]
+    })
+    const refresh = vi.spyOn(store, 'refresh').mockResolvedValue()
+    store.scheduleMaturityRefresh()
+    await nextTick()
+    expect(wrapper.get('tbody tr').text()).toContain('2h 0m')
+
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
+    document.dispatchEvent(new Event('visibilitychange'))
+    await vi.advanceTimersByTimeAsync(3_600_000)
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    document.dispatchEvent(new Event('visibilitychange'))
+    await flushPromises()
+
+    expect(wrapper.get('tbody tr').text()).toContain('1h 0m')
+    expect(store.chainTimestampMs).toBe(chainTime + 3_600_000)
+    expect(refresh).not.toHaveBeenCalled()
+    expect(store.vmus[0].status).toBe('MINTING')
+    await vi.advanceTimersByTimeAsync(3_601_500)
+    expect(refresh).toHaveBeenCalledOnce()
+  })
+
+  it('keeps chain time unavailable after a failed resume and retries on focus', async () => {
+    vi.useFakeTimers()
+    const chainTime = 1_800_000_000_000
+    vi.setSystemTime(chainTime)
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    const { wrapper, store } = mountClaimableList()
+    store.$patch({
+      chainTimestampMs: chainTime,
+      vmus: [{ ...store.vmus[0], status: 'MINTING', maturityTs: chainTime + 3_600_000 }]
+    })
+    chainClock.readChainTimestamp.mockRejectedValueOnce(new Error('offline'))
+    window.dispatchEvent(new Event('focus'))
+    await flushPromises()
+    expect(wrapper.get('tbody tr').text()).toContain('Chain time unavailable')
+    expect(store.vmus[0].status).toBe('MINTING')
+    expect(wrapper.find('input[type="checkbox"]').exists()).toBe(false)
+
+    chainClock.readChainTimestamp.mockResolvedValueOnce(chainTime + 60_000)
+    window.dispatchEvent(new Event('focus'))
+    await flushPromises()
+    expect(wrapper.get('tbody tr').text()).toContain('59m')
+  })
+
+  it('coalesces resume events and cancels the read when unmounted', async () => {
+    vi.useFakeTimers()
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    const { wrapper, store } = mountClaimableList()
+    let finish!: (value: number) => void
+    chainClock.readChainTimestamp.mockClear().mockReturnValueOnce(
+      new Promise<number>((resolve) => {
+        finish = resolve
+      })
+    )
+    const previous = store.chainTimestampMs
+    window.dispatchEvent(new Event('focus'))
+    document.dispatchEvent(new Event('visibilitychange'))
+    await flushPromises()
+    expect(chainClock.readChainTimestamp).toHaveBeenCalledOnce()
+    wrapper.unmount()
+    finish(previous! + 60_000)
+    await flushPromises()
+    expect(store.chainTimestampMs).toBe(previous)
+    window.dispatchEvent(new Event('focus'))
+    document.dispatchEvent(new Event('visibilitychange'))
+    await flushPromises()
+    expect(chainClock.readChainTimestamp).toHaveBeenCalledOnce()
   })
 })

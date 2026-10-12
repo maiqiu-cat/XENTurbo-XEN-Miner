@@ -114,6 +114,10 @@ export function getReadProvider(key: ChainKey): ReadProvider {
   )
 }
 
+export function getRpcGeneration(key: ChainKey): number {
+  return providerGenerations.get(key) ?? 0
+}
+
 /** Drop cached providers (call after the user edits custom RPC URLs). */
 export function resetProviders(key?: ChainKey): void {
   const keys = key ? [key] : (Object.keys(CHAINS) as ChainKey[])

@@ -5,7 +5,10 @@ const batchState = vi.hoisted(() => ({
   peak: 0,
   calls: 0,
   failCalls: new Set<number>(),
-  ranges: [] as Array<{ fromId: number; toId: number }>
+  ranges: [] as Array<{ fromId: number; toId: number }>,
+  proxyIds: [] as number[],
+  retryDerivedCounts: [] as number[],
+  onCall: undefined as ((call: number) => void) | undefined
 }))
 
 vi.mock('ethers', async (importOriginal) => {
@@ -17,6 +20,8 @@ vi.mock('ethers', async (importOriginal) => {
     async aggregate3(calls: unknown[]) {
       batchState.calls += 1
       const call = batchState.calls
+      batchState.retryDerivedCounts.push(batchState.proxyIds.length)
+      batchState.onCall?.(call)
       batchState.active += 1
       batchState.peak = Math.max(batchState.peak, batchState.active)
       await new Promise((resolve) => setTimeout(resolve, 5))
@@ -39,7 +44,10 @@ vi.mock('ethers', async (importOriginal) => {
 })
 
 vi.mock('@/core/create2', () => ({
-  computeProxyAddress: vi.fn(),
+  computeProxyAddress: vi.fn(({ vmuId }: { vmuId: number }) => {
+    batchState.proxyIds.push(vmuId)
+    return `0x${vmuId.toString(16).padStart(40, '0')}`
+  }),
   computeProxyAddressRange: ({ fromId, toId }: { fromId: number; toId: number }) => {
     batchState.ranges.push({ fromId, toId })
     return Array.from({ length: toId - fromId + 1 }, (_, index) => ({
@@ -64,6 +72,9 @@ describe('wallet VMU batch reads', () => {
     batchState.calls = 0
     batchState.failCalls = new Set()
     batchState.ranges = []
+    batchState.proxyIds = []
+    batchState.retryDerivedCounts = []
+    batchState.onCall = undefined
   })
 
   it('runs large-wallet Multicall batches with bounded parallelism', async () => {
@@ -107,5 +118,35 @@ describe('wallet VMU batch reads', () => {
 
     await expect(scan).rejects.toMatchObject({ name: 'AbortError' })
     expect(batchState.calls).toBe(2)
+  })
+
+  it('derives failed VMU addresses lazily in retry-sized batches', async () => {
+    batchState.failCalls = new Set([1, 2, 3])
+    const vmus = await readWalletVmus('eth', '0x0000000000000000000000000000000000000002', {
+      vmuCount: 1_200,
+      chainTimestampMs: 1_000
+    })
+
+    expect(vmus).toHaveLength(1_200)
+    expect(vmus.every((vmu) => vmu.readOk)).toBe(true)
+    expect(batchState.retryDerivedCounts).toEqual([0, 0, 0, 400, 800, 1_200])
+  })
+
+  it('does not derive later retry batches after cancellation', async () => {
+    batchState.failCalls = new Set([1, 2, 3])
+    const controller = new AbortController()
+    batchState.onCall = (call) => {
+      if (call === 4) controller.abort()
+    }
+
+    await expect(
+      readWalletVmus('eth', '0x0000000000000000000000000000000000000002', {
+        vmuCount: 1_200,
+        chainTimestampMs: 1_000,
+        signal: controller.signal
+      })
+    ).rejects.toMatchObject({ name: 'AbortError' })
+    expect(batchState.calls).toBe(4)
+    expect(batchState.proxyIds).toHaveLength(400)
   })
 })

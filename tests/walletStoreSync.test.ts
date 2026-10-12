@@ -2,6 +2,7 @@ import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { Eip1193Request } from '../src/core/eip1193'
+import { READ_TIMEOUT_MS } from '../src/core/readDeadline'
 
 const ACCOUNT = '0x0000000000000000000000000000000000000001'
 
@@ -11,7 +12,9 @@ const rpc = vi.hoisted(() => ({
 }))
 
 vi.mock('@/core/rpc', () => ({
-  ensureHealthyReadProvider: rpc.ensureHealthyReadProvider
+  getRpcGeneration: () => 0,
+  ensureHealthyReadProvider: rpc.ensureHealthyReadProvider,
+  withRetry: (read: () => Promise<unknown>) => read()
 }))
 
 type Listener = (...args: unknown[]) => void
@@ -66,6 +69,7 @@ describe('wallet store injected state synchronization', () => {
   })
 
   afterEach(() => {
+    vi.useRealTimers()
     vi.unstubAllGlobals()
     vi.resetModules()
   })
@@ -111,5 +115,72 @@ describe('wallet store injected state synchronization', () => {
     expect(store.chainId).toBe(137)
     expect(store.switchingChain).toBe(false)
     expect(store.switchError).toBeNull()
+  })
+
+  it.each(['eth_accounts', 'eth_chainId'])(
+    'recovers from a stalled initial %s read without applying its late result',
+    async (method) => {
+      vi.useFakeTimers()
+      const provider = new SilentInjectedProvider()
+      const request = provider.request.getMockImplementation()!
+      let resolveLate!: (value: unknown) => void
+      let stalled = true
+      provider.request.mockImplementation((params) => {
+        if (params.method === method && stalled) {
+          return new Promise((resolve) => {
+            resolveLate = resolve
+          })
+        }
+        return request(params)
+      })
+      installProvider(provider)
+      const store = await loadStore()
+      const initialization = store.init()
+
+      await vi.advanceTimersByTimeAsync(READ_TIMEOUT_MS + 1)
+      expect(store.ready).toBe(true)
+      expect(store.connectError).toContain('READ_TIMEOUT')
+      await initialization
+
+      stalled = false
+      provider.requestedAccounts = ['0x0000000000000000000000000000000000000002']
+      provider.chainId = '0x89'
+      await store.connect()
+      resolveLate(method === 'eth_accounts' ? [ACCOUNT] : '0x1')
+      await Promise.resolve()
+
+      expect(store.address).toBe(provider.requestedAccounts[0])
+      expect(store.chainId).toBe(137)
+      expect(store.contractWalletChecked).toBe(true)
+      expect(store.connectError).toBeNull()
+    }
+  )
+
+  it('keeps a timed-out wallet type unchecked and allows a safe recheck', async () => {
+    vi.useFakeTimers()
+    let resolveLate!: (value: string) => void
+    rpc.getCode.mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        resolveLate = resolve
+      })
+    )
+    installProvider(new SilentInjectedProvider())
+    const store = await loadStore()
+    const initialization = store.init()
+
+    await vi.advanceTimersByTimeAsync(READ_TIMEOUT_MS + 1)
+    expect(store.ready).toBe(true)
+    expect(store.contractWalletChecked).toBe(false)
+    expect(store.contractWalletChecking).toBe(false)
+    expect(store.contractWalletError).toContain('timed out')
+    await initialization
+
+    await store.detectContractWallet(ACCOUNT, 1)
+    resolveLate('0x6001600055')
+    await Promise.resolve()
+
+    expect(store.contractWalletChecked).toBe(true)
+    expect(store.isContractWallet).toBe(false)
+    expect(store.contractWalletError).toBeNull()
   })
 })

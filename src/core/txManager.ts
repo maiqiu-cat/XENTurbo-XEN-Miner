@@ -1020,21 +1020,6 @@ export async function sendPreparedOperation(
       throw new Error('Transaction reverted on-chain')
     }
     log('Transaction confirmed on-chain. Verifying the resulting VMU state.', 'done')
-    recordPendingOp({
-      id: prepared.batch,
-      chain: prepared.chain,
-      wallet: prepared.wallet,
-      op: prepared.op,
-      ids: prepared.ids,
-      count: prepared.count,
-      term: prepared.term,
-      txHash,
-      nonce: broadcastNonce,
-      phase: 'confirmed',
-      settlement,
-      preVmuCount: prepared.preVmuCount
-    })
-    resolved = true
     try {
       state.outcome = await verifyOperationOutcomeWithRetry(prepared)
     } catch {

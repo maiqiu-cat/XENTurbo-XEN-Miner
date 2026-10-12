@@ -7,13 +7,16 @@ import {
   switchToChain,
   chainIdToKey
 } from '@/core/wallet'
-import { ensureHealthyReadProvider } from '@/core/rpc'
+import { ensureHealthyReadProvider, getRpcGeneration, withRetry } from '@/core/rpc'
+import { assertReadActive, withReadDeadline } from '@/core/readDeadline'
 
 interface State {
   address: string | null
   chainId: number | null
   isContractWallet: boolean
   contractWalletChecked: boolean
+  contractWalletChecking: boolean
+  contractWalletError: string | null
   ready: boolean
   connectError: string | null
   /** True while waiting for the wallet to approve / finish a chain switch. */
@@ -26,6 +29,14 @@ interface State {
 interface WalletStoreLifecycle {
   initializing?: Promise<void>
   unsubscribe?: () => void
+  detection?: {
+    contextGen: number
+    rpcGeneration: number
+    address: string
+    chainId: number
+    controller: AbortController
+    promise: Promise<void>
+  }
 }
 
 const walletStoreLifecycles = new WeakMap<object, WalletStoreLifecycle>()
@@ -55,6 +66,8 @@ export const useWalletStore = defineStore('wallet', {
     chainId: null,
     isContractWallet: false,
     contractWalletChecked: false,
+    contractWalletChecking: false,
+    contractWalletError: null,
     ready: false,
     connectError: null,
     switchingChain: false,
@@ -84,7 +97,10 @@ export const useWalletStore = defineStore('wallet', {
         try {
           await initWallet()
         } catch (err: any) {
-          this.connectError = err?.message || String(err)
+          const message = err?.message || String(err)
+          this.connectError = /READ_TIMEOUT/.test(message)
+            ? `${message}. Open your wallet extension, check network access, then retry Connect Wallet.`
+            : message
         } finally {
           this.ready = true
         }
@@ -98,11 +114,14 @@ export const useWalletStore = defineStore('wallet', {
     },
 
     async applyAccount(address?: string, chainId?: number) {
+      getWalletStoreLifecycle(this).detection?.controller.abort()
       const gen = ++this.contextGen
       this.address = address ?? null
       this.chainId = chainId ?? null
       this.isContractWallet = false
       this.contractWalletChecked = false
+      this.contractWalletChecking = false
+      this.contractWalletError = null
       this.switchingChain = false
       this.switchError = null
       if (address && chainId) {
@@ -115,11 +134,14 @@ export const useWalletStore = defineStore('wallet', {
     // (not the wallet RPC, which may be broken and cause false positives).
     async detectContractWallet(_address: string, chainId: number, requestedGen?: number) {
       const gen = requestedGen ?? this.contextGen
+      const key = chainIdToKey[chainId]
+      const rpcGeneration = key ? getRpcGeneration(key) : 0
       const isCurrent = () =>
         gen === this.contextGen &&
         this.address?.toLowerCase() === _address.toLowerCase() &&
-        this.chainId === chainId
-      const key = chainIdToKey[chainId]
+        this.chainId === chainId &&
+        (!key || getRpcGeneration(key) === rpcGeneration)
+      if (!isCurrent()) return
       if (!key) {
         if (isCurrent()) {
           this.isContractWallet = false
@@ -127,19 +149,67 @@ export const useWalletStore = defineStore('wallet', {
         }
         return
       }
-      try {
-        const provider = await ensureHealthyReadProvider(key)
-        const code = await provider.getCode(_address)
-        if (isCurrent()) {
-          this.isContractWallet = isContractCode(code)
-          this.contractWalletChecked = true
+      const lifecycle = getWalletStoreLifecycle(this)
+      const existing = lifecycle.detection
+      if (
+        existing?.contextGen === gen &&
+        existing.rpcGeneration === rpcGeneration &&
+        existing.address.toLowerCase() === _address.toLowerCase() &&
+        existing.chainId === chainId &&
+        !existing.controller.signal.aborted
+      )
+        return existing.promise
+      existing?.controller.abort()
+      const controller = new AbortController()
+      this.contractWalletChecked = false
+      this.contractWalletChecking = true
+      this.contractWalletError = null
+      const promise = (async () => {
+        try {
+          const code = await withReadDeadline(
+            async () => {
+              const provider = await ensureHealthyReadProvider(key)
+              assertReadActive(controller.signal)
+              return withRetry(() => provider.getCode(_address), {
+                retries: 1,
+                signal: controller.signal
+              })
+            },
+            'Wallet type verification',
+            { signal: controller.signal }
+          )
+          if (isCurrent() && !controller.signal.aborted) {
+            this.isContractWallet = isContractCode(code)
+            this.contractWalletChecked = true
+          }
+        } catch (error) {
+          if (isCurrent() && !controller.signal.aborted) {
+            this.isContractWallet = false
+            this.contractWalletChecked = false
+            this.contractWalletError =
+              error instanceof Error && /READ_TIMEOUT/.test(error.message)
+                ? 'Wallet type verification timed out. Check internet access and your RPC endpoints, then recheck.'
+                : 'Wallet type could not be verified. Check internet access and your RPC endpoints, then recheck.'
+          }
+        } finally {
+          if (isCurrent() && !controller.signal.aborted) this.contractWalletChecking = false
         }
-      } catch {
-        if (isCurrent()) {
-          this.isContractWallet = false
-          this.contractWalletChecked = false
-        }
+      })()
+      const flight = {
+        contextGen: gen,
+        rpcGeneration,
+        address: _address,
+        chainId,
+        controller,
+        promise
       }
+      lifecycle.detection = flight
+      const clearFlight = () => {
+        controller.abort()
+        if (lifecycle.detection === flight) lifecycle.detection = undefined
+      }
+      void promise.then(clearFlight, clearFlight)
+      return promise
     },
 
     async connect() {
