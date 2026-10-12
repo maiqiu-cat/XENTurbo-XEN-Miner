@@ -3,13 +3,13 @@ import { onMounted } from 'vue'
 import { useWalletStore } from '@/stores/walletStore'
 import ChromeGuard from '@/components/ChromeGuard.vue'
 import MinerView from '@/views/MinerView.vue'
-import { analytics } from '@/core/analytics'
+import { loadCloudflareAnalytics } from '@/core/cloudflareAnalytics'
 
 const wallet = useWalletStore()
 
 onMounted(() => {
   void wallet.init()
-  void analytics.grant().catch(() => {})
+  loadCloudflareAnalytics()
 })
 </script>
 

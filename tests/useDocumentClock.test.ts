@@ -9,6 +9,19 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
+function mountClock(onResume?: () => void) {
+  let clock!: ReturnType<typeof useDocumentClock>
+  const wrapper = mount(
+    defineComponent({
+      setup() {
+        clock = useDocumentClock(1_000, () => true, Date.now, onResume)
+        return () => h('div')
+      }
+    })
+  )
+  return { wrapper, clock }
+}
+
 describe('document clock', () => {
   it('stops ticking while hidden and catches up when visible again', async () => {
     vi.useFakeTimers()
@@ -17,15 +30,7 @@ describe('document clock', () => {
       configurable: true,
       value: 'visible'
     })
-    let clock!: ReturnType<typeof useDocumentClock>
-    const wrapper = mount(
-      defineComponent({
-        setup() {
-          clock = useDocumentClock(1_000)
-          return () => h('div')
-        }
-      })
-    )
+    const { wrapper, clock } = mountClock()
 
     await vi.advanceTimersByTimeAsync(1_000)
     expect(clock.value).toBe(2_000)
@@ -47,5 +52,26 @@ describe('document clock', () => {
     expect(clock.value).toBe(7_000)
 
     wrapper.unmount()
+  })
+
+  it('revalidates on focus or BFCache restore only when visible and removes listeners', () => {
+    const resume = vi.fn()
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
+    const { wrapper } = mountClock(resume)
+    window.dispatchEvent(new Event('focus'))
+    expect(resume).not.toHaveBeenCalled()
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    window.dispatchEvent(new Event('pageshow'))
+    expect(resume).not.toHaveBeenCalled()
+    const restored = new Event('pageshow')
+    Object.defineProperty(restored, 'persisted', { value: true })
+    window.dispatchEvent(restored)
+    window.dispatchEvent(new Event('focus'))
+    expect(resume).toHaveBeenCalledTimes(2)
+    wrapper.unmount()
+    window.dispatchEvent(restored)
+    window.dispatchEvent(new Event('focus'))
+    document.dispatchEvent(new Event('visibilitychange'))
+    expect(resume).toHaveBeenCalledTimes(2)
   })
 })

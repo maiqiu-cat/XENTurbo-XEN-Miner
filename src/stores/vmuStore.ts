@@ -12,6 +12,7 @@ import {
 import { loadSnapshot, saveSnapshot, clearSnapshot } from '@/core/idb'
 import { broadcastLockedIds } from '@/core/localLock'
 import { ensureHealthyReadProvider } from '@/core/rpc'
+import { assertReadActive, withReadDeadline } from '@/core/readDeadline'
 import { estimateGroupXen } from '@/utils/rewards'
 
 interface State {
@@ -45,6 +46,18 @@ const refreshFlights = new WeakMap<
     promise: Promise<void>
   }
 >()
+const clockFlights = new WeakMap<
+  object,
+  {
+    controller: AbortController
+    promise: Promise<number | null>
+  }
+>()
+
+function abortClockRefresh(store: object): void {
+  clockFlights.get(store)?.controller.abort()
+  clockFlights.delete(store)
+}
 
 function abortRefresh(store: object): void {
   refreshFlights
@@ -171,6 +184,7 @@ export const useVmuStore = defineStore('vmu', {
   },
   actions: {
     reset() {
+      abortClockRefresh(this)
       clearMaturityTimer()
       this.vmuCount = 0
       this.vmus = []
@@ -218,10 +232,11 @@ export const useVmuStore = defineStore('vmu', {
     },
 
     /** Full re-read from chain (source of truth). */
-    async refresh(options: { afterCurrent?: boolean } = {}): Promise<void> {
+    async refresh(options: { afterCurrent?: boolean; restart?: boolean } = {}): Promise<void> {
       if (!this.chain || !this.wallet) return
       const chain = this.chain
       const wallet = this.wallet
+      if (options.restart) abortRefresh(this)
       const existing = refreshFlights.get(this)
       if (
         existing?.chain === chain &&
@@ -235,6 +250,7 @@ export const useVmuStore = defineStore('vmu', {
       }
 
       const controller = new AbortController()
+      abortClockRefresh(this)
       const promise = (async () => {
         const gen = ++this.refreshGen
         const isCurrent = () =>
@@ -355,6 +371,7 @@ export const useVmuStore = defineStore('vmu', {
       const oldCount = this.vmuCount
       const newIds = selected.filter((id) => id > oldCount).sort((a, b) => a - b)
       abortRefresh(this)
+      abortClockRefresh(this)
       const controller = new AbortController()
       const gen = ++this.refreshGen
       const isCurrent = () =>
@@ -424,6 +441,58 @@ export const useVmuStore = defineStore('vmu', {
       void promise.finally(() => {
         if (refreshFlights.get(this) === flight) refreshFlights.delete(this)
       })
+      return promise
+    },
+
+    /** Re-anchor a resumed page without rescanning its complete VMU inventory. */
+    async refreshChainTime(signal?: AbortSignal): Promise<number | null> {
+      if (!this.chain || !this.wallet || signal?.aborted) return null
+      const existing = clockFlights.get(this)
+      if (existing && !existing.controller.signal.aborted) return existing.promise
+      const chain = this.chain
+      const wallet = this.wallet
+      const gen = this.refreshGen
+      const controller = new AbortController()
+      const abort = () => controller.abort()
+      signal?.addEventListener('abort', abort, { once: true })
+      const promise = (async () => {
+        try {
+          const timestamp = await withReadDeadline(
+            async () => {
+              const active = refreshFlights.get(this)
+              if (active) await active.promise
+              assertReadActive(controller.signal)
+              await ensureHealthyReadProvider(chain)
+              assertReadActive(controller.signal)
+              return readChainTimestamp(chain, { signal: controller.signal })
+            },
+            'Chain time refresh',
+            { signal: controller.signal }
+          )
+          if (
+            controller.signal.aborted ||
+            gen !== this.refreshGen ||
+            chain !== this.chain ||
+            wallet !== this.wallet
+          )
+            return null
+          this.chainTimestampMs = timestamp
+          this.scheduleMaturityRefresh()
+          return timestamp
+        } catch (error) {
+          if (controller.signal.aborted) return null
+          throw error
+        } finally {
+          signal?.removeEventListener('abort', abort)
+          controller.abort()
+        }
+      })()
+      const flight = { controller, promise }
+      clockFlights.set(this, flight)
+      const clearFlight = () => {
+        if (clockFlights.get(this) === flight) clockFlights.delete(this)
+      }
+      void promise.then(clearFlight, clearFlight)
       return promise
     },
 

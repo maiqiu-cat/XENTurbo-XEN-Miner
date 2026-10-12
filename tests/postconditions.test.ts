@@ -102,15 +102,38 @@ describe('operation postconditions', () => {
       getBlock: vi.fn(async () => ({ hash: blockHash, number: 42, timestamp }))
     })
     const readStatuses = vi.fn(async () => new Map([[1, 'MINTING' as const]]))
-    const readStates = vi.fn(async () => [{ id: 1, readOk: true, ...mint } as unknown as Vmu])
+    const readStates = vi.fn(async () => [
+      { id: 1, readOk: true, status: 'MINTING', ...mint } as unknown as Vmu
+    ])
     const result = await verifyOperationOutcome(
       operation({ op: 'CLAIM_REUSE', ids: [1], term: 10, receipt, beforeRanks: { 1: 100 } }),
       { readStatuses, readStates }
     )
     expect(result.classification).toBe(mint.expected)
-    expect(readStatuses).toHaveBeenCalledWith('eth', wallet, [1], { blockTag: 42 })
+    expect(readStatuses).not.toHaveBeenCalled()
     expect(readStates).toHaveBeenCalledWith('eth', wallet, [1], { blockTag: 42 })
+    expect(readStates).toHaveBeenCalledOnce()
   })
+
+  it.each([
+    { status: 'EMPTY' as const, readOk: true, expected: 'partial' },
+    { status: 'MINTING' as const, readOk: false, expected: 'uncertain' }
+  ])(
+    'classifies the single mint snapshot conservatively: $expected',
+    async ({ status, readOk, expected }) => {
+      const readStatuses = vi.fn(async () => new Map([[1, 'MINTING' as const]]))
+      const readStates = vi.fn(async () => [
+        { id: 1, status, readOk, term: 10, rank: 200, maturityTs: 1_800_000_000_000 } as Vmu
+      ])
+      const result = await verifyOperationOutcome(
+        operation({ op: 'CLAIM_REUSE', ids: [1], term: 10 }),
+        { readStatuses, readStates }
+      )
+      expect(result.classification).toBe(expected)
+      expect(readStates).toHaveBeenCalledOnce()
+      expect(readStatuses).not.toHaveBeenCalled()
+    }
+  )
 
   it.each([
     {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 import { useVmuStore } from '@/stores/vmuStore'
 import { useWalletStore } from '@/stores/walletStore'
 import type { VmuGroup } from '@/core/types'
@@ -21,7 +21,56 @@ const store = useVmuStore()
 const wallet = useWalletStore()
 type Filter = 'ALL' | 'CLAIMABLE' | 'MINTING'
 const filter = ref<Filter>('ALL')
-const now = useDocumentClock(30_000)
+const monotonicNow = useDocumentClock(
+  30_000,
+  () => store.chainTimestampMs !== null,
+  () => performance.now(),
+  () => void refreshClock()
+)
+const clockAnchor = ref<{ timestamp: number | null; observedAt: number }>({
+  timestamp: null,
+  observedAt: performance.now()
+})
+let clockRefresh: AbortController | null = null
+
+async function refreshClock() {
+  if (clockRefresh || !store.chain || !store.wallet) return
+  const controller = new AbortController()
+  clockRefresh = controller
+  clockAnchor.value = { timestamp: null, observedAt: performance.now() }
+  try {
+    const timestamp = await store.refreshChainTime(controller.signal)
+    if (!controller.signal.aborted && timestamp !== null) {
+      clockAnchor.value = { timestamp, observedAt: performance.now() }
+    }
+  } catch {
+    // Keep the clock unavailable until a subsequent chain read succeeds.
+  } finally {
+    if (clockRefresh === controller) clockRefresh = null
+  }
+}
+
+onUnmounted(() => clockRefresh?.abort())
+watch(
+  [() => store.chainTimestampMs, () => store.syncedAt, () => store.chain, () => store.wallet],
+  () => {
+    clockAnchor.value = { timestamp: store.chainTimestampMs, observedAt: performance.now() }
+  },
+  { immediate: true }
+)
+const chainNow = computed(() => {
+  const anchor = clockAnchor.value
+  return anchor.timestamp === null
+    ? null
+    : anchor.timestamp + Math.max(0, monotonicNow.value - anchor.observedAt)
+})
+
+function countdown(group: VmuGroup): string {
+  if (group.status === 'CLAIMABLE') return 'Matured'
+  if (chainNow.value === null) return 'Chain time unavailable'
+  if (chainNow.value >= group.maturityTs) return 'Awaiting chain confirmation'
+  return countdownTo(group.maturityTs, chainNow.value)
+}
 
 /** Term used for the next Claim & Re-Mint — edited next to the action button. */
 const reuseTerm = ref(DEFAULT_TERM)
@@ -207,7 +256,7 @@ function doClaimReuse() {
           <td class="mono">{{ g.term }}d</td>
           <td class="mono">
             {{ formatDate(g.maturityTs) }}
-            <span class="dim">({{ countdownTo(g.maturityTs, now) }})</span>
+            <span class="dim">({{ countdown(g) }})</span>
           </td>
           <td class="mono">{{ g.estXen === undefined ? 'Unavailable' : thousands(g.estXen) }}</td>
         </tr>

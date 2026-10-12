@@ -66,7 +66,6 @@ vi.mock('@/composables/usePendingTx', () => ({
     markDropped: vi.fn()
   })
 }))
-vi.mock('@/core/analytics', () => ({ trackAnalyticsEvent: vi.fn() }))
 
 import MinerView from '../src/views/MinerView.vue'
 import { useWalletStore } from '../src/stores/walletStore'

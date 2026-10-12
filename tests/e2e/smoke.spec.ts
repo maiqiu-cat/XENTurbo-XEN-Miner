@@ -1,4 +1,5 @@
 import { expect, test, type Page, type Route } from '@playwright/test'
+import { join } from 'node:path'
 import { Interface } from 'ethers'
 import { computeProxyAddress, minimalProxyRuntimeCode } from '../../src/core/create2'
 
@@ -27,6 +28,11 @@ const multicallInterface = new Interface([
   'function aggregate3(tuple(address target,bool allowFailure,bytes callData)[] calls) payable returns (tuple(bool success,bytes returnData)[] returnData)'
 ])
 
+async function captureQaScreenshot(page: Page, name: string): Promise<void> {
+  const directory = process.env.XENTURBO_QA_SCREENSHOT_DIR
+  if (directory) await page.screenshot({ path: join(directory, `${name}.png`), fullPage: true })
+}
+
 interface WalletMockStats {
   sendAttempts: number
   successfulBroadcasts: number
@@ -41,15 +47,16 @@ declare global {
       setSendDelay(delayMs: number): void
       stats(): WalletMockStats
     }
+    __confirmedWrites: Array<{ id: string; hasOutcome: boolean }>
   }
 }
 
-function blockResult(chainId: number) {
+function blockResult(chainId: number, timestamp = BLOCK_TIMESTAMP) {
   return {
     hash: `0x${'b'.repeat(64)}`,
     parentHash: ZERO_HASH,
     number: '0x1',
-    timestamp: `0x${BLOCK_TIMESTAMP.toString(16)}`,
+    timestamp: `0x${timestamp.toString(16)}`,
     nonce: '0x0000000000000000',
     difficulty: '0x0',
     gasLimit: '0x1c9c380',
@@ -66,6 +73,8 @@ interface RpcMockState {
   successfulTx?: boolean
   confirmed?: boolean
   operation?: 'GENERAL_MINT' | 'CREATE_EMPTY_SLOT' | 'MINT_EMPTY_SLOT' | 'CLAIM' | 'CLAIM_REUSE'
+  blockTimestamp?: number
+  maturityTimestamp?: number
 }
 
 function contractReadResult(chainId: 1 | 137, params: unknown[], state: RpcMockState = {}): string {
@@ -117,7 +126,11 @@ function contractReadResult(chainId: 1 | 137, params: unknown[], state: RpcMockS
         xenInterface.encodeFunctionResult('userMints', [
           proxy,
           minting ? 10n : empty ? 0n : 100n,
-          minting ? BigInt(BLOCK_TIMESTAMP + 10 * 86_400) : empty ? 0n : 1_700_000_000n,
+          minting
+            ? BigInt(BLOCK_TIMESTAMP + 10 * 86_400)
+            : empty
+              ? 0n
+              : BigInt(state.maturityTimestamp ?? 1_700_000_000),
           minting ? 200n : empty ? 0n : 100n,
           3_000n,
           0n
@@ -164,7 +177,7 @@ function rpcResult(
         reward: [['0x3b9aca00']]
       }
     case 'eth_getBlockByNumber':
-      return blockResult(chainId)
+      return blockResult(chainId, state.blockTimestamp)
     case 'eth_call':
       return contractReadResult(chainId, params, state)
     case 'eth_estimateGas':
@@ -279,10 +292,10 @@ async function emulateDesktopGoogleChrome(page: Page): Promise<void> {
 
 async function installInjectedWallet(
   page: Page,
-  options: { successfulSend?: boolean } = {}
+  options: { successfulSend?: boolean; initiallyStalled?: string[] } = {}
 ): Promise<void> {
   await page.addInitScript(
-    ({ accountA, successfulSend, txHash, countSelector }) => {
+    ({ accountA, successfulSend, txHash, countSelector, initiallyStalled }) => {
       type Listener = (...args: unknown[]) => void
       const listeners = new Map<string, Set<Listener>>()
       let accounts: string[] = []
@@ -291,7 +304,7 @@ async function installInjectedWallet(
       let sendAttempts = 0
       let successfulBroadcasts = 0
       let sendDelayMs = 0
-      const stalledMethods = new Set<string>()
+      const stalledMethods = new Set<string>(initiallyStalled)
 
       const emit = (event: string, value: unknown) => {
         for (const listener of listeners.get(event) ?? []) listener(value)
@@ -395,6 +408,7 @@ async function installInjectedWallet(
     {
       accountA: ACCOUNT_A,
       successfulSend: options.successfulSend ?? false,
+      initiallyStalled: options.initiallyStalled ?? [],
       txHash: TX_HASH,
       countSelector: factoryInterface.getFunction('vmuCount')!.selector
     }
@@ -439,9 +453,11 @@ test('production preview renders in desktop Chrome without console errors and se
   expect(headers['content-security-policy']).toContain("default-src 'self'")
   expect(headers['content-security-policy']).toContain("script-src 'self'")
   expect(headers['content-security-policy']).toContain(
-    "script-src 'self' https://www.googletagmanager.com"
+    "script-src 'self' https://static.cloudflareinsights.com"
   )
   expect(headers['content-security-policy']).not.toContain("script-src 'self' 'unsafe-inline'")
+  expect(headers['content-security-policy']).not.toMatch(/google-analytics|googletagmanager/)
+  await expect(page.locator('script[data-cf-beacon]')).toHaveCount(0)
   expect(headers['content-security-policy']).toContain("style-src 'self' 'unsafe-inline'")
   expect(headers['content-security-policy']).toContain("img-src 'self' data: chrome-extension:")
   expect(headers['content-security-policy']).toContain("font-src 'self'")
@@ -453,6 +469,7 @@ test('production preview renders in desktop Chrome without console errors and se
   expect(headers['strict-transport-security']).toContain('max-age=31536000')
   expect(headers['x-content-type-options']).toBe('nosniff')
   expect(headers['referrer-policy']).toBe('strict-origin-when-cross-origin')
+  await captureQaScreenshot(page, 'desktop')
   expect(headers['permissions-policy']).toContain('camera=()')
   expect(headers['x-frame-options']).toBe('DENY')
 })
@@ -500,6 +517,7 @@ test('mobile Chrome is blocked by the PC Chrome guard', async ({ browser, baseUR
 
   await expect(page.getByRole('alertdialog')).toBeVisible()
   await expect(page.getByText('Mobile browsers are not supported.')).toBeVisible()
+  await captureQaScreenshot(page, 'mobile-guard')
   await context.close()
 })
 
@@ -725,6 +743,19 @@ test('a successful claim is confirmed and its on-chain result is verified', asyn
   await emulateDesktopGoogleChrome(page)
   await mockSameOriginRpc(page, rpcState)
   await installInjectedWallet(page, { successfulSend: true })
+  await page.addInitScript(() => {
+    window.__confirmedWrites = []
+    const write = Storage.prototype.setItem
+    Storage.prototype.setItem = function (key, value) {
+      if (key.startsWith('sm.pendingOps.event.')) {
+        const record = JSON.parse(value).record
+        if (record?.phase === 'confirmed') {
+          window.__confirmedWrites.push({ id: record.id, hasOutcome: !!record.outcome })
+        }
+      }
+      return write.call(this, key, value)
+    }
+  })
   await page.goto('/')
   await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
 
@@ -739,7 +770,228 @@ test('a successful claim is confirmed and its on-chain result is verified', asyn
   await expect
     .poll(() => page.evaluate(() => window.__walletMock.stats()))
     .toEqual({ sendAttempts: 1, successfulBroadcasts: 1 })
+  const writes = await page.evaluate(() => window.__confirmedWrites)
+  expect(writes.filter((write) => !write.hasOutcome)).toHaveLength(1)
+  expect(writes.filter((write) => write.hasOutcome)).toHaveLength(1)
 })
+
+test('a stalled initial wallet read times out and Connect Wallet can recover', async ({ page }) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page, { initiallyStalled: ['eth_accounts'] })
+  await page.clock.install()
+  await page.goto('/')
+  await expect(page.getByRole('heading', { name: 'XENTurbo XEN Miner' })).toBeVisible()
+  await page.clock.runFor(15_100)
+  await expect(page.locator('.connect-err')).toContainText('READ_TIMEOUT')
+
+  await page.evaluate(() => window.__walletMock.setStalled('eth_accounts', false))
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await expect(page.getByRole('button', { name: '0x1111...1111' }).first()).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
+  expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+    sendAttempts: 0,
+    successfulBroadcasts: 0
+  })
+  await captureQaScreenshot(page, 'wallet-init-recovered')
+})
+
+test('a failed wallet type read stays blocked until the user safely rechecks it', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  let failCodeRead = true
+  for (const endpoint of ETHEREUM_RPC_ROUTES) {
+    await page.route(endpoint, async (route) => {
+      const body = route.request().postDataJSON() as
+        | { id: number; method: string; params: unknown[] }
+        | Array<{ id: number; method: string; params: unknown[] }>
+      const requests = Array.isArray(body) ? body : [body]
+      if (failCodeRead && requests.some(({ method }) => method === 'eth_getCode')) {
+        const replies = requests.map(({ id, method, params }) => ({
+          jsonrpc: '2.0',
+          id,
+          ...(method === 'eth_getCode'
+            ? { error: { code: -32000, message: 'wallet type read unavailable' } }
+            : { result: rpcResult(method, 1, params) })
+        }))
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify(Array.isArray(body) ? replies : replies[0])
+        })
+      } else {
+        await handleRpcRoute(route)
+      }
+    })
+  }
+  await installInjectedWallet(page)
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await expect(
+    page.getByText(
+      'Wallet type could not be verified. Check internet access and your RPC endpoints, then recheck.'
+    )
+  ).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeDisabled()
+  failCodeRead = false
+  await page.getByRole('button', { name: 'Recheck wallet' }).click()
+  await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
+  await captureQaScreenshot(page, 'wallet-type-recovered')
+  expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+    sendAttempts: 0,
+    successfulBroadcasts: 0
+  })
+})
+
+test('saving a new RPC recovers an in-flight wallet check without another recheck', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await installInjectedWallet(page)
+  const held: Route[] = []
+  for (const endpoint of ETHEREUM_RPC_ROUTES) {
+    await page.route(endpoint, async (route) => {
+      const payload = route.request().postDataJSON()
+      const requests = Array.isArray(payload) ? payload : [payload]
+      if (requests.some(({ method }) => method === 'eth_getCode')) held.push(route)
+      else await handleRpcRoute(route)
+    })
+  }
+  let replacementReads = 0
+  await page.route('https://replacement.rpc.test/**', async (route) => {
+    const payload = route.request().postDataJSON()
+    const requests = Array.isArray(payload) ? payload : [payload]
+    replacementReads += requests.filter(({ method }) => method === 'eth_getCode').length
+    await handleRpcRoute(route)
+  })
+  try {
+    await page.goto('/')
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    await expect.poll(() => held.length).toBeGreaterThan(0)
+    await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeDisabled()
+    await page.getByRole('button', { name: 'RPC', exact: true }).click()
+    await page.locator('textarea').fill('https://replacement.rpc.test/')
+    await page.getByRole('button', { name: 'Save', exact: true }).click()
+    await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
+    await expect(page.locator('tbody tr')).toBeVisible()
+    expect(replacementReads).toBeGreaterThan(0)
+    expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+    await captureQaScreenshot(page, 'rpc-replacement-recovered')
+  } finally {
+    for (const route of held) await route.abort().catch(() => {})
+  }
+})
+
+test('resuming a sleeping page corrects the countdown without a VMU rescan', async ({ page }) => {
+  await emulateDesktopGoogleChrome(page)
+  await installInjectedWallet(page)
+  await page.clock.install()
+  await page.addInitScript(() => {
+    Object.defineProperty(performance, 'now', { configurable: true, value: () => 100 })
+  })
+  const state: RpcMockState = {
+    blockTimestamp: BLOCK_TIMESTAMP,
+    maturityTimestamp: BLOCK_TIMESTAMP + 7_200
+  }
+  let scans = 0
+  for (const endpoint of ETHEREUM_RPC_ROUTES) {
+    await page.route(endpoint, async (route) => {
+      const payload = route.request().postDataJSON()
+      const requests = Array.isArray(payload) ? payload : [payload]
+      scans += requests.filter(
+        ({ method, params }) =>
+          method === 'eth_call' && params[0]?.to?.toLowerCase() === MULTICALL.toLowerCase()
+      ).length
+      await handleRpcRouteWithState(route, state)
+    })
+  }
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await expect(page.locator('tbody tr')).toContainText('2h 0m')
+  const scansBeforeResume = scans
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  await page.clock.fastForward(3_600_000)
+  state.blockTimestamp = BLOCK_TIMESTAMP + 3_600
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    document.dispatchEvent(new Event('visibilitychange'))
+    window.dispatchEvent(new Event('focus'))
+  })
+  await expect(page.locator('tbody tr')).toContainText('1h 0m')
+  await expect(page.locator('tbody tr')).toContainText('Maturing')
+  expect(scans).toBe(scansBeforeResume)
+  expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+  await captureQaScreenshot(page, 'chain-clock-resumed')
+})
+
+for (const blocked of [false, true]) {
+  test(`Cloudflare production-host beacon ${blocked ? 'can be blocked without disrupting mining' : 'loads with the supplied token and no Google requests'}`, async ({
+    page,
+    baseURL
+  }) => {
+    const googleRequests: string[] = []
+    const pageErrors: string[] = []
+    let beaconRequests = 0
+    const payloads: unknown[] = []
+    page.on('pageerror', (error) => pageErrors.push(error.message))
+    page.on('request', (request) => {
+      if (/google-analytics|googletagmanager/.test(request.url()))
+        googleRequests.push(request.url())
+    })
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await installInjectedWallet(page)
+    // Only the hostname is emulated: HTML/assets are fetched from the local preview, never production.
+    const productionPreview = new URL(baseURL!)
+    productionPreview.hostname = 'miner.xenturbo.io'
+    await page.route(`${productionPreview.origin}/**`, async (route) => {
+      const url = new URL(route.request().url())
+      url.hostname = '127.0.0.1'
+      const response = await route.fetch({ url: url.href })
+      await route.fulfill({ response })
+    })
+    await page.route('https://static.cloudflareinsights.com/beacon.min.js', async (route) => {
+      beaconRequests += 1
+      if (blocked) return route.abort('blockedbyclient')
+      await route.fulfill({
+        contentType: 'text/javascript',
+        headers: { 'access-control-allow-origin': '*' },
+        body: `const beacon = document.querySelector('script[data-cf-beacon]');
+          void fetch('https://cloudflareinsights.com/cdn-cgi/rum', {
+            method: 'POST', body: beacon.getAttribute('data-cf-beacon')
+          });`
+      })
+    })
+    await page.route('https://cloudflareinsights.com/cdn-cgi/rum', async (route) => {
+      payloads.push(JSON.parse(route.request().postData()!))
+      await route.fulfill({ status: 204, headers: { 'access-control-allow-origin': '*' } })
+    })
+    await page.goto(productionPreview.href)
+    await expect(page.locator('script[data-cf-beacon]')).toHaveCount(1)
+    await expect(page.locator('script[data-cf-beacon]')).toHaveAttribute('type', 'module')
+    expect(
+      JSON.parse((await page.locator('script[data-cf-beacon]').getAttribute('data-cf-beacon'))!)
+    ).toEqual({ token: 'd47010c2cf564339b8ad6c17afef3e0c' })
+    await expect.poll(() => beaconRequests).toBe(1)
+    if (!blocked)
+      await expect.poll(() => payloads).toEqual([{ token: 'd47010c2cf564339b8ad6c17afef3e0c' }])
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
+    await page.getByRole('button', { name: 'Confirm Mint' }).click()
+    await expect(page.getByRole('button', { name: 'Open MetaMask & Sign' })).toBeVisible()
+    expect(googleRequests).toEqual([])
+    expect(pageErrors).toEqual([])
+    expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+      sendAttempts: 0,
+      successfulBroadcasts: 0
+    })
+  })
+}
 
 for (const operation of [
   'GENERAL_MINT',

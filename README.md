@@ -1,6 +1,17 @@
 # XENTurbo XEN Miner
 
-Current release: **v1.1.3**. The page header displays the same version as the source package and Git release tag.
+Current release: **v1.1.4**. The page header displays the same version as the source package and Git release tag.
+
+### v1.1.4 Read Recovery And Analytics
+
+- Updated compatible Vue and transitive dependency patches without changing Pinia, TypeScript or Node major versions.
+- Bounded initial wallet, wallet-type and Gas display reads. Timed-out reads release their waiting state, ignore late responses and allow retry; unchecked wallets remain blocked.
+- Saving RPC settings restarts wallet verification and stale VMU scans against the new configuration. Late responses from the previous configuration cannot replace the new results.
+- Reused receipt-block VMU snapshots for result verification and removed one redundant confirmed-record write, retaining the first terminal record and final outcome.
+- Derived failed VMU addresses in bounded retry batches, with cancellation checks before each batch.
+- Based maturity countdowns on chain time and monotonic elapsed time, not the computer's clock. Reaching zero does not enable claiming without chain confirmation.
+- Resuming a page refreshes its chain-time anchor without rescanning the full VMU inventory. Concurrent recovery reads are coalesced and bounded; unavailable chain time never enables claiming.
+- Removed Google Analytics and its custom events. The production hostname uses the supplied Cloudflare Web Analytics module beacon instead.
 
 ### v1.1.3 Reliability And Security
 
@@ -8,7 +19,7 @@ Current release: **v1.1.3**. The page header displays the same version as the so
 - Remote pending candidates are authenticated through the wallet before persistence. Receipt and replacement reconciliation use chain-bound wallet evidence; ambiguous and legacy records remain conservative.
 - Reads have bounded timeouts and cancellation. Corrupted RPC settings or blocked IndexedDB caches no longer prevent recovery; configured RPC lists are preserved on network failure.
 - Result verification reads the receipt block and checks requested mint terms, maturity and changed rank. Selected VMUs refresh incrementally when the wallet inventory is complete.
-- Existing contracts, chain support, wallet-signing consent and automatic GA loading are unchanged.
+- Existing contracts, chain support and wallet-signing consent are unchanged.
 
 A pure-frontend, open-source batch miner for XEN.
 
@@ -84,7 +95,7 @@ npm run dev
 
 Open the local address printed by Vite, normally:
 
-http://127.0.0.1:5173
+http://localhost:5300
 
 To test a production build locally:
 
@@ -103,28 +114,29 @@ cp .env.example .env
 Custom RPC endpoints can also be added through the RPC control in the Miner.
 Only HTTPS endpoints that return the expected chain ID are accepted.
 
-## Optional usage analytics
+## Page and performance analytics
 
-The production site at `miner.xenturbo.io` offers optional Google Analytics 4
-usage analytics. The Google tag is not requested and no analytics event is sent
-until the visitor selects **Allow analytics**.
+The production hostname `miner.xenturbo.io` automatically loads the configured
+[Cloudflare Web Analytics](https://developers.cloudflare.com/web-analytics/)
+module beacon. There is no analytics confirmation dialog. Google Analytics,
+Google tags and the previous custom operation events have been removed.
 
-When enabled, GA4 records page and session statistics, approximate location, and
-browser/device information. It may store a first-party `_ga` client identifier.
-XENTurbo's custom events contain only fixed categories for browser support,
-wallet connection outcome, selected chain, RPC health, and Miner operation stage.
-They never include wallet addresses, transaction hashes, nonces, RPC URLs, VMU
-IDs, form values, or error text.
+The beacon provides page traffic and browser performance measurements. The
+Miner does not attach wallet addresses, transaction hashes, nonces, RPC URLs,
+VMU IDs, form values or error messages to analytics. It does not send custom
+wallet, RPC or transaction-stage events. An unavailable or blocked beacon must
+not affect wallet connections or mining.
 
-Advertising storage, advertising user data, ad personalization, and Google
-Signals remain disabled. Visitors can change their choice at any time through
-**Analytics settings** in the page footer; declining or revoking analytics does
-not affect mining. Google explains how it processes partner-site data at
-https://policies.google.com/technologies/partner-sites.
+The loader checks the exact production hostname and avoids adding a second
+beacon when Cloudflare has already injected one. Analytics is disabled on
+localhost, IP-address previews and forks hosted on other domains, so local
+verification does not send traffic to the production analytics site.
 
-Analytics is restricted by hostname and is disabled by default for local builds
-and forks unless their operator explicitly supplies a GA4 Measurement ID and an
-allowed hostname.
+When publishing to another hostname, configure its own Cloudflare Analytics
+site and update `src/core/cloudflareAnalytics.ts`. The browser beacon token is
+public configuration, not a Cloudflare API credential. Manual beacon setup does
+not require changing the site's DNS or CDN provider; see
+[Cloudflare's setup guide](https://developers.cloudflare.com/web-analytics/get-started/).
 
 ## Why no backend is needed
 
@@ -173,8 +185,9 @@ Same five on-chain operations as the original Manual Batch tool:
 
 Ethereum and Polygon (both use the deployed factory
 `0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2`). The per-VMU service fee is read
-through the active injected wallet (`FEE()`) and cross-checked against the read RPC
-at send time. Gas pricing is left to the wallet rather than copied from a public RPC.
+through the active injected wallet (`FEE()`) and multiplied by the actual operation
+units immediately before sending. The public RPC fee is advisory, not an authority
+for transaction value. Gas pricing is left to the wallet rather than copied from a public RPC.
 Add more chains in `src/config/chains.ts` + `src/config/contracts.ts`.
 
 ## Development and verification
@@ -222,13 +235,21 @@ and estimates.
 successive VMU batches until it finds an active derived proxy. Use `--rpc https://...`
 to override the script's default RPC for the selected chain.
 
+Playwright uses a dedicated local production-preview server on port 4173. If that
+port is occupied by another application, keep that application running and set
+`PLAYWRIGHT_PORT`, for example `PLAYWRIGHT_PORT=4184 npm run verify`. The same
+override works with `npm run test:e2e`; CI retains the default port.
+
 ## Security headers
 
 Vite development and preview responses include the release security headers so they
 can be validated locally. A matching Nginx snippet is prepared at
 `ops/nginx/security-headers.conf` for production deployment. The CSP allows
 same-origin requests, HTTPS RPC endpoints (including user-configured RPCs), and
-the minimum Google tag and GA4 image endpoints needed after analytics consent.
+the Cloudflare beacon script endpoint. Inline scripts remain disallowed; the
+removed Google tag and GA4 image endpoints are no longer allowlisted. Publishing
+this analytics change also requires updating the production CSP snippet; changing
+the local snippet does not modify a live server.
 
 ## Bundle budget
 

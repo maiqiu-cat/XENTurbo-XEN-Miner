@@ -204,7 +204,6 @@ export async function verifyOperationOutcome(
         deployments = new Map()
       }
     } else {
-      statuses = await readStatuses(prepared.chain, prepared.wallet, expectedIds, context)
       if (expectedStatus === 'MINTING' && prepared.term !== undefined) {
         const states = await (deps.readStates ?? readVmuStates)(
           prepared.chain,
@@ -212,7 +211,12 @@ export async function verifyOperationOutcome(
           expectedIds,
           context
         )
-        for (const state of states) mintedStates.set(state.id, state)
+        for (const state of states) {
+          mintedStates.set(state.id, state)
+          statuses.set(state.id, state.readOk ? state.status : 'READ_ERROR')
+        }
+      } else {
+        statuses = await readStatuses(prepared.chain, prepared.wallet, expectedIds, context)
       }
     }
   } catch {
