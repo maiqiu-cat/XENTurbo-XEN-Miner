@@ -113,6 +113,13 @@ cp .env.example .env
 
 Custom RPC endpoints can also be added through the RPC control in the Miner.
 Only HTTPS endpoints that return the expected chain ID are accepted.
+Custom lists allow up to 16 distinct endpoints, with a 2,048-character limit per
+URL. Saving settings validates at most four endpoints concurrently. Operation
+health checks probe the bounded list in parallel to preserve wallet read
+deadlines. Failed checks preserve the configured list; check the local network
+or edit RPC settings to recover. Legacy entries exceeding the new limits remain
+visible and are rejected explicitly until edited, rather than silently selecting
+defaults or deleting the saved configuration.
 
 ## Page and performance analytics
 
@@ -126,6 +133,11 @@ Miner does not attach wallet addresses, transaction hashes, nonces, RPC URLs,
 VMU IDs, form values or error messages to analytics. It does not send custom
 wallet, RPC or transaction-stage events. An unavailable or blocked beacon must
 not affect wallet connections or mining.
+
+The remote beacon is trusted third-party JavaScript and shares the page's
+privileges; `type="module"` is not a security sandbox. Local tests replace the
+beacon with a fixture to verify the loader and mining behavior. They do not
+verify the real remote script's data collection or its future changes.
 
 The loader checks the exact production hostname and avoids adding a second
 beacon when Cloudflare has already injected one. Analytics is disabled on
@@ -232,8 +244,12 @@ and estimates.
 
 `verify:create2` requires an explicit witness address for the selected chain: pass
 `--wallet 0x...`, or set `CREATE2_WITNESS_ETH` / `CREATE2_WITNESS_POLYGON`. It scans
-successive VMU batches until it finds an active derived proxy. Use `--rpc https://...`
-to override the script's default RPC for the selected chain.
+successive VMU batches until it finds an active derived proxy, with a default
+budget of 1,000 VMUs and 30 seconds for the whole check. Budget exhaustion returns
+`NOT_VERIFIED` (exit code 2), not a derivation mismatch. Resume with the reported
+`--from-id`, or adjust `--scan-limit` (up to 100,000) and `--deadline-ms` (up to
+300,000). Use `--rpc https://...` to override the selected chain's default RPC;
+redirects are rejected, so supply the endpoint's final URL explicitly.
 
 Playwright uses a dedicated local production-preview server on port 4173. If that
 port is occupied by another application, keep that application running and set

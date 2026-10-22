@@ -6,6 +6,18 @@ import { CHAIN_CONFIG, getChainConfig } from './chain-config.mjs'
 const factoryInterface = new Interface(['function FEE() view returns (uint256)'])
 
 export async function checkRpcEndpoint(url, config, fetchImpl = fetch) {
+  try {
+    return await inspectRpcEndpoint(url, config, fetchImpl)
+  } catch (error) {
+    return {
+      url,
+      healthy: false,
+      error: `INVALID_RPC_RESPONSE: ${error instanceof Error ? error.message : String(error)}`
+    }
+  }
+}
+
+async function inspectRpcEndpoint(url, config, fetchImpl) {
   const endpoint = new URL(url)
   if (endpoint.protocol !== 'https:') {
     return { url, healthy: false, error: 'HTTPS_REQUIRED: RPC endpoint must use https://.' }
@@ -51,7 +63,26 @@ export async function checkRpcEndpoint(url, config, fetchImpl = fetch) {
     }
   }
 
-  const results = new Map(Array.isArray(payload) ? payload.map((item) => [item.id, item]) : [])
+  if (!Array.isArray(payload) || payload.length > 2) {
+    throw new Error('INVALID_BATCH: expected only the two requested RPC results.')
+  }
+  const results = new Map()
+  for (const item of payload) {
+    if (
+      item === null ||
+      typeof item !== 'object' ||
+      Array.isArray(item) ||
+      item.jsonrpc !== '2.0' ||
+      (item.id !== 1 && item.id !== 2)
+    ) {
+      throw new Error('INVALID_BATCH_MEMBER: expected a JSON-RPC 2.0 object with ID 1 or 2.')
+    }
+    if (results.has(item.id)) throw new Error('DUPLICATE_ID: RPC result IDs must be unique.')
+    if (Object.hasOwn(item, 'error') || typeof item.result !== 'string') {
+      throw new Error('INVALID_RESULT: expected a successful string result for each RPC call.')
+    }
+    results.set(item.id, item)
+  }
   const chainIdResult = results.get(1)
   const feeResult = results.get(2)
   if (!chainIdResult?.result || !feeResult?.result) {
@@ -62,8 +93,11 @@ export async function checkRpcEndpoint(url, config, fetchImpl = fetch) {
     }
   }
 
-  const chainId = Number(BigInt(chainIdResult.result))
-  if (chainId !== config.chainId) {
+  if (!/^0x(?:0|[1-9a-fA-F][0-9a-fA-F]{0,63})$/.test(chainIdResult.result)) {
+    throw new Error('INVALID_CHAIN_ID: expected a canonical hex quantity of at most 256 bits.')
+  }
+  const chainId = BigInt(chainIdResult.result)
+  if (chainId !== BigInt(config.chainId)) {
     return {
       url,
       healthy: false,
@@ -72,8 +106,11 @@ export async function checkRpcEndpoint(url, config, fetchImpl = fetch) {
   }
 
   try {
+    if (!/^0x[0-9a-fA-F]{64}$/.test(feeResult.result)) {
+      throw new Error('Expected one 32-byte ABI word for FEE().')
+    }
     const [fee] = factoryInterface.decodeFunctionResult('FEE', feeResult.result)
-    return { url, healthy: true, chainId, fee }
+    return { url, healthy: true, chainId: Number(chainId), fee }
   } catch (error) {
     return {
       url,

@@ -264,15 +264,17 @@ export const useVmuStore = defineStore('vmu', {
         this.rankAvailable = false
         this.rankError = null
         try {
-          await ensureHealthyReadProvider(chain)
+          await withReadDeadline(() => ensureHealthyReadProvider(chain), 'RPC health check', {
+            signal: controller.signal
+          })
           if (!isCurrent()) return
           const [count, rankResult, chainTimestampMs] = await Promise.all([
-            readVmuCount(chain, wallet),
-            readGlobalRank(chain).then(
+            readVmuCount(chain, wallet, { signal: controller.signal }),
+            readGlobalRank(chain, { signal: controller.signal }).then(
               (rank) => ({ ok: true as const, rank }),
               (error: unknown) => ({ ok: false as const, error })
             ),
-            readChainTimestamp(chain)
+            readChainTimestamp(chain, { signal: controller.signal })
           ])
           if (!isCurrent()) return
 
@@ -295,9 +297,9 @@ export const useVmuStore = defineStore('vmu', {
           })
           if (!isCurrent()) return
 
-          const latestChainTimestampMs = await readChainTimestamp(chain).catch(
-            () => chainTimestampMs
-          )
+          const latestChainTimestampMs = await readChainTimestamp(chain, {
+            signal: controller.signal
+          }).catch(() => chainTimestampMs)
           if (!isCurrent()) return
           const vmus = scannedVmus.map((vmu) =>
             vmu.readOk && vmu.status !== 'READ_ERROR'
@@ -383,10 +385,13 @@ export const useVmuStore = defineStore('vmu', {
         this.loading = true
         this.error = null
         try {
-          await ensureHealthyReadProvider(chain)
+          await withReadDeadline(() => ensureHealthyReadProvider(chain), 'RPC health check', {
+            signal: controller.signal
+          })
+          if (!isCurrent()) return
           const [count, rank, timestamp] = await Promise.all([
             readVmuCount(chain, wallet, { signal: controller.signal }),
-            readGlobalRank(chain).catch(() => null),
+            readGlobalRank(chain, { signal: controller.signal }).catch(() => null),
             readChainTimestamp(chain, { signal: controller.signal })
           ])
           if (!isCurrent()) return

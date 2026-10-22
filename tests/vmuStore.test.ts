@@ -97,6 +97,40 @@ describe('vmu store request invalidation', () => {
     )
   })
 
+  it('passes the same cancellation signal to all initial reads and the final clock read', async () => {
+    chainReader.readVmuCount.mockResolvedValue(0)
+    chainReader.readGlobalRank.mockResolvedValue(100)
+    chainReader.readWalletVmus.mockResolvedValue([])
+    const store = useVmuStore()
+    store.$patch({ chain: 'eth', wallet: walletA })
+    await store.refresh()
+    const context = chainReader.readVmuCount.mock.calls[0][2]
+    expect(context.signal).toBeInstanceOf(AbortSignal)
+    expect(chainReader.readGlobalRank).toHaveBeenCalledWith('eth', context)
+    expect(chainReader.readChainTimestamp.mock.calls).toEqual([
+      ['eth', context],
+      ['eth', context]
+    ])
+    store.detach()
+  })
+
+  it('abandons an initial health wait on disconnect without starting chain reads', async () => {
+    const health = deferred<unknown>()
+    rpcHealth.ensureHealthyReadProvider.mockReturnValueOnce(health.promise)
+    const store = useVmuStore()
+    store.$patch({ chain: 'eth', wallet: walletA })
+    const refresh = store.refresh()
+    await vi.waitFor(() => expect(rpcHealth.ensureHealthyReadProvider).toHaveBeenCalledOnce())
+    store.detach()
+    await refresh
+    health.resolve({})
+    await Promise.resolve()
+    expect(chainReader.readVmuCount).not.toHaveBeenCalled()
+    expect(chainReader.readGlobalRank).not.toHaveBeenCalled()
+    expect(chainReader.readChainTimestamp).not.toHaveBeenCalled()
+    expect(store.loading).toBe(false)
+  })
+
   it('restarts a stalled scan after RPC settings change and ignores the old result', async () => {
     const oldScan = deferred<Vmu[]>()
     const store = useVmuStore()

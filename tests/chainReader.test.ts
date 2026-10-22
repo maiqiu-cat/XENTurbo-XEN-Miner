@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { assertVmuCount, classifyVmuStatus, MAX_WALLET_VMU_COUNT } from '@/core/chainReader'
+import {
+  assertVmuCount,
+  classifyVmuStatus,
+  MAX_WALLET_VMU_COUNT,
+  timestampSecondsToMs
+} from '@/core/chainReader'
 
 afterEach(() => vi.restoreAllMocks())
 
@@ -26,5 +31,25 @@ describe('VMU count validation', () => {
 
   it('accepts the configured defensive boundary', () => {
     expect(assertVmuCount(BigInt(MAX_WALLET_VMU_COUNT))).toBe(MAX_WALLET_VMU_COUNT)
+  })
+})
+
+describe('chain timestamp bounds', () => {
+  const lastSafeSecond = Math.floor(Number.MAX_SAFE_INTEGER / 1_000)
+
+  it.each([1, 1_800_000_000, lastSafeSecond])('accepts safe seconds %s', (seconds) => {
+    expect(timestampSecondsToMs(seconds)).toBe(seconds * 1_000)
+  })
+
+  it.each([undefined, null, '1800000000', 0, -1, 1.5, NaN, Infinity, lastSafeSecond + 1])(
+    'rejects an invalid or millisecond-overflowing timestamp %s',
+    (seconds) => {
+      expect(() => timestampSecondsToMs(seconds)).toThrow('invalid timestamp')
+    }
+  )
+
+  it('only permits zero for the empty mint representation', () => {
+    expect(timestampSecondsToMs(0, true)).toBe(0)
+    expect(() => timestampSecondsToMs(-1, true)).toThrow('invalid timestamp')
   })
 })

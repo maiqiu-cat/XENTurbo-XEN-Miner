@@ -40,6 +40,8 @@ export function usePendingTx(
     pendingCount.value = 0
     localUnresolvedCount.value = 0
     ops.value = []
+    lastCheckedAt.value = null
+    error.value = null
   }
 
   function check(options: { freshRpc?: boolean; reverifyResults?: boolean } = {}): Promise<number> {
@@ -124,13 +126,14 @@ export function usePendingTx(
   watch(
     [() => address(), () => chain()],
     ([addr, key]) => {
+      resetState()
       if (addr && key) startPolling()
       else {
         stopPolling()
         resetState()
       }
     },
-    { immediate: true }
+    { immediate: true, flush: 'sync' }
   )
 
   onScopeDispose(() => {

@@ -190,6 +190,61 @@ describe('usePendingTx', () => {
     scope.stop()
   })
 
+  it.each(['wallet', 'chain'] as const)(
+    'immediately removes the old pending display when %s changes',
+    async (kind) => {
+      const walletA = '0x0000000000000000000000000000000000000001'
+      const oldView = {
+        id: 'old-account-op',
+        chain: 'eth' as const,
+        wallet: walletA,
+        op: 'CLAIM' as const,
+        ids: [1],
+        count: 0,
+        term: 0,
+        txHash: '',
+        nonce: 1,
+        phase: 'broadcast' as const,
+        submittedAt: 0,
+        updatedAt: 0,
+        label: 'Claim',
+        detail: '',
+        explorerUrl: 'https://etherscan.io/',
+        status: 'pending' as const
+      }
+      vi.mocked(refreshPendingOps)
+        .mockResolvedValueOnce({
+          views: [oldView],
+          pendingNonceGap: 1,
+          unresolvedCount: 1,
+          confirmedOps: []
+        })
+        .mockRejectedValueOnce(new Error('new context RPC is unavailable'))
+      const address = ref(walletA)
+      const chain = ref<'eth' | 'polygon'>('eth')
+      const scope = effectScope()
+      const state = scope.run(() =>
+        usePendingTx(
+          () => address.value,
+          () => chain.value
+        )
+      )!
+      await vi.waitFor(() => expect(state.ops.value).toHaveLength(1))
+      expect(state.lastCheckedAt.value).not.toBeNull()
+      if (kind === 'wallet') address.value = '0x0000000000000000000000000000000000000002'
+      else chain.value = 'polygon'
+      expect(state.ops.value).toEqual([])
+      expect(state.pendingCount.value).toBe(0)
+      expect(state.localUnresolvedCount.value).toBe(0)
+      expect(state.lastCheckedAt.value).toBeNull()
+      expect(state.checking.value).toBe(true)
+      await vi.waitFor(() => expect(state.error.value).toContain('new context RPC is unavailable'))
+      await expect(state.markDropped(oldView.id)).rejects.toThrow('Only an unresolved transaction')
+      expect(state.ops.value).toEqual([])
+      scope.stop()
+    }
+  )
+
   it('keeps slow checks single-flight and performs one trailing refresh', async () => {
     const first = deferred<Awaited<ReturnType<typeof refreshPendingOps>>>()
     const second = deferred<Awaited<ReturnType<typeof refreshPendingOps>>>()

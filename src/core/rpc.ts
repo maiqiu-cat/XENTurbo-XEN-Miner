@@ -1,7 +1,15 @@
 import { JsonRpcProvider, FallbackProvider, FetchRequest, Network } from 'ethers'
-import { CHAINS, getRpcUrls, normalizeHttpsRpcUrl, type ChainKey } from '@/config/chains'
+import {
+  CHAINS,
+  getRpcUrls,
+  normalizeHttpsRpcUrl,
+  normalizeRpcUrls,
+  MAX_RPC_ENDPOINTS,
+  type ChainKey
+} from '@/config/chains'
 import { CONTRACTS } from '@/config/contracts'
 import { withReadDeadline } from './readDeadline'
+import { mapWithConcurrency } from '@/utils/concurrency'
 
 export type ReadProvider = JsonRpcProvider | FallbackProvider
 
@@ -249,7 +257,7 @@ export function ensureHealthyReadProvider(
   const promise = (async () => {
     let urls: string[]
     try {
-      urls = Array.from(new Set(getRpcUrls(key).map(normalizeHttpsRpcUrl)))
+      urls = normalizeRpcUrls(getRpcUrls(key))
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       const state: RpcHealthState = {
@@ -271,19 +279,22 @@ export function ensureHealthyReadProvider(
       error: null
     })
 
-    const checks = await Promise.all(
-      urls.map(async (url) => {
-        try {
-          const chainId = parseRpcChainId(await request(url))
-          if (chainId !== CHAINS[key].chainId) {
-            throw new Error(`expected chain ${CHAINS[key].chainId} but returned ${chainId}`)
-          }
-          return { url, failure: null }
-        } catch (error) {
-          return { url, failure: healthFailure(url, error) }
+    // The list is capped at 16. Keep health probes parallel so validation fits
+    // existing wallet read deadlines even when every endpoint responds slowly.
+    const checks = await mapWithConcurrency(urls, MAX_RPC_ENDPOINTS, async (url) => {
+      try {
+        if ((providerGenerations.get(key) ?? 0) !== generation) {
+          throw new Error('RPC configuration changed during health check')
         }
-      })
-    )
+        const chainId = parseRpcChainId(await request(url))
+        if (chainId !== CHAINS[key].chainId) {
+          throw new Error(`expected chain ${CHAINS[key].chainId} but returned ${chainId}`)
+        }
+        return { url, failure: null }
+      } catch (error) {
+        return { url, failure: healthFailure(url, error) }
+      }
+    })
 
     if ((providerGenerations.get(key) ?? 0) !== generation) {
       return ensureHealthyReadProvider(key, request)

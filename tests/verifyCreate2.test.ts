@@ -1,6 +1,8 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { spawn } from 'node:child_process'
 import { createServer, type Server } from 'node:http'
+import type { Socket } from 'node:net'
+import { fileURLToPath } from 'node:url'
 import {
   Interface,
   concat,
@@ -9,6 +11,7 @@ import {
   keccak256,
   solidityPackedKeccak256
 } from 'ethers'
+import { parseVerificationArgs, verifyCreate2 } from '../scripts/verify-create2.mjs'
 
 const FACTORY = '0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2'
 const ETH_XEN = '0x06450dEe7FD2Fb8E39061434BAbCFC05599a6Fb8'
@@ -25,8 +28,13 @@ const xenInterface = new Interface([
 ])
 
 const servers = new Set<Server>()
+const timers = new Set<ReturnType<typeof setTimeout>>()
 
 afterEach(async () => {
+  vi.useRealTimers()
+  vi.restoreAllMocks()
+  for (const timer of timers) clearTimeout(timer)
+  timers.clear()
   for (const server of servers) {
     server.closeAllConnections()
     if (server.listening) server.close()
@@ -34,7 +42,7 @@ afterEach(async () => {
   servers.clear()
 })
 
-function proxyForId(wallet: string, id: number): string {
+function proxyForId(wallet: string, id: number | bigint): string {
   const initHash = keccak256(concat([PROXY_PREFIX, getAddress(VMU_TEMPLATE), PROXY_SUFFIX]))
   const salt = solidityPackedKeccak256(['address', 'uint256'], [getAddress(wallet), id])
   return getCreate2Address(getAddress(FACTORY), salt, initHash)
@@ -44,9 +52,10 @@ function rpcResult(
   method: string,
   params: unknown[],
   options: {
-    activeIds: number[]
+    activeIds: Array<number | bigint>
     chainId: number
-    vmuCount: number
+    misdirectedIds: number[]
+    vmuCount: number | bigint
     wallet: string
     xen: string
   }
@@ -63,11 +72,14 @@ function rpcResult(
     const active = options.activeIds.some(
       (id) => getAddress(proxy) === getAddress(proxyForId(options.wallet, id))
     )
+    const misdirected = options.misdirectedIds.some(
+      (id) => getAddress(proxy) === getAddress(proxyForId(options.wallet, id))
+    )
     return xenInterface.encodeFunctionResult('userMints', [
-      proxy,
-      active ? 100 : 0,
+      misdirected ? getAddress(WALLET) : proxy,
+      active || misdirected ? 100 : 0,
       0,
-      active ? 1 : 0,
+      active || misdirected ? 1 : 0,
       0,
       0
     ])
@@ -80,19 +92,34 @@ async function runVerification({
   chain = 'eth',
   chainId = 1,
   cliWallet = WALLET,
+  countDelayMs = 0,
   env = {},
+  extraArgs = [],
+  hang,
+  mintDelayMs = 0,
+  misdirectedIds = [],
+  redirect = false,
   vmuCount = 1
 }: {
-  activeIds?: number[]
+  activeIds?: Array<number | bigint>
   chain?: 'eth' | 'polygon'
   chainId?: number
   cliWallet?: string | null
+  countDelayMs?: number
   env?: NodeJS.ProcessEnv
-  vmuCount?: number
+  extraArgs?: string[]
+  hang?: 'network' | 'count' | 'mint' | 'laterMint'
+  mintDelayMs?: number
+  misdirectedIds?: number[]
+  redirect?: boolean
+  vmuCount?: number | bigint
 } = {}) {
   const xen = chain === 'eth' ? ETH_XEN : POLYGON_XEN
   const wallet =
     cliWallet ?? (chain === 'eth' ? env.CREATE2_WITNESS_ETH : env.CREATE2_WITNESS_POLYGON) ?? WALLET
+  const connections = new Set<Socket>()
+  const mintProxies: string[] = []
+  const rpcMethods: string[] = []
   const server = createServer((request, response) => {
     let body = ''
     request.setEncoding('utf8')
@@ -104,14 +131,68 @@ async function runVerification({
         | { id: number; method: string; params: unknown[] }
         | Array<{ id: number; method: string; params: unknown[] }>
       const requests = Array.isArray(payload) ? payload : [payload]
+      if (redirect) {
+        rpcMethods.push(...requests.map(({ method }) => method))
+        response.writeHead(302, { Location: '/redirect-target', Connection: 'close' })
+        response.end()
+        return
+      }
+      let readsCount = false
+      let readsMint = false
+      for (const { method, params } of requests) {
+        rpcMethods.push(method)
+        if (method !== 'eth_call') continue
+        const call = params[0] as { data: string; to: string }
+        if (call.to.toLowerCase() === FACTORY.toLowerCase()) readsCount = true
+        if (call.to.toLowerCase() === xen.toLowerCase()) {
+          readsMint = true
+          const [proxy] = xenInterface.decodeFunctionData('userMints', call.data)
+          mintProxies.push(getAddress(proxy))
+        }
+      }
+      if (
+        (hang === 'network' && requests.some(({ method }) => method === 'eth_chainId')) ||
+        (hang === 'count' && readsCount) ||
+        (hang === 'mint' && readsMint) ||
+        (hang === 'laterMint' && readsMint && mintProxies.length > 5)
+      ) {
+        return
+      }
       const replies = requests.map(({ id, method, params }) => ({
         jsonrpc: '2.0',
         id,
-        result: rpcResult(method, params, { activeIds, chainId, vmuCount, wallet, xen })
+        result: rpcResult(method, params, {
+          activeIds,
+          chainId,
+          misdirectedIds,
+          vmuCount,
+          wallet,
+          xen
+        })
       }))
-      response.writeHead(200, { 'Content-Type': 'application/json', Connection: 'close' })
-      response.end(JSON.stringify(Array.isArray(payload) ? replies : replies[0]))
+      const reply = () => {
+        response.writeHead(200, { 'Content-Type': 'application/json', Connection: 'close' })
+        response.end(JSON.stringify(Array.isArray(payload) ? replies : replies[0]))
+      }
+      const delay = Math.max(readsCount ? countDelayMs : 0, readsMint ? mintDelayMs : 0)
+      if (delay > 0) {
+        const timer = setTimeout(() => {
+          timers.delete(timer)
+          reply()
+        }, delay)
+        timers.add(timer)
+        response.once('close', () => {
+          clearTimeout(timer)
+          timers.delete(timer)
+        })
+      } else {
+        reply()
+      }
     })
+  })
+  server.on('connection', (socket) => {
+    connections.add(socket)
+    socket.once('close', () => connections.delete(socket))
   })
   servers.add(server)
   await new Promise<void>((resolve, reject) => {
@@ -125,24 +206,47 @@ async function runVerification({
   const address = server.address()
   if (!address || typeof address === 'string') throw new Error('Mock RPC failed to bind')
 
-  return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
-    const childEnv = { ...process.env, ...env }
-    if (!Object.hasOwn(env, 'CREATE2_WITNESS_ETH')) delete childEnv.CREATE2_WITNESS_ETH
-    if (!Object.hasOwn(env, 'CREATE2_WITNESS_POLYGON')) delete childEnv.CREATE2_WITNESS_POLYGON
+  const entrypoint = new URL('../scripts/verify-create2.mjs', import.meta.url)
+  const bootstrap = `
+    import { JsonRpcProvider } from 'ethers';
+    const destroy = JsonRpcProvider.prototype.destroy;
+    JsonRpcProvider.prototype.destroy = function () {
+      console.log('TEST_PROVIDER_DESTROYED');
+      return destroy.call(this);
+    };
+    process.argv = [process.execPath, ${JSON.stringify(fileURLToPath(entrypoint))}, ...process.argv.slice(1)];
+    await import(${JSON.stringify(entrypoint.href)});
+  `
+
+  return new Promise<{
+    code: number | null
+    stdout: string
+    stderr: string
+    mintProxies: string[]
+    rpcMethods: string[]
+    providerDestroyCount: number
+    openConnections: number
+  }>((resolve, reject) => {
     const child = spawn(
       process.execPath,
       [
-        'scripts/verify-create2.mjs',
+        '--input-type=module',
+        '--eval',
+        bootstrap,
+        '--',
         '--chain',
         chain,
         ...(cliWallet ? ['--wallet', cliWallet] : []),
         '--rpc',
-        `http://127.0.0.1:${address.port}`
+        `http://127.0.0.1:${address.port}`,
+        ...extraArgs
       ],
       {
         cwd: process.cwd(),
-        env: childEnv,
-        stdio: ['ignore', 'pipe', 'pipe']
+        env: { ...env },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 4_000,
+        killSignal: 'SIGKILL'
       }
     )
     let stdout = ''
@@ -154,7 +258,19 @@ async function runVerification({
       stderr += chunk
     })
     child.on('error', reject)
-    child.on('close', (code) => resolve({ code, stdout, stderr }))
+    child.on('close', (code) => {
+      setImmediate(() =>
+        resolve({
+          code,
+          stdout,
+          stderr,
+          mintProxies,
+          rpcMethods,
+          providerDestroyCount: stdout.match(/^TEST_PROVIDER_DESTROYED$/gm)?.length ?? 0,
+          openConnections: connections.size
+        })
+      )
+    })
   })
 }
 
@@ -164,6 +280,17 @@ describe('CREATE2 verification release gate', () => {
 
     expect(result.code).toBe(1)
     expect(result.stderr).toContain('WITNESS_REQUIRED')
+    expect(result.rpcMethods).toEqual([])
+    expect(result.providerDestroyCount).toBe(0)
+  })
+
+  it('rejects redirects without following them outside the owned transport', async () => {
+    const result = await runVerification({ redirect: true })
+    expect(result.code).toBe(1)
+    expect(result.stderr).toContain('RPC_REDIRECT_REQUIRES_EXPLICIT_URL')
+    expect(result.rpcMethods.every((method) => method === 'eth_chainId')).toBe(true)
+    expect(result.providerDestroyCount).toBe(1)
+    expect(result.openConnections).toBe(0)
   })
 
   it('uses the selected chain witness environment variable when --wallet is omitted', async () => {
@@ -175,6 +302,7 @@ describe('CREATE2 verification release gate', () => {
 
     expect(result.code).toBe(0)
     expect(result.stdout).toContain(`wallet=${getAddress(ENV_WALLET)}`)
+    expect(result.providerDestroyCount).toBe(1)
   })
 
   it('uses Polygon chain configuration when --chain polygon is selected', async () => {
@@ -182,6 +310,7 @@ describe('CREATE2 verification release gate', () => {
 
     expect(result.code).toBe(0)
     expect(result.stdout).toContain('chain=polygon chainId=137')
+    expect(result.providerDestroyCount).toBe(1)
   })
 
   it('fails before contract reads when the RPC chain ID differs from the selected chain', async () => {
@@ -189,6 +318,8 @@ describe('CREATE2 verification release gate', () => {
 
     expect(result.code).toBe(1)
     expect(result.stderr).toContain('CHAIN_ID_MISMATCH')
+    expect(result.rpcMethods).not.toContain('eth_call')
+    expect(result.providerDestroyCount).toBe(1)
   })
 
   it('scans later batches until it finds an active VMU that records the derived proxy as minter', async () => {
@@ -199,6 +330,7 @@ describe('CREATE2 verification release gate', () => {
     expect(result.stdout).toContain('CREATE2 derivation VERIFIED')
     expect(result.stdout).not.toContain('NOT_VERIFIED')
     expect(result.stderr).toBe('')
+    expect(result.providerDestroyCount).toBe(1)
   })
 
   it('returns NOT_VERIFIED with exit code 2 when no VMU is active', async () => {
@@ -206,5 +338,256 @@ describe('CREATE2 verification release gate', () => {
 
     expect(result.code).toBe(2)
     expect(result.stdout).toContain('NOT_VERIFIED')
+    expect(result.providerDestroyCount).toBe(1)
+  })
+
+  it('does not reuse an Ethereum environment witness for Polygon', async () => {
+    const result = await runVerification({
+      chain: 'polygon',
+      chainId: 137,
+      cliWallet: null,
+      env: { CREATE2_WITNESS_ETH: ENV_WALLET }
+    })
+
+    expect(result.code).toBe(1)
+    expect(result.stderr).toContain('CREATE2_WITNESS_POLYGON')
+    expect(result.rpcMethods).toEqual([])
+  })
+
+  it('accepts an explicit Polygon environment witness', async () => {
+    const result = await runVerification({
+      activeIds: [1],
+      chain: 'polygon',
+      chainId: 137,
+      cliWallet: null,
+      env: { CREATE2_WITNESS_POLYGON: ENV_WALLET }
+    })
+
+    expect(result.code).toBe(0)
+    expect(result.stdout).toContain(`wallet=${getAddress(ENV_WALLET)}`)
+    expect(result.providerDestroyCount).toBe(1)
+  })
+
+  it('bounds a uint256-sized VMU count without reporting a derivation mismatch', async () => {
+    const result = await runVerification({
+      vmuCount: (1n << 256n) - 1n,
+      extraArgs: ['--scan-limit', '6']
+    })
+
+    expect(result.code).toBe(2)
+    expect(result.mintProxies).toHaveLength(6)
+    expect(result.stdout).toContain('NOT_VERIFIED: SCAN_LIMIT')
+    expect(result.stdout).toContain('--from-id 7')
+    expect(result.stdout).not.toContain('MISMATCH')
+    expect(result.stdout).not.toContain('CREATE2 derivation VERIFIED')
+    expect(result.providerDestroyCount).toBe(1)
+  })
+
+  it.each([
+    { chain: 'eth' as const, chainId: 1 },
+    { chain: 'polygon' as const, chainId: 137 }
+  ])('resumes on $chain and verifies the next page', async ({ chain, chainId }) => {
+    const first = await runVerification({
+      chain,
+      chainId,
+      activeIds: [6],
+      vmuCount: 6,
+      extraArgs: ['--scan-limit', '5']
+    })
+    expect(first.code).toBe(2)
+    expect(first.mintProxies).toHaveLength(5)
+    expect(first.stdout).toContain('--from-id 6')
+
+    const second = await runVerification({
+      chain,
+      chainId,
+      activeIds: [6],
+      vmuCount: 6,
+      extraArgs: ['--from-id', '6', '--scan-limit', '5']
+    })
+    expect(second.code).toBe(0)
+    expect(second.mintProxies).toEqual([proxyForId(WALLET, 6)])
+    expect(second.stdout).toContain('batch=6-6')
+    expect(second.stdout).toContain('CREATE2 derivation VERIFIED')
+    expect(first.providerDestroyCount).toBe(1)
+    expect(second.providerDestroyCount).toBe(1)
+  })
+
+  it('keeps looking past an active record with a different minter', async () => {
+    const result = await runVerification({ activeIds: [6], misdirectedIds: [1], vmuCount: 6 })
+
+    expect(result.code).toBe(0)
+    expect(result.stdout).toContain('batch=6-6')
+    expect(result.stdout).toContain('CREATE2 derivation VERIFIED')
+    expect(result.stdout).not.toContain('MISMATCH')
+  })
+
+  it('does not treat an active record with a different minter as proof of mismatch', async () => {
+    const result = await runVerification({ misdirectedIds: [1] })
+
+    expect(result.code).toBe(2)
+    expect(result.stdout).toContain('NOT_VERIFIED')
+    expect(result.stdout).not.toContain('MISMATCH')
+    expect(result.stdout).not.toContain('CREATE2 derivation VERIFIED')
+  })
+
+  it.each(['network', 'count', 'mint', 'laterMint'] as const)(
+    'bounds a stalled %s read and destroys the provider and sockets',
+    async (hang) => {
+      const result = await runVerification({
+        hang,
+        vmuCount: 100,
+        extraArgs: ['--deadline-ms', '500']
+      })
+
+      expect(result.code).toBe(2)
+      expect(result.stdout).toContain('NOT_VERIFIED: DEADLINE_EXCEEDED')
+      expect(result.stdout).not.toContain('MISMATCH')
+      expect(result.stdout).not.toContain('CREATE2 derivation VERIFIED')
+      expect(result.mintProxies.length).toBeLessThanOrEqual(hang === 'laterMint' ? 10 : 5)
+      expect(result.providerDestroyCount).toBe(1)
+      expect(result.openConnections).toBe(0)
+      if (hang === 'laterMint') expect(result.stdout).toContain('--from-id 6')
+    }
+  )
+
+  it('uses one total deadline rather than restarting the budget for each read', async () => {
+    const result = await runVerification({
+      activeIds: [1],
+      countDelayMs: 200,
+      mintDelayMs: 200,
+      extraArgs: ['--deadline-ms', '350']
+    })
+
+    expect(result.code).toBe(2)
+    expect(result.stdout).toContain('NOT_VERIFIED: DEADLINE_EXCEEDED')
+    expect(result.stdout).not.toContain('CREATE2 derivation VERIFIED')
+    expect(result.mintProxies).toHaveLength(1)
+    expect(result.providerDestroyCount).toBe(1)
+    expect(result.openConnections).toBe(0)
+  })
+
+  it('accepts uint256-sized page offsets without lossy number conversion', async () => {
+    const id = (1n << 256n) - 1n
+    const result = await runVerification({
+      activeIds: [id],
+      vmuCount: id,
+      extraArgs: ['--from-id', id.toString(), '--scan-limit', '1']
+    })
+
+    expect(result.code).toBe(0)
+    expect(result.mintProxies).toEqual([proxyForId(WALLET, id)])
+    expect(result.stdout).toContain(`batch=${id}-${id}`)
+  })
+
+  it.each([0, 5])('does not scan beyond a VMU count of %s', async (vmuCount) => {
+    const result = await runVerification({ vmuCount, extraArgs: ['--from-id', '6'] })
+
+    expect(result.code).toBe(2)
+    expect(result.stdout).toContain('NOT_VERIFIED')
+    expect(result.mintProxies).toEqual([])
+    expect(result.providerDestroyCount).toBe(1)
+  })
+
+  it.each([
+    ['--scan-limit', '0'],
+    ['--scan-limit', '-1'],
+    ['--scan-limit', '1.5'],
+    ['--scan-limit', '100001'],
+    ['--deadline-ms', '0'],
+    ['--deadline-ms', '300001'],
+    ['--deadline-ms', 'Infinity'],
+    ['--from-id', '0'],
+    ['--from-id', (1n << 256n).toString()],
+    ['--from-id', '9'.repeat(4096)],
+    ['--scan-limit']
+  ])('rejects invalid scan options before RPC reads: %s %s', async (...extraArgs) => {
+    const result = await runVerification({ extraArgs })
+
+    expect(result.code).toBe(1)
+    expect(result.stderr).toContain('INVALID_SCAN_OPTION')
+    expect(result.rpcMethods).toEqual([])
+    expect(result.providerDestroyCount).toBe(0)
+  })
+
+  it('parses the maximum bounded budgets and defaults without losing bigint page offsets', () => {
+    const defaults = parseVerificationArgs(['--chain', 'eth', '--wallet', WALLET], {})
+    expect(defaults).toMatchObject({ fromId: 1n, scanLimit: 1_000, deadlineMs: 30_000 })
+
+    const fromId = (1n << 256n) - 1n
+    const maximum = parseVerificationArgs(
+      [
+        '--chain',
+        'eth',
+        '--wallet',
+        WALLET,
+        '--from-id',
+        fromId.toString(),
+        '--scan-limit',
+        '100000',
+        '--deadline-ms',
+        '300000'
+      ],
+      {}
+    )
+    expect(maximum).toMatchObject({ fromId, scanLimit: 100_000, deadlineMs: 300_000 })
+  })
+
+  it('does not destroy a borrowed provider or continue after a late network response', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] })
+    const { config, wallet } = parseVerificationArgs(['--chain', 'eth', '--wallet', WALLET], {})
+    let resolveNetwork!: (network: { chainId: bigint }) => void
+    const provider = {
+      provider: null,
+      getNetwork: vi.fn(
+        () =>
+          new Promise<{ chainId: bigint }>((resolve) => {
+            resolveNetwork = resolve
+          })
+      ),
+      call: vi.fn(),
+      destroy: vi.fn()
+    }
+    const log = vi.fn()
+
+    const verification = verifyCreate2({ config, provider, wallet, log, deadlineMs: 20 })
+    const settled = expect(verification).resolves.toBe(false)
+    await vi.advanceTimersByTimeAsync(20)
+    await settled
+    resolveNetwork({ chainId: 1n })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    expect(provider.getNetwork).toHaveBeenCalledOnce()
+    expect(provider.call).not.toHaveBeenCalled()
+    expect(provider.destroy).not.toHaveBeenCalled()
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('NOT_VERIFIED: DEADLINE_EXCEEDED'))
+    expect(log).not.toHaveBeenCalledWith('CREATE2 derivation VERIFIED against on-chain data.')
+  })
+
+  it('rechecks an unfinished batch after expiry during inspection', async () => {
+    const { config, wallet } = parseVerificationArgs(['--chain', 'eth', '--wallet', WALLET], {})
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(0)
+    const provider = {
+      provider: null,
+      getNetwork: vi.fn().mockResolvedValue({ chainId: 1n }),
+      call: vi
+        .fn()
+        .mockResolvedValueOnce(factoryInterface.encodeFunctionResult('vmuCount', [1]))
+        .mockResolvedValueOnce(
+          xenInterface.encodeFunctionResult('userMints', [proxyForId(WALLET, 1), 100, 0, 1, 0, 0])
+        ),
+      destroy: vi.fn()
+    }
+    const log = vi.fn((message: string) => {
+      if (message.startsWith('id=1 ')) clock.mockReturnValue(1_000)
+    })
+
+    const verified = await verifyCreate2({ config, provider, wallet, log, deadlineMs: 500 })
+
+    expect(verified).toBe(false)
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('NOT_VERIFIED: DEADLINE_EXCEEDED'))
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('--from-id 1'))
+    expect(log).not.toHaveBeenCalledWith('CREATE2 derivation VERIFIED against on-chain data.')
+    expect(provider.destroy).not.toHaveBeenCalled()
   })
 })

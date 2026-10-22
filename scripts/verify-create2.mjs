@@ -2,32 +2,57 @@
 //
 // Usage:
 //   node scripts/verify-create2.mjs --chain eth --wallet 0x... [--rpc https://...]
+//     [--from-id 1] [--scan-limit 1000] [--deadline-ms 30000]
 //   CREATE2_WITNESS_POLYGON=0x... node scripts/verify-create2.mjs --chain polygon
 
-import { Contract, JsonRpcProvider, getAddress } from 'ethers'
+import { Agent as HttpAgent } from 'node:http'
+import { Agent as HttpsAgent } from 'node:https'
+import { Contract, FetchRequest, JsonRpcProvider, getAddress } from 'ethers'
 import { computeProxyAddress } from '../src/core/create2.ts'
 import { getChainConfig } from './chain-config.mjs'
 
 const SCAN_BATCH_SIZE = 5
+const DEFAULT_SCAN_LIMIT = 1_000
+const MAX_SCAN_LIMIT = 100_000
+const DEFAULT_DEADLINE_MS = 30_000
+const MAX_DEADLINE_MS = 300_000
+const UINT256_MAX = (1n << 256n) - 1n
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
 const factoryAbi = ['function vmuCount(address) view returns (uint256)']
 const xenAbi = [
   'function userMints(address) view returns (address user, uint256 term, uint256 maturityTs, uint256 rank, uint256 amplifier, uint256 eaaRate)'
 ]
 
+function positiveOption(value, flag, maximum) {
+  if (typeof value !== 'string' || !/^[1-9][0-9]{0,77}$/.test(value)) {
+    throw new Error(`INVALID_SCAN_OPTION: ${flag} requires a positive decimal integer.`)
+  }
+  const parsed = BigInt(value)
+  if (parsed > BigInt(maximum)) {
+    throw new Error(`INVALID_SCAN_OPTION: ${flag} must not exceed ${maximum}.`)
+  }
+  return parsed
+}
+
 export function parseVerificationArgs(argv, env = process.env) {
   let chain
   let rpcUrl
   let wallet
+  let fromId = '1'
+  let scanLimit = String(DEFAULT_SCAN_LIMIT)
+  let deadlineMs = String(DEFAULT_DEADLINE_MS)
 
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index]
     if (value === '--chain') chain = argv[++index]
     else if (value === '--wallet') wallet = argv[++index]
     else if (value === '--rpc') rpcUrl = argv[++index]
+    else if (value === '--from-id') fromId = argv[++index]
+    else if (value === '--scan-limit') scanLimit = argv[++index]
+    else if (value === '--deadline-ms') deadlineMs = argv[++index]
     else
       throw new Error(
-        `Unknown argument ${JSON.stringify(value)}. Use --chain, --wallet, and --rpc.`
+        `Unknown argument ${JSON.stringify(value)}. Use --chain, --wallet, --rpc, --from-id, --scan-limit, and --deadline-ms.`
       )
   }
 
@@ -41,76 +66,182 @@ export function parseVerificationArgs(argv, env = process.env) {
     )
   }
 
-  return { config, rpcUrl: rpcUrl ?? config.rpcUrls[0], wallet: getAddress(witness) }
+  return {
+    config,
+    rpcUrl: rpcUrl ?? config.rpcUrls[0],
+    wallet: getAddress(witness),
+    fromId: positiveOption(fromId, '--from-id', UINT256_MAX),
+    scanLimit: Number(positiveOption(scanLimit, '--scan-limit', MAX_SCAN_LIMIT)),
+    deadlineMs: Number(positiveOption(deadlineMs, '--deadline-ms', MAX_DEADLINE_MS))
+  }
 }
 
-export async function verifyCreate2({ config, provider, wallet, log = console.log }) {
-  const network = await provider.getNetwork()
-  if (network.chainId !== BigInt(config.chainId)) {
-    throw new Error(
-      `CHAIN_ID_MISMATCH: selected ${config.key} expects ${config.chainId}, RPC returned ${network.chainId}.`
-    )
+export async function verifyCreate2({
+  config,
+  provider,
+  wallet,
+  log = console.log,
+  fromId = 1n,
+  scanLimit = DEFAULT_SCAN_LIMIT,
+  deadlineMs = DEFAULT_DEADLINE_MS
+}) {
+  if (
+    typeof fromId !== 'bigint' ||
+    fromId < 1n ||
+    fromId > UINT256_MAX ||
+    !Number.isSafeInteger(scanLimit) ||
+    scanLimit < 1 ||
+    scanLimit > MAX_SCAN_LIMIT ||
+    !Number.isSafeInteger(deadlineMs) ||
+    deadlineMs < 1 ||
+    deadlineMs > MAX_DEADLINE_MS
+  ) {
+    throw new Error('INVALID_SCAN_OPTION: scan range and deadline must be positive and bounded.')
   }
 
-  const factory = new Contract(config.factory, factoryAbi, provider)
-  const xen = new Contract(config.xenCrypto, xenAbi, provider)
-  const vmuCount = await factory.vmuCount(wallet)
-  log(`chain=${config.key} chainId=${config.chainId}`)
-  log(`wallet=${wallet}`)
-  log(`vmuCount=${vmuCount}`)
+  const deadline = performance.now() + deadlineMs
+  const deadlineError = new Error('DEADLINE_EXCEEDED')
+  let nextId = fromId
+  let scanned = 0
 
-  if (vmuCount === 0n) {
-    log('NOT_VERIFIED: wallet has no VMUs.')
-    return false
-  }
-
-  for (let fromId = 1n; fromId <= vmuCount; fromId += BigInt(SCAN_BATCH_SIZE)) {
-    const toId =
-      fromId + BigInt(SCAN_BATCH_SIZE - 1) > vmuCount
-        ? vmuCount
-        : fromId + BigInt(SCAN_BATCH_SIZE - 1)
-    log(`batch=${fromId}-${toId}`)
-
-    const records = await Promise.all(
-      Array.from({ length: Number(toId - fromId + 1n) }, async (_, offset) => {
-        const id = fromId + BigInt(offset)
-        const proxy = computeProxyAddress({
-          factory: config.factory,
-          vmuTemplate: config.vmuTemplate,
-          wallet,
-          vmuId: id
+  async function readBeforeDeadline(read) {
+    const remaining = deadline - performance.now()
+    if (remaining <= 0) throw deadlineError
+    let timer
+    try {
+      const result = await Promise.race([
+        Promise.resolve().then(() => {
+          if (performance.now() >= deadline) throw deadlineError
+          return read()
+        }),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(deadlineError), remaining)
         })
-        const mint = await xen.userMints(proxy)
-        return { id, mint, proxy }
-      })
-    )
-
-    for (const { id, mint, proxy } of records) {
-      const active = mint.user !== ZERO_ADDRESS && mint.rank > 0n && mint.term > 0n
-      log(
-        `id=${id} proxy=${proxy} user=${mint.user} rank=${mint.rank} term=${mint.term} maturityTs=${mint.maturityTs} ${
-          active ? 'ACTIVE' : 'empty/claimed/inactive'
-        }`
-      )
-      if (active && getAddress(mint.user) === getAddress(proxy)) {
-        log('CREATE2 derivation VERIFIED against on-chain data.')
-        return true
-      }
+      ])
+      if (performance.now() >= deadline) throw deadlineError
+      return result
+    } finally {
+      clearTimeout(timer)
     }
   }
 
-  log('NOT_VERIFIED: no active VMU records a derived proxy as its on-chain minter.')
-  return false
+  try {
+    return await scan()
+  } catch (error) {
+    if (error !== deadlineError) throw error
+    log(
+      `NOT_VERIFIED: DEADLINE_EXCEEDED after ${deadlineMs} ms; scanned=${scanned}; resume with --from-id ${nextId}.`
+    )
+    return false
+  }
+
+  async function scan() {
+    const network = await readBeforeDeadline(() => provider.getNetwork())
+    if (network.chainId !== BigInt(config.chainId)) {
+      throw new Error(
+        `CHAIN_ID_MISMATCH: selected ${config.key} expects ${config.chainId}, RPC returned ${network.chainId}.`
+      )
+    }
+
+    const factory = new Contract(config.factory, factoryAbi, provider)
+    const xen = new Contract(config.xenCrypto, xenAbi, provider)
+    const vmuCount = await readBeforeDeadline(() => factory.vmuCount(wallet))
+    log(`chain=${config.key} chainId=${config.chainId}`)
+    log(`wallet=${wallet}`)
+    log(`vmuCount=${vmuCount}`)
+
+    if (vmuCount === 0n) {
+      log('NOT_VERIFIED: wallet has no VMUs.')
+      return false
+    }
+
+    if (fromId > vmuCount) {
+      log('NOT_VERIFIED: --from-id is beyond the wallet VMU count.')
+      return false
+    }
+
+    const scanEnd = fromId + BigInt(scanLimit) - 1n
+    const lastId = scanEnd < vmuCount ? scanEnd : vmuCount
+    while (nextId <= lastId) {
+      const batchFrom = nextId
+      const toId =
+        batchFrom + BigInt(SCAN_BATCH_SIZE - 1) > lastId
+          ? lastId
+          : batchFrom + BigInt(SCAN_BATCH_SIZE - 1)
+      log(`batch=${batchFrom}-${toId}`)
+
+      const records = await readBeforeDeadline(() =>
+        Promise.all(
+          Array.from({ length: Number(toId - batchFrom + 1n) }, async (_, offset) => {
+            const id = batchFrom + BigInt(offset)
+            const proxy = computeProxyAddress({
+              factory: config.factory,
+              vmuTemplate: config.vmuTemplate,
+              wallet,
+              vmuId: id
+            })
+            const mint = await xen.userMints(proxy)
+            return { id, mint, proxy }
+          })
+        )
+      )
+      scanned += records.length
+
+      for (const { id, mint, proxy } of records) {
+        if (performance.now() >= deadline) throw deadlineError
+        const active = mint.user !== ZERO_ADDRESS && mint.rank > 0n && mint.term > 0n
+        log(
+          `id=${id} proxy=${proxy} user=${mint.user} rank=${mint.rank} term=${mint.term} maturityTs=${mint.maturityTs} ${
+            active ? 'ACTIVE' : 'empty/claimed/inactive'
+          }`
+        )
+        if (active && getAddress(mint.user) === getAddress(proxy)) {
+          if (performance.now() >= deadline) throw deadlineError
+          log('CREATE2 derivation VERIFIED against on-chain data.')
+          return true
+        }
+      }
+      nextId = toId + 1n
+    }
+
+    if (lastId < vmuCount) {
+      log(
+        `NOT_VERIFIED: SCAN_LIMIT reached after ${scanned} VMUs; continue with --from-id ${nextId}.`
+      )
+      return false
+    }
+    log('NOT_VERIFIED: no active VMU records a derived proxy as its on-chain minter.')
+    return false
+  }
 }
 
 async function main() {
-  const { config, rpcUrl, wallet } = parseVerificationArgs(process.argv.slice(2))
-  const provider = new JsonRpcProvider(rpcUrl)
+  const { config, rpcUrl, wallet, ...scanOptions } = parseVerificationArgs(process.argv.slice(2))
+  const agent = new URL(rpcUrl).protocol === 'https:' ? new HttpsAgent() : new HttpAgent()
+  let provider
   try {
-    const verified = await verifyCreate2({ config, provider, wallet })
+    const request = new FetchRequest(rpcUrl)
+    request.timeout = scanOptions.deadlineMs
+    const getUrl = FetchRequest.createGetUrlFunc({ agent })
+    request.getUrlFunc = async (connection, signal) => {
+      const response = await getUrl(connection, signal)
+      // Ethers redirects discard this request's owned transport and retry policy.
+      if ([301, 302, 307, 308].includes(response.statusCode)) {
+        throw new Error('RPC_REDIRECT_REQUIRES_EXPLICIT_URL: pass the final RPC URL with --rpc.')
+      }
+      return response
+    }
+    request.retryFunc = async () => false
+    provider = new JsonRpcProvider(request)
+    const verified = await verifyCreate2({ config, provider, wallet, ...scanOptions })
     if (!verified) process.exitCode = 2
   } finally {
-    provider.destroy()
+    try {
+      provider?.destroy()
+    } finally {
+      // JsonRpcProvider.destroy() does not close its in-flight HTTP sockets.
+      agent.destroy()
+    }
   }
 }
 

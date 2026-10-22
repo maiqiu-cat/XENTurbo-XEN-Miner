@@ -45,6 +45,31 @@ export const CHAINS: Record<ChainKey, ChainConfig> = {
 
 export const CHAIN_KEYS = Object.keys(CHAINS) as ChainKey[]
 
+export const MAX_RPC_ENDPOINTS = 16
+export const MAX_RPC_URL_LENGTH = 2_048
+export const MAX_RPC_INPUT_LENGTH = MAX_RPC_ENDPOINTS * (MAX_RPC_URL_LENGTH + 1)
+export const RPC_CHECK_CONCURRENCY = 4
+
+export function normalizeRpcUrls(urls: readonly string[]): string[] {
+  const normalized = [...new Set(urls.map(normalizeHttpsRpcUrl))]
+  if (normalized.length > MAX_RPC_ENDPOINTS) {
+    throw new Error(`Use at most ${MAX_RPC_ENDPOINTS} RPC endpoints`)
+  }
+  return normalized
+}
+
+export function parseRpcInput(text: string): string[] {
+  if (text.length > MAX_RPC_INPUT_LENGTH) {
+    throw new Error(`RPC input must not exceed ${MAX_RPC_INPUT_LENGTH} characters`)
+  }
+  return normalizeRpcUrls(
+    text
+      .split('\n')
+      .map((url) => url.trim())
+      .filter(Boolean)
+  )
+}
+
 /**
  * Resolve effective RPC list for a chain.
  * Priority: user overrides (localStorage) > env override > defaults.
@@ -88,7 +113,8 @@ export function readCustomRpc(key: ChainKey): string[] {
   if (!Array.isArray(all[key])) return []
   return all[key].flatMap((url) => {
     try {
-      return [normalizeHttpsRpcUrl(url)]
+      // Keep legacy HTTPS entries visible; new limits must not silently select defaults.
+      return [parseHttpsRpcUrl(url).toString()]
     } catch {
       return []
     }
@@ -97,7 +123,7 @@ export function readCustomRpc(key: ChainKey): string[] {
 
 export function writeCustomRpc(key: ChainKey, urls: string[]): void {
   const all = readAllCustomRpc()
-  const cleaned = urls.map(normalizeHttpsRpcUrl)
+  const cleaned = normalizeRpcUrls(urls)
   if (cleaned.length) {
     all[key] = cleaned
   } else {
@@ -108,6 +134,17 @@ export function writeCustomRpc(key: ChainKey, urls: string[]): void {
 
 /** Normalize and reject RPC URLs that are unsafe to persist in the browser. */
 export function normalizeHttpsRpcUrl(value: string): string {
+  if (value.length > MAX_RPC_URL_LENGTH) {
+    throw new Error(`RPC URL must not exceed ${MAX_RPC_URL_LENGTH} characters`)
+  }
+  const normalized = parseHttpsRpcUrl(value).toString()
+  if (normalized.length > MAX_RPC_URL_LENGTH) {
+    throw new Error(`RPC URL must not exceed ${MAX_RPC_URL_LENGTH} characters`)
+  }
+  return normalized
+}
+
+function parseHttpsRpcUrl(value: string): URL {
   let url: URL
   try {
     url = new URL(value.trim())
@@ -118,5 +155,5 @@ export function normalizeHttpsRpcUrl(value: string): string {
   if (url.username || url.password) {
     throw new Error('RPC endpoint must not contain credentials in the URL')
   }
-  return url.toString()
+  return url
 }

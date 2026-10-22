@@ -1,7 +1,16 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
-import { CHAINS, readCustomRpc, writeCustomRpc, type ChainKey } from '@/config/chains'
+import { onScopeDispose, ref, watch } from 'vue'
+import {
+  CHAINS,
+  MAX_RPC_INPUT_LENGTH,
+  RPC_CHECK_CONCURRENCY,
+  parseRpcInput,
+  readCustomRpc,
+  writeCustomRpc,
+  type ChainKey
+} from '@/config/chains'
 import { resetProviders, validateRpcEndpoint } from '@/core/rpc'
+import { mapWithConcurrency } from '@/utils/concurrency'
 
 const props = defineProps<{ chain: ChainKey }>()
 const emit = defineEmits<{ (e: 'saved'): void }>()
@@ -10,10 +19,16 @@ const open = ref(false)
 const text = ref('')
 const saving = ref(false)
 const error = ref<string | null>(null)
+let contextRevision = 0
+
+onScopeDispose(() => {
+  contextRevision += 1
+})
 
 watch(
   () => props.chain,
   (c) => {
+    contextRevision += 1
     text.value = readCustomRpc(c).join('\n')
     error.value = null
   },
@@ -21,20 +36,23 @@ watch(
 )
 
 async function save() {
+  if (saving.value) return
   error.value = null
   const targetChain = props.chain
-  const urls = text.value
-    .split('\n')
-    .map((s) => s.trim())
-    .filter(Boolean)
-  saving.value = true
-  try {
-    const checked = await Promise.all(
-      urls.map((url) => validateRpcEndpoint(url, CHAINS[targetChain].chainId))
-    )
-    if (props.chain !== targetChain) {
+  const revision = contextRevision
+  const assertContext = () => {
+    if (props.chain !== targetChain || contextRevision !== revision) {
       throw new Error('Network changed while RPC validation was running. Recheck and save again.')
     }
+  }
+  saving.value = true
+  try {
+    const urls = parseRpcInput(text.value)
+    const checked = await mapWithConcurrency(urls, RPC_CHECK_CONCURRENCY, (url) => {
+      assertContext()
+      return validateRpcEndpoint(url, CHAINS[targetChain].chainId)
+    })
+    assertContext()
     writeCustomRpc(
       targetChain,
       checked.map((result) => result.url)
@@ -72,6 +90,7 @@ function resetDefault() {
         <textarea
           class="input"
           rows="4"
+          :maxlength="MAX_RPC_INPUT_LENGTH"
           v-model="text"
           :placeholder="CHAINS[chain].defaultRpcUrls.join('\n')"
         />
