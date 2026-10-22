@@ -21,7 +21,7 @@ function validPayload() {
     { id: 4, result: '0x6003' },
     { id: 5, result: factoryInterface.encodeFunctionResult('FEE', [18n]) },
     { id: 6, result: factoryInterface.encodeFunctionResult('vmuCount', [0n]) }
-  ]
+  ].map((entry) => ({ jsonrpc: '2.0', ...entry }))
 }
 
 describe('release chain probe', () => {
@@ -41,6 +41,7 @@ describe('release chain probe', () => {
       vmuCount: 0n
     })
     const request = JSON.parse(fetchImpl.mock.calls[0][1].body)
+    expect(fetchImpl.mock.calls[0][1].redirect).toBe('error')
     expect(request.map((entry: { method: string }) => entry.method)).toEqual([
       'eth_chainId',
       'eth_getCode',
@@ -53,7 +54,7 @@ describe('release chain probe', () => {
 
   it('fails when any deployed contract has no bytecode', async () => {
     const payload = validPayload()
-    payload[4 - 1] = { id: 4, result: '0x' }
+    payload[4 - 1] = { ...payload[4 - 1], result: '0x' }
     const fetchImpl = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -66,5 +67,34 @@ describe('release chain probe', () => {
       healthy: false,
       error: 'CONTRACT_CODE_MISSING: vmuTemplate'
     })
+  })
+
+  it.each([
+    ['duplicate IDs', () => [...validPayload().slice(0, 5), validPayload()[0]]],
+    [
+      'wrong version',
+      () => validPayload().map((item, index) => (index === 0 ? { ...item, jsonrpc: '1.0' } : item))
+    ],
+    [
+      'noncanonical chain',
+      () => validPayload().map((item, index) => (index === 0 ? { ...item, result: '0x01' } : item))
+    ],
+    ['missing result', () => validPayload().slice(0, 5)],
+    [
+      'conflicting error',
+      () =>
+        validPayload().map((item, index) =>
+          index === 0 ? { ...item, error: { message: 'denied' } } : item
+        )
+    ]
+  ])('rejects malformed RPC batches: %s', async (_name, payload) => {
+    const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => payload() }))
+    expect(
+      await probeReleaseEndpoint(
+        'https://rpc.example',
+        config,
+        fetchImpl as unknown as typeof fetch
+      )
+    ).toMatchObject({ healthy: false })
   })
 })

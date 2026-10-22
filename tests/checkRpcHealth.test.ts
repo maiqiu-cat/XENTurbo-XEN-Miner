@@ -79,6 +79,7 @@ describe('RPC health release gate', () => {
 
     expect(result).toMatchObject({ healthy: true, chainId: 1, fee: 123n })
     expect(fetchImpl).toHaveBeenCalledOnce()
+    expect(fetchImpl.mock.calls[0][1].redirect).toBe('error')
     const request = JSON.parse(fetchImpl.mock.calls[0][1].body as string)
     expect(request).toEqual(
       expect.arrayContaining([
@@ -113,7 +114,7 @@ describe('RPC health release gate', () => {
 
     await expect(checkRpcEndpoint('not a URL', config, fetchImpl)).resolves.toMatchObject({
       healthy: false,
-      error: expect.stringContaining('INVALID_RPC_RESPONSE')
+      error: expect.stringContaining('INVALID_RPC_URL')
     })
     expect(fetchImpl).not.toHaveBeenCalled()
   })

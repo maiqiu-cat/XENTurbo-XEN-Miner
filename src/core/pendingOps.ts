@@ -464,7 +464,19 @@ export function recordPendingOp(params: {
   }
   appendRecord(rec)
   if (rec.txHash && isUnresolvedPending(rec)) {
-    attachTxHash(rec.id, rec.txHash)
+    try {
+      attachTxHash(rec.id, rec.txHash, {
+        chain: rec.chain,
+        wallet: rec.wallet,
+        ids: rec.ids,
+        op: rec.op,
+        count: rec.count,
+        term: rec.term,
+        lockedAt: rec.submittedAt
+      })
+    } catch {
+      // The durable journal is authoritative; a lock-cache failure must not lose the hash.
+    }
   } else if (!isUnresolvedPending(rec)) {
     releaseRecordLocks(rec)
   }

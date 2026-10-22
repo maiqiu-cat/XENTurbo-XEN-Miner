@@ -14,14 +14,7 @@ import { readFee, readVmuStatuses, readVmuStates } from './chainReader'
 import { readWalletEvidence, type WalletReceipt } from './walletEvidence'
 import { mapWithConcurrency } from '@/utils/concurrency'
 import { ensureHealthyReadProvider, getReadProvider } from './rpc'
-import {
-  attachTxHash,
-  releaseLock,
-  newBatchId,
-  pendingLocks,
-  tryAcquireLock,
-  clearSoftLocks
-} from './localLock'
+import { releaseLock, newBatchId, pendingLocks, tryAcquireLock, clearSoftLocks } from './localLock'
 import { countUnresolvedPendingOps, recordPendingOp, removePendingOpRecord } from './pendingOps'
 import { operationKey, runWalletExclusive } from './operationGate'
 import {
@@ -757,7 +750,6 @@ export async function sendPreparedOperation(
   const recordBroadcast = (txHash: string) => {
     broadcasted = true
     awaitingWalletResolved = true
-    if (prepared.lockIds.length) attachTxHash(prepared.batch, txHash)
     recordPendingOp({
       id: prepared.batch,
       chain: prepared.chain,

@@ -237,10 +237,11 @@ describe('usePendingTx', () => {
       expect(state.pendingCount.value).toBe(0)
       expect(state.localUnresolvedCount.value).toBe(0)
       expect(state.lastCheckedAt.value).toBeNull()
-      expect(state.checking.value).toBe(true)
+      expect(state.ready.value).toBe(false)
       await vi.waitFor(() => expect(state.error.value).toContain('new context RPC is unavailable'))
       await expect(state.markDropped(oldView.id)).rejects.toThrow('Only an unresolved transaction')
       expect(state.ops.value).toEqual([])
+      expect(state.ready.value).toBe(false)
       scope.stop()
     }
   )
@@ -274,6 +275,110 @@ describe('usePendingTx', () => {
     await second.promise
     scope.stop()
   })
+
+  it('blocks an unknown scope and a failed retry until reconciliation succeeds', async () => {
+    const retry = deferred<Awaited<ReturnType<typeof refreshPendingOps>>>()
+    vi.mocked(refreshPendingOps)
+      .mockResolvedValueOnce({
+        views: [],
+        pendingNonceGap: 0,
+        unresolvedCount: 0,
+        confirmedOps: []
+      })
+      .mockRejectedValueOnce(new Error('wallet nonce unavailable'))
+      .mockReturnValueOnce(retry.promise)
+    const scope = effectScope()
+    const state = scope.run(() =>
+      usePendingTx(
+        () => '0x0000000000000000000000000000000000000001',
+        () => 'eth'
+      )
+    )!
+    expect(state.ready.value).toBe(false)
+    await vi.waitFor(() => expect(state.ready.value).toBe(true))
+    await state.check()
+    expect(state.ready.value).toBe(false)
+    const checking = state.check()
+    expect(state.error.value).toBeNull()
+    expect(state.ready.value).toBe(false)
+    retry.resolve({ views: [], pendingNonceGap: 0, unresolvedCount: 0, confirmedOps: [] })
+    await checking
+    expect(state.ready.value).toBe(true)
+    scope.stop()
+  })
+
+  it('coalesces synchronous wallet and chain changes without checking an intermediate scope', async () => {
+    vi.mocked(refreshPendingOps).mockResolvedValue({
+      views: [],
+      pendingNonceGap: 0,
+      unresolvedCount: 0,
+      confirmedOps: []
+    })
+    const address = ref('0x0000000000000000000000000000000000000001')
+    const chain = ref<'eth' | 'polygon'>('eth')
+    const scope = effectScope()
+    const state = scope.run(() =>
+      usePendingTx(
+        () => address.value,
+        () => chain.value
+      )
+    )!
+    await vi.waitFor(() => expect(state.ready.value).toBe(true))
+    vi.mocked(refreshPendingOps).mockClear()
+    address.value = '0x0000000000000000000000000000000000000002'
+    chain.value = 'polygon'
+    expect(state.ready.value).toBe(false)
+    expect(refreshPendingOps).not.toHaveBeenCalled()
+    await nextTick()
+    expect(refreshPendingOps).toHaveBeenCalledTimes(1)
+    expect(refreshPendingOps).toHaveBeenCalledWith('polygon', address.value, expect.any(Object))
+    scope.stop()
+  })
+
+  it.each(['wallet', 'chain'] as const)(
+    'restarts recurring checks after a synchronous %s round trip',
+    async (kind) => {
+      vi.useFakeTimers()
+      const empty = { views: [], pendingNonceGap: 0, unresolvedCount: 0, confirmedOps: [] }
+      vi.mocked(refreshPendingOps).mockReset().mockResolvedValue(empty)
+      const wallet = '0x0000000000000000000000000000000000000001'
+      const address = ref<string | null>(wallet)
+      const chain = ref<'eth' | 'polygon'>('eth')
+      const scope = effectScope()
+      const state = scope.run(() =>
+        usePendingTx(
+          () => address.value,
+          () => chain.value
+        )
+      )!
+      try {
+        await vi.advanceTimersByTimeAsync(0)
+        expect(state.ready.value).toBe(true)
+        vi.mocked(refreshPendingOps).mockClear()
+        if (kind === 'wallet') {
+          address.value = null
+          address.value = wallet
+        } else {
+          chain.value = 'polygon'
+          chain.value = 'eth'
+        }
+        expect(state.ready.value).toBe(false)
+        await nextTick()
+        await vi.advanceTimersByTimeAsync(0)
+        expect(refreshPendingOps).toHaveBeenCalledTimes(1)
+        expect(state.ready.value).toBe(true)
+        await state.check()
+        expect(refreshPendingOps).toHaveBeenCalledTimes(2)
+        await vi.advanceTimersByTimeAsync(30_000)
+        expect(refreshPendingOps).toHaveBeenCalledTimes(3)
+        await vi.advanceTimersByTimeAsync(30_000)
+        expect(refreshPendingOps).toHaveBeenCalledTimes(4)
+      } finally {
+        scope.stop()
+        vi.useRealTimers()
+      }
+    }
+  )
 
   it('notifies the mining inventory after delayed confirmation is authenticated', async () => {
     const confirmed = {

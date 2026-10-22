@@ -206,6 +206,11 @@ async function detachAtWalletTimeout(harness: Awaited<ReturnType<typeof installO
     expect.objectContaining({ id: prepared.batch, phase: 'awaiting-wallet', txHash: '' })
   ])
   expect(harness.activeLocks).toContain(harness.lockKey)
+  expect(onStep.mock.lastCall?.[0]).toMatchObject({ send: 'error', confirm: 'wait' })
+  expect(onStep.mock.lastCall?.[0].error).toContain(
+    'MetaMask did not return a result within 2 minutes'
+  )
+  expect(onStep.mock.lastCall?.[0].logs.at(-1)).toMatchObject({ status: 'error' })
   return { prepared, onStep }
 }
 
@@ -214,6 +219,7 @@ describe('offline transaction safety integration (H-08)', () => {
     const harness = await installOfflineHarness()
     const { prepared, onStep } = await detachAtWalletTimeout(harness)
     const notifications = onStep.mock.calls.length
+    expect(harness.locks.lockedIds('eth', WALLET).size).toBe(0)
     const retry = await harness.prepare()
     const retryFailure = expect(harness.tx.sendPreparedOperation(retry)).rejects.toThrow(
       'LOCAL_PENDING_UNRESOLVED'
@@ -230,6 +236,10 @@ describe('offline transaction safety integration (H-08)', () => {
     expect(harness.readProvider.waitForTransaction).not.toHaveBeenCalled()
     expect(onStep).toHaveBeenCalledTimes(notifications)
     expect(harness.activeLocks.size).toBe(0)
+    expect(harness.locks.pendingLocks('eth', WALLET)).toEqual([
+      expect.objectContaining({ batch: prepared.batch, txHash: HASH, ids: [1] })
+    ])
+    expect(harness.locks.broadcastLockedIds('eth', WALLET)).toEqual(new Set([1]))
     expect(harness.pending.listPendingOps('eth', WALLET)).toEqual([
       expect.objectContaining({
         id: prepared.batch,
@@ -242,11 +252,13 @@ describe('offline transaction safety integration (H-08)', () => {
 
     vi.resetModules()
     const reloaded = await import('@/core/pendingOps')
+    const reloadedLocks = await import('@/core/localLock')
     expect(reloaded.countUnresolvedPendingOps('eth', WALLET)).toBe(1)
     expect(reloaded.listPendingOps('eth', WALLET)).toEqual([
       expect.objectContaining({ id: prepared.batch, phase: 'broadcast', txHash: HASH })
     ])
     expect(harness.sendRequests()).toHaveLength(1)
+    expect(reloadedLocks.broadcastLockedIds('eth', WALLET)).toEqual(new Set([1]))
   })
 
   it('drops only a late code-4001 request, allowing a new explicit send', async () => {
@@ -336,4 +348,39 @@ describe('offline transaction safety integration (H-08)', () => {
       expect(harness.readProvider.waitForTransaction).not.toHaveBeenCalled()
     }
   )
+
+  it('persists a late broadcast hash even when the VMU lock cache cannot be written', async () => {
+    const harness = await installOfflineHarness()
+    const { prepared } = await detachAtWalletTimeout(harness)
+    const setItem = vi.mocked(harness.storage.setItem).getMockImplementation()!
+    vi.mocked(harness.storage.setItem).mockImplementation((key, value) => {
+      if (key === 'sm.vmuLocks') throw new DOMException('lock storage full', 'QuotaExceededError')
+      return setItem(key, value)
+    })
+    harness.walletResponse.resolve(HASH)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(harness.pending.listPendingOps('eth', WALLET)).toEqual([
+      expect.objectContaining({ id: prepared.batch, txHash: HASH, phase: 'broadcast' })
+    ])
+    expect(harness.pending.countUnresolvedPendingOps('eth', WALLET)).toBe(1)
+    expect(harness.sendRequests()).toHaveLength(1)
+  })
+
+  it('retains the unresolved request if journal persistence fails after a real hash arrives', async () => {
+    const harness = await installOfflineHarness()
+    const { prepared } = await detachAtWalletTimeout(harness)
+    const setItem = vi.mocked(harness.storage.setItem).getMockImplementation()!
+    vi.mocked(harness.storage.setItem).mockImplementation((key, value) => {
+      if (key.startsWith('sm.pendingOps.event.'))
+        throw new DOMException('journal full', 'QuotaExceededError')
+      return setItem(key, value)
+    })
+    harness.walletResponse.resolve(HASH)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(harness.pending.listPendingOps('eth', WALLET)).toEqual([
+      expect.objectContaining({ id: prepared.batch, txHash: '', phase: 'awaiting-wallet' })
+    ])
+    expect(harness.pending.countUnresolvedPendingOps('eth', WALLET)).toBe(1)
+    expect(harness.sendRequests()).toHaveLength(1)
+  })
 })

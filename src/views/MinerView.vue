@@ -39,6 +39,9 @@ const { state: rpcHealth, unavailable: rpcUnavailable } = useRpcHealth(() => rea
 
 const rpcHealthMessage = computed(() => {
   const state = rpcHealth.value
+  if (state.error && state.errorKind === 'configuration') {
+    return `${state.error.replace(/^RPC_UNAVAILABLE:\s*/, '')}. Your RPC list was not changed. Open the RPC settings to correct the configuration or reset to defaults. Chain reads and transactions remain blocked until validation succeeds.`
+  }
   if (state.error || (state.checkedAt !== null && state.healthyUrls.length === 0)) {
     return `No usable ${CHAINS[state.chain].name} RPC endpoints (${state.healthyUrls.length}/${state.totalUrls}). Your RPC list was not changed. Check internet access, DNS, firewall, and proxy/VPN settings, then recheck; or use the RPC button to change endpoints. Chain reads and transactions are blocked until a recheck succeeds.`
   }
@@ -79,6 +82,7 @@ async function onChainSelect(ev: Event) {
 }
 const {
   hasPending,
+  ready: pendingReady,
   pendingCount,
   localUnresolvedCount,
   ops: pendingOps,
@@ -123,6 +127,11 @@ const {
 )
 
 const pendingBlockedReason = computed(() => {
+  if (!pendingReady.value) {
+    return pendingError.value
+      ? 'Blocked: pending transaction check failed. Recheck before submitting.'
+      : 'Blocked: verifying pending transactions for this account and network.'
+  }
   if (!hasPending.value) return null
   if (pendingCount.value > 0) {
     return `Blocked: ${pendingCount.value} pending tx on-chain`
@@ -209,6 +218,7 @@ const canOperate = computed(
     wallet.contractWalletChecked &&
     !rpcUnavailable.value &&
     !busy.value &&
+    pendingReady.value &&
     !hasPending.value
 )
 
@@ -267,16 +277,17 @@ async function operate(
   ) {
     return
   }
-  if (pendingError?.value) {
+  if (!pendingReady.value || pendingError.value) {
     busy.value = false
+    const error =
+      pendingError.value ??
+      'Pending transaction check has not completed. Recheck before submitting.'
     txState.value = {
       estimate: 'error',
       send: 'wait',
       confirm: 'wait',
-      error: pendingError.value,
-      logs: [
-        { at: Date.now(), status: 'error', message: `Pending check failed: ${pendingError.value}` }
-      ]
+      error,
+      logs: [{ at: Date.now(), status: 'error', message: `Pending check failed: ${error}` }]
     }
     return
   }
@@ -286,7 +297,9 @@ async function operate(
       estimate: 'error',
       send: 'wait',
       confirm: 'wait',
-      error: `Blocked: ${n} pending tx on-chain. Wait, Speed up, or Cancel in MetaMask first.`
+      error:
+        pendingBlockedReason.value ??
+        `Blocked: ${n} pending tx on-chain. Wait, Speed up, or Cancel in MetaMask first.`
     }
     txVisible.value = true
     busy.value = false
@@ -329,7 +342,7 @@ async function signPrepared() {
   const requestedContextGen = wallet.contextGen
   const n = await checkPending()
   if (seq !== opSeq || wallet.contextGen !== requestedContextGen || prepared.value !== prep) return
-  if (n > 0 || pendingError?.value) {
+  if (!pendingReady.value || n > 0 || pendingError.value) {
     abortPrepared(prep)
     prepared.value = null
     busy.value = false
@@ -339,7 +352,8 @@ async function signPrepared() {
       confirm: 'wait',
       readyToSign: false,
       error:
-        pendingError?.value ??
+        pendingError.value ??
+        pendingBlockedReason.value ??
         `A previous transaction is still pending (${n}). Wait for it in MetaMask, then retry.`
     }
     return
@@ -533,6 +547,9 @@ const explorerAddrUrl = computed(() => {
         @track="onTrackHash"
         @mark-dropped="onMarkPendingDropped"
       />
+      <p v-if="!pendingReady" class="dim" role="status">
+        {{ pendingBlockedReason }} <span v-if="pendingError">{{ pendingError }}</span>
+      </p>
       <p v-if="trackError" class="card warn-card">{{ trackError }}</p>
 
       <!-- operation tabs -->
@@ -661,7 +678,9 @@ const explorerAddrUrl = computed(() => {
 
       <!-- mint list -->
       <MintList
-        :busy="busy || hasPending || rpcUnavailable || !wallet.contractWalletChecked"
+        :busy="
+          busy || !pendingReady || hasPending || rpcUnavailable || !wallet.contractWalletChecked
+        "
         :blocked-reason="
           rpcUnavailable
             ? `Blocked: no healthy ${CHAINS[readChain].name} RPC endpoint`

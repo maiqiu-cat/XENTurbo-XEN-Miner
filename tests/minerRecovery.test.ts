@@ -57,10 +57,12 @@ vi.mock('@/composables/useRpcHealth', () => ({
 vi.mock('@/composables/usePendingTx', () => ({
   usePendingTx: () => ({
     hasPending: ref(false),
+    ready: ref(true),
     pendingCount: ref(0),
     localUnresolvedCount: ref(0),
     ops: ref([]),
     checking: ref(false),
+    error: ref(null),
     check: vi.fn(async () => 0),
     trackHash: vi.fn(),
     markDropped: vi.fn()

@@ -24,6 +24,7 @@ export function usePendingTx(
   const checking = ref(false)
   const lastCheckedAt = ref<number | null>(null)
   const error = ref<string | null>(null)
+  const ready = ref(false)
 
   let timer: ReturnType<typeof setTimeout> | null = null
   let gen = 0
@@ -42,6 +43,7 @@ export function usePendingTx(
     ops.value = []
     lastCheckedAt.value = null
     error.value = null
+    ready.value = false
   }
 
   function check(options: { freshRpc?: boolean; reverifyResults?: boolean } = {}): Promise<number> {
@@ -67,11 +69,13 @@ export function usePendingTx(
         localUnresolvedCount.value = unresolvedCount
         ops.value = views
         lastCheckedAt.value = Date.now()
+        ready.value = true
         if (confirmedOps?.length) onConfirmed?.(confirmedOps)
         return pendingNonceGap
       })
       .catch((err: any) => {
         if (myGen !== gen) return pendingCount.value
+        ready.value = false
         error.value = err?.shortMessage || err?.message || 'Failed to check pending txs'
         return pendingCount.value
       })
@@ -123,17 +127,24 @@ export function usePendingTx(
     document.addEventListener('visibilitychange', onVisibilityChange)
   }
 
+  const contextVersion = ref(0)
   watch(
     [() => address(), () => chain()],
-    ([addr, key]) => {
+    () => {
+      stopPolling()
       resetState()
-      if (addr && key) startPolling()
-      else {
-        stopPolling()
-        resetState()
-      }
+      contextVersion.value += 1
     },
-    { immediate: true, flush: 'sync' }
+    { flush: 'sync' }
+  )
+  // An A -> null -> A round trip must also restart polling after invalidation.
+  watch(
+    contextVersion,
+    () => {
+      resetState()
+      if (address() && chain()) startPolling()
+    },
+    { immediate: true }
   )
 
   onScopeDispose(() => {
@@ -172,6 +183,7 @@ export function usePendingTx(
     localUnresolvedCount: localUnresolvedCount as Ref<number>,
     ops: ops as Ref<PendingOpView[]>,
     hasPending,
+    ready,
     checking,
     lastCheckedAt,
     error,

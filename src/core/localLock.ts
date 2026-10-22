@@ -52,16 +52,17 @@ function isAlive(l: LockRecord, now: number): boolean {
   return hasTx || now - l.lockedAt < SOFT_LOCK_TTL_MS
 }
 
-function readAll(): LockRecord[] {
+function readAll(strict = false): LockRecord[] {
   try {
     const raw = localStorage.getItem(KEY)
     const list = raw ? (JSON.parse(raw) as unknown[]) : []
-    if (!Array.isArray(list)) return []
+    if (!Array.isArray(list)) throw new Error('Invalid VMU lock storage')
     const now = Date.now()
     const valid = list.filter(isValidLock).filter((l) => isAlive(l, now))
     if (valid.length !== list.length) writeAll(valid)
     return valid
-  } catch {
+  } catch (error) {
+    if (strict) throw error
     return []
   }
 }
@@ -132,11 +133,21 @@ export function tryAcquireLock(params: {
   return true
 }
 
-export function attachTxHash(batch: string, txHash: string): void {
-  const list = readAll()
-  list.forEach((l) => {
-    if (l.batch === batch) l.txHash = txHash
-  })
+export function attachTxHash(
+  batch: string,
+  txHash: string,
+  metadata?: Omit<LockRecord, 'batch' | 'txHash' | 'lockedAt'> & { lockedAt?: number }
+): void {
+  if (metadata && metadata.ids.length === 0) return
+  const list = readAll(true)
+  const matching = list.filter((lock) => lock.batch === batch && (!metadata || scope(metadata.chain, metadata.wallet)(lock)))
+  if (matching.some((lock) => lock.txHash && lock.txHash.toLowerCase() !== txHash.toLowerCase())) {
+    throw new Error('LOCK_IDENTITY_CONFLICT: a broadcast lock cannot change transaction identity')
+  }
+  matching.forEach((lock) => { lock.txHash = txHash })
+  if (metadata && matching.length === 0) {
+    list.push({ ...metadata, ids: [...metadata.ids], batch, txHash, lockedAt: metadata.lockedAt ?? Date.now() })
+  }
   writeAll(list)
 }
 

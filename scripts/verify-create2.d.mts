@@ -23,6 +23,8 @@ export interface VerificationArgs extends Required<VerificationScanOptions> {
 
 export interface VerificationProvider extends ContractRunner {
   getNetwork(): Promise<{ chainId: bigint }>
+  getBlockNumber(): Promise<number>
+  getCode(address: string, blockTag?: number): Promise<string>
   call(transaction: TransactionRequest): Promise<string>
 }
 

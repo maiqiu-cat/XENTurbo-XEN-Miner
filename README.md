@@ -114,12 +114,17 @@ cp .env.example .env
 Custom RPC endpoints can also be added through the RPC control in the Miner.
 Only HTTPS endpoints that return the expected chain ID are accepted.
 Custom lists allow up to 16 distinct endpoints, with a 2,048-character limit per
-URL. Saving settings validates at most four endpoints concurrently. Operation
+normalized URL. The raw input text is limited to 32,784 characters, including
+whitespace and line separators. Saving settings validates at most four endpoints
+concurrently; after failure it stops dispatching and waits for in-flight checks
+before allowing another save. Operation
 health checks probe the bounded list in parallel to preserve wallet read
 deadlines. Failed checks preserve the configured list; check the local network
 or edit RPC settings to recover. Legacy entries exceeding the new limits remain
 visible and are rejected explicitly until edited, rather than silently selecting
-defaults or deleting the saved configuration.
+defaults or deleting the saved configuration. Configuration errors are shown
+separately from network failures. Transaction controls remain blocked until the
+current wallet and chain have completed pending reconciliation successfully.
 
 ## Page and performance analytics
 
@@ -248,8 +253,23 @@ successive VMU batches until it finds an active derived proxy, with a default
 budget of 1,000 VMUs and 30 seconds for the whole check. Budget exhaustion returns
 `NOT_VERIFIED` (exit code 2), not a derivation mismatch. Resume with the reported
 `--from-id`, or adjust `--scan-limit` (up to 100,000) and `--deadline-ms` (up to
-300,000). Use `--rpc https://...` to override the selected chain's default RPC;
-redirects are rejected, so supply the endpoint's final URL explicitly.
+300,000). Reads are pinned to one block. Before accepting an active witness, the
+gate checks exact proxy runtime code at the first and last allocated IDs and
+absence at the next ID (when representable), catching constant numbering shifts.
+This supplements fixed-address unit tests; it does not prove every intermediate ID.
+
+Exit codes are `0` for verified, `1` for arguments/RPC errors, `2` for unverified
+(including budget exhaustion, no VMUs, an out-of-range start, or no active witness),
+and `3` for a proxy boundary mismatch. Scan progress and continuation IDs are
+reported on interruption. The scan budget bounds verification, not an OS-level
+process kill deadline.
+
+Use `--rpc https://...` to override the selected chain's default RPC. Plain HTTP
+is permitted only for explicit loopback test endpoints. Redirects are rejected;
+supply the final endpoint URL. HTTP 429 responses receive at most two retries,
+respecting Retry-After within the total verification budget. Release probes use
+strict JSON-RPC batch/ABI validation and reject redirects. Their chain IDs must
+use canonical hexadecimal quantities, so a noncanonical `0x01` is rejected.
 
 Playwright uses a dedicated local production-preview server on port 4173. If that
 port is occupied by another application, keep that application running and set

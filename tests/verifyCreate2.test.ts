@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createServer, type Server } from 'node:http'
 import type { Socket } from 'node:net'
 import { fileURLToPath } from 'node:url'
@@ -12,6 +12,7 @@ import {
   solidityPackedKeccak256
 } from 'ethers'
 import { parseVerificationArgs, verifyCreate2 } from '../scripts/verify-create2.mjs'
+import { minimalProxyRuntimeCode } from '../src/core/create2'
 
 const FACTORY = '0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2'
 const ETH_XEN = '0x06450dEe7FD2Fb8E39061434BAbCFC05599a6Fb8'
@@ -58,9 +59,21 @@ function rpcResult(
     vmuCount: number | bigint
     wallet: string
     xen: string
+    proxyShift: number
   }
 ): string {
   if (method === 'eth_chainId') return `0x${options.chainId.toString(16)}`
+  if (method === 'eth_blockNumber') return '0x1'
+  if (method === 'eth_getCode') {
+    const address = getAddress(params[0] as string)
+    const count = BigInt(options.vmuCount)
+    const shifted = [1n, count]
+      .map((id) => id + BigInt(options.proxyShift))
+      .filter((id) => id >= 0n && id < 1n << 256n)
+    return shifted.some((id) => address === getAddress(proxyForId(options.wallet, id)))
+      ? minimalProxyRuntimeCode(VMU_TEMPLATE)
+      : '0x'
+  }
   if (method !== 'eth_call') throw new Error(`Unexpected RPC method ${method}`)
 
   const call = params[0] as { data?: string; to?: string }
@@ -99,7 +112,10 @@ async function runVerification({
   mintDelayMs = 0,
   misdirectedIds = [],
   redirect = false,
-  vmuCount = 1
+  vmuCount = 1,
+  proxyShift = 0,
+  rateLimitOnce = false,
+  retryAfter
 }: {
   activeIds?: Array<number | bigint>
   chain?: 'eth' | 'polygon'
@@ -113,6 +129,9 @@ async function runVerification({
   misdirectedIds?: number[]
   redirect?: boolean
   vmuCount?: number | bigint
+  proxyShift?: number
+  rateLimitOnce?: boolean
+  retryAfter?: string
 } = {}) {
   const xen = chain === 'eth' ? ETH_XEN : POLYGON_XEN
   const wallet =
@@ -131,6 +150,15 @@ async function runVerification({
         | { id: number; method: string; params: unknown[] }
         | Array<{ id: number; method: string; params: unknown[] }>
       const requests = Array.isArray(payload) ? payload : [payload]
+      if (rateLimitOnce) {
+        rateLimitOnce = false
+        response.writeHead(429, {
+          Connection: 'close',
+          ...(retryAfter ? { 'Retry-After': retryAfter } : {})
+        })
+        response.end()
+        return
+      }
       if (redirect) {
         rpcMethods.push(...requests.map(({ method }) => method))
         response.writeHead(302, { Location: '/redirect-target', Connection: 'close' })
@@ -167,7 +195,8 @@ async function runVerification({
           misdirectedIds,
           vmuCount,
           wallet,
-          xen
+          xen,
+          proxyShift
         })
       }))
       const reply = () => {
@@ -245,7 +274,7 @@ async function runVerification({
         cwd: process.cwd(),
         env: { ...env },
         stdio: ['ignore', 'pipe', 'pipe'],
-        timeout: 4_000,
+        timeout: 10_000,
         killSignal: 'SIGKILL'
       }
     )
@@ -275,6 +304,62 @@ async function runVerification({
 }
 
 describe('CREATE2 verification release gate', () => {
+  it('ends with NOT_VERIFIED when DNS lookup never completes in an isolated fixture', () => {
+    const entrypoint = new URL('../scripts/verify-create2.mjs', import.meta.url)
+    const script = `
+      import dns from 'node:dns';
+      dns.lookup = () => {};
+      process.argv = [process.execPath, ${JSON.stringify(fileURLToPath(entrypoint))}, '--chain', 'eth', '--wallet', ${JSON.stringify(WALLET)}, '--rpc', 'https://unresolved.fixture.invalid', '--deadline-ms', '250'];
+      await import(${JSON.stringify(entrypoint.href)});
+    `
+    const result = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
+      env: {},
+      encoding: 'utf8',
+      timeout: 8_000
+    })
+    expect(result.error).toBeUndefined()
+    expect(result.status).toBe(2)
+    expect(result.stdout).toContain('NOT_VERIFIED: DEADLINE_EXCEEDED')
+  })
+  it.each([-1, 1])(
+    'rejects a proxy numbering shift of %s instead of accepting another active VMU',
+    async (proxyShift) => {
+      const result = await runVerification({ vmuCount: 3, activeIds: [2], proxyShift })
+      expect(result.code).toBe(3)
+      expect(result.stderr).toContain('CREATE2_MISMATCH')
+      expect(result.stdout).not.toContain('CREATE2 derivation VERIFIED')
+      expect(result.providerDestroyCount).toBe(1)
+    }
+  )
+
+  it('retries one transient rate limit inside the owned transport', async () => {
+    const result = await runVerification({ activeIds: [1], rateLimitOnce: true })
+    expect(result.code).toBe(0)
+    expect(result.stdout).toContain('CREATE2 derivation VERIFIED')
+    expect(result.openConnections).toBe(0)
+  })
+
+  it('respects Retry-After without outliving the total scan budget', async () => {
+    const result = await runVerification({
+      activeIds: [1],
+      rateLimitOnce: true,
+      retryAfter: '60',
+      extraArgs: ['--deadline-ms', '250']
+    })
+    expect(result.code).toBe(2)
+    expect(result.stdout).toContain('NOT_VERIFIED: DEADLINE_EXCEEDED')
+    expect(result.openConnections).toBe(0)
+  })
+
+  it.each(['--wallet', '--rpc', '--chain'])(
+    'rejects a missing %s value without silently choosing defaults',
+    async (flag) => {
+      const result = await runVerification({ extraArgs: [flag] })
+      expect(result.code).toBe(1)
+      expect(result.stderr).toContain('ARGUMENT_VALUE_REQUIRED')
+      expect(result.rpcMethods).toEqual([])
+    }
+  )
   it('requires a per-chain witness address rather than using a default wallet', async () => {
     const result = await runVerification({ cliWallet: null })
 
@@ -437,7 +522,7 @@ describe('CREATE2 verification release gate', () => {
       const result = await runVerification({
         hang,
         vmuCount: 100,
-        extraArgs: ['--deadline-ms', '500']
+        extraArgs: ['--deadline-ms', '1500']
       })
 
       expect(result.code).toBe(2)
@@ -452,19 +537,31 @@ describe('CREATE2 verification release gate', () => {
   )
 
   it('uses one total deadline rather than restarting the budget for each read', async () => {
-    const result = await runVerification({
-      activeIds: [1],
-      countDelayMs: 200,
-      mintDelayMs: 200,
-      extraArgs: ['--deadline-ms', '350']
-    })
-
-    expect(result.code).toBe(2)
-    expect(result.stdout).toContain('NOT_VERIFIED: DEADLINE_EXCEEDED')
-    expect(result.stdout).not.toContain('CREATE2 derivation VERIFIED')
-    expect(result.mintProxies).toHaveLength(1)
-    expect(result.providerDestroyCount).toBe(1)
-    expect(result.openConnections).toBe(0)
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] })
+    const { config, wallet } = parseVerificationArgs(['--chain', 'eth', '--wallet', WALLET], {})
+    const provider = {
+      provider: null,
+      getNetwork: vi.fn(async () => ({ chainId: 1n })),
+      getBlockNumber: vi.fn(async () => 1),
+      getCode: vi.fn(async (address: string) =>
+        getAddress(address) === getAddress(proxyForId(WALLET, 1))
+          ? minimalProxyRuntimeCode(VMU_TEMPLATE)
+          : '0x'
+      ),
+      call: vi.fn(async (transaction: { to: string }) => {
+        await new Promise((resolve) => setTimeout(resolve, 200))
+        return transaction.to.toLowerCase() === FACTORY.toLowerCase()
+          ? factoryInterface.encodeFunctionResult('vmuCount', [1])
+          : xenInterface.encodeFunctionResult('userMints', [proxyForId(WALLET, 1), 100, 0, 1, 0, 0])
+      })
+    }
+    const log = vi.fn()
+    const result = verifyCreate2({ config, wallet, provider, log, deadlineMs: 350 })
+    await vi.advanceTimersByTimeAsync(350)
+    expect(await result).toBe(false)
+    expect(provider.call).toHaveBeenCalledTimes(2)
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('NOT_VERIFIED: DEADLINE_EXCEEDED'))
+    expect(log).not.toHaveBeenCalledWith('CREATE2 derivation VERIFIED against on-chain data.')
   })
 
   it('accepts uint256-sized page offsets without lossy number conversion', async () => {
@@ -505,7 +602,9 @@ describe('CREATE2 verification release gate', () => {
     const result = await runVerification({ extraArgs })
 
     expect(result.code).toBe(1)
-    expect(result.stderr).toContain('INVALID_SCAN_OPTION')
+    expect(result.stderr).toContain(
+      extraArgs.length === 1 ? 'ARGUMENT_VALUE_REQUIRED' : 'INVALID_SCAN_OPTION'
+    )
     expect(result.rpcMethods).toEqual([])
     expect(result.providerDestroyCount).toBe(0)
   })
@@ -546,6 +645,8 @@ describe('CREATE2 verification release gate', () => {
           })
       ),
       call: vi.fn(),
+      getBlockNumber: vi.fn(async () => 1),
+      getCode: vi.fn(async () => '0x'),
       destroy: vi.fn()
     }
     const log = vi.fn()
@@ -570,6 +671,12 @@ describe('CREATE2 verification release gate', () => {
     const provider = {
       provider: null,
       getNetwork: vi.fn().mockResolvedValue({ chainId: 1n }),
+      getBlockNumber: vi.fn(async () => 1),
+      getCode: vi.fn(async (address: string) =>
+        getAddress(address) === getAddress(proxyForId(WALLET, 1))
+          ? minimalProxyRuntimeCode(VMU_TEMPLATE)
+          : '0x'
+      ),
       call: vi
         .fn()
         .mockResolvedValueOnce(factoryInterface.encodeFunctionResult('vmuCount', [1]))

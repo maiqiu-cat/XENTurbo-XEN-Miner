@@ -2,6 +2,8 @@
 
 import { Interface } from 'ethers'
 import { CHAIN_CONFIG } from './chain-config.mjs'
+import { isMainModule, normalizeProbeUrl } from './cli-utils.mjs'
+import { rpcBatchResults, rpcStringResult, rpcChainId, rpcAbiWord } from './rpc-response.mjs'
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
 const factoryInterface = new Interface([
@@ -14,19 +16,21 @@ function rpcCall(id, method, params) {
 }
 
 function usableCode(value) {
-  return typeof value === 'string' && /^0x[0-9a-f]+$/i.test(value) && value !== '0x'
+  return typeof value === 'string' && /^0x(?:[0-9a-f]{2})+$/i.test(value)
 }
 
 export async function probeReleaseEndpoint(url, config, fetchImpl = fetch) {
-  const endpoint = new URL(url)
-  if (endpoint.protocol !== 'https:') {
-    return { healthy: false, url, error: 'HTTPS_REQUIRED' }
+  try {
+    normalizeProbeUrl(url)
+  } catch (error) {
+    return { healthy: false, url, error: error.message }
   }
 
   let response
   try {
     response = await fetchImpl(url, {
       method: 'POST',
+      redirect: 'error',
       headers: { 'Content-Type': 'application/json' },
       signal: AbortSignal.timeout(10_000),
       body: JSON.stringify([
@@ -58,9 +62,9 @@ export async function probeReleaseEndpoint(url, config, fetchImpl = fetch) {
 
   try {
     const payload = await response.json()
-    const results = new Map(Array.isArray(payload) ? payload.map((item) => [item.id, item]) : [])
-    const chainId = Number(BigInt(results.get(1)?.result))
-    if (chainId !== config.chainId) {
+    const results = rpcBatchResults(payload, [1, 2, 3, 4, 5, 6])
+    const chainId = rpcChainId(rpcStringResult(results, 1, 'eth_chainId'))
+    if (chainId !== BigInt(config.chainId)) {
       return {
         healthy: false,
         url,
@@ -72,13 +76,19 @@ export async function probeReleaseEndpoint(url, config, fetchImpl = fetch) {
       [3, 'xenCrypto'],
       [4, 'vmuTemplate']
     ]) {
-      if (!usableCode(results.get(id)?.result)) {
+      if (!usableCode(rpcStringResult(results, id, label))) {
         return { healthy: false, url, error: `CONTRACT_CODE_MISSING: ${label}` }
       }
     }
-    const [fee] = factoryInterface.decodeFunctionResult('FEE', results.get(5)?.result)
-    const [vmuCount] = factoryInterface.decodeFunctionResult('vmuCount', results.get(6)?.result)
-    return { healthy: true, url, chainId, fee, vmuCount }
+    const [fee] = factoryInterface.decodeFunctionResult(
+      'FEE',
+      rpcAbiWord(rpcStringResult(results, 5, 'FEE'), 'FEE')
+    )
+    const [vmuCount] = factoryInterface.decodeFunctionResult(
+      'vmuCount',
+      rpcAbiWord(rpcStringResult(results, 6, 'vmuCount'), 'vmuCount')
+    )
+    return { healthy: true, url, chainId: Number(chainId), fee, vmuCount }
   } catch (error) {
     return {
       healthy: false,
@@ -89,6 +99,8 @@ export async function probeReleaseEndpoint(url, config, fetchImpl = fetch) {
 }
 
 async function main() {
+  if (process.argv.length > 2)
+    throw new Error('UNEXPECTED_ARGUMENT: this probe does not accept CLI options.')
   let failed = false
   for (const config of Object.values(CHAIN_CONFIG)) {
     let passed = null
@@ -112,7 +124,7 @@ async function main() {
   if (failed) process.exitCode = 1
 }
 
-if (import.meta.url === new URL(process.argv[1], 'file:').href) {
+if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error))
     process.exitCode = 1

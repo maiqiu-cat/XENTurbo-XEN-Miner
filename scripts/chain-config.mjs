@@ -30,7 +30,7 @@ export const CHAIN_CONFIG = Object.freeze({
 })
 
 export function getChainConfig(key) {
-  const config = CHAIN_CONFIG[key]
-  if (!config) throw new Error(`Unsupported chain ${JSON.stringify(key)}; use eth or polygon.`)
-  return config
+  if (!Object.hasOwn(CHAIN_CONFIG, key))
+    throw new Error(`Unsupported chain ${JSON.stringify(key)}; use eth or polygon.`)
+  return CHAIN_CONFIG[key]
 }

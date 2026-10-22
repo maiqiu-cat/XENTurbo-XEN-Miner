@@ -7,9 +7,11 @@
 
 import { Agent as HttpAgent } from 'node:http'
 import { Agent as HttpsAgent } from 'node:https'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { Contract, FetchRequest, JsonRpcProvider, getAddress } from 'ethers'
-import { computeProxyAddress } from '../src/core/create2.ts'
+import { computeProxyAddress, minimalProxyRuntimeCode } from '../src/core/create2.ts'
 import { getChainConfig } from './chain-config.mjs'
+import { cliValue, isMainModule, normalizeProbeUrl } from './cli-utils.mjs'
 
 const SCAN_BATCH_SIZE = 5
 const DEFAULT_SCAN_LIMIT = 1_000
@@ -44,12 +46,12 @@ export function parseVerificationArgs(argv, env = process.env) {
 
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index]
-    if (value === '--chain') chain = argv[++index]
-    else if (value === '--wallet') wallet = argv[++index]
-    else if (value === '--rpc') rpcUrl = argv[++index]
-    else if (value === '--from-id') fromId = argv[++index]
-    else if (value === '--scan-limit') scanLimit = argv[++index]
-    else if (value === '--deadline-ms') deadlineMs = argv[++index]
+    if (value === '--chain') chain = cliValue(argv, ++index, value)
+    else if (value === '--wallet') wallet = cliValue(argv, ++index, value)
+    else if (value === '--rpc') rpcUrl = cliValue(argv, ++index, value)
+    else if (value === '--from-id') fromId = cliValue(argv, ++index, value)
+    else if (value === '--scan-limit') scanLimit = cliValue(argv, ++index, value)
+    else if (value === '--deadline-ms') deadlineMs = cliValue(argv, ++index, value)
     else
       throw new Error(
         `Unknown argument ${JSON.stringify(value)}. Use --chain, --wallet, --rpc, --from-id, --scan-limit, and --deadline-ms.`
@@ -68,7 +70,7 @@ export function parseVerificationArgs(argv, env = process.env) {
 
   return {
     config,
-    rpcUrl: rpcUrl ?? config.rpcUrls[0],
+    rpcUrl: normalizeProbeUrl(rpcUrl ?? config.rpcUrls[0], true),
     wallet: getAddress(witness),
     fromId: positiveOption(fromId, '--from-id', UINT256_MAX),
     scanLimit: Number(positiveOption(scanLimit, '--scan-limit', MAX_SCAN_LIMIT)),
@@ -128,7 +130,10 @@ export async function verifyCreate2({
   try {
     return await scan()
   } catch (error) {
-    if (error !== deadlineError) throw error
+    if (error !== deadlineError) {
+      log(`Verification interrupted; scanned=${scanned}; resume with --from-id ${nextId}.`)
+      throw error
+    }
     log(
       `NOT_VERIFIED: DEADLINE_EXCEEDED after ${deadlineMs} ms; scanned=${scanned}; resume with --from-id ${nextId}.`
     )
@@ -143,9 +148,10 @@ export async function verifyCreate2({
       )
     }
 
+    const blockTag = await readBeforeDeadline(() => provider.getBlockNumber())
     const factory = new Contract(config.factory, factoryAbi, provider)
     const xen = new Contract(config.xenCrypto, xenAbi, provider)
-    const vmuCount = await readBeforeDeadline(() => factory.vmuCount(wallet))
+    const vmuCount = await readBeforeDeadline(() => factory.vmuCount(wallet, { blockTag }))
     log(`chain=${config.key} chainId=${config.chainId}`)
     log(`wallet=${wallet}`)
     log(`vmuCount=${vmuCount}`)
@@ -158,6 +164,38 @@ export async function verifyCreate2({
     if (fromId > vmuCount) {
       log('NOT_VERIFIED: --from-id is beyond the wallet VMU count.')
       return false
+    }
+
+    // Pin both the inventory and boundary probes to one block, so concurrent
+    // minting cannot turn a newly deployed next proxy into a false mismatch.
+    const derive = (id) =>
+      computeProxyAddress({
+        factory: config.factory,
+        vmuTemplate: config.vmuTemplate,
+        wallet,
+        vmuId: id
+      })
+    const boundaries = [
+      ...new Set([1n, vmuCount, ...(vmuCount < UINT256_MAX ? [vmuCount + 1n] : [])])
+    ]
+    const codes = await readBeforeDeadline(() =>
+      Promise.all(
+        boundaries.map(async (id) => ({
+          id,
+          code: await provider.getCode(derive(id), blockTag)
+        }))
+      )
+    )
+    const expectedCode = minimalProxyRuntimeCode(config.vmuTemplate).toLowerCase()
+    for (const { id, code } of codes) {
+      const matches = id <= vmuCount ? code.toLowerCase() === expectedCode : code === '0x'
+      if (!matches) {
+        const mismatch = new Error(
+          `CREATE2_MISMATCH: deployed proxy boundary does not match VMU id ${id} at block ${blockTag}.`
+        )
+        mismatch.code = 'CREATE2_MISMATCH'
+        throw mismatch
+      }
     }
 
     const scanEnd = fromId + BigInt(scanLimit) - 1n
@@ -180,13 +218,11 @@ export async function verifyCreate2({
               wallet,
               vmuId: id
             })
-            const mint = await xen.userMints(proxy)
+            const mint = await xen.userMints(proxy, { blockTag })
             return { id, mint, proxy }
           })
         )
       )
-      scanned += records.length
-
       for (const { id, mint, proxy } of records) {
         if (performance.now() >= deadline) throw deadlineError
         const active = mint.user !== ZERO_ADDRESS && mint.rank > 0n && mint.term > 0n
@@ -200,6 +236,8 @@ export async function verifyCreate2({
           log('CREATE2 derivation VERIFIED against on-chain data.')
           return true
         }
+        scanned += 1
+        nextId = id + 1n
       }
       nextId = toId + 1n
     }
@@ -210,7 +248,9 @@ export async function verifyCreate2({
       )
       return false
     }
-    log('NOT_VERIFIED: no active VMU records a derived proxy as its on-chain minter.')
+    log(
+      `NOT_VERIFIED: no active VMU records a derived proxy as its on-chain minter in ids ${fromId}..${lastId}.`
+    )
     return false
   }
 }
@@ -218,24 +258,41 @@ export async function verifyCreate2({
 async function main() {
   const { config, rpcUrl, wallet, ...scanOptions } = parseVerificationArgs(process.argv.slice(2))
   const agent = new URL(rpcUrl).protocol === 'https:' ? new HttpsAgent() : new HttpAgent()
+  const transport = new AbortController()
   let provider
   try {
     const request = new FetchRequest(rpcUrl)
     request.timeout = scanOptions.deadlineMs
     const getUrl = FetchRequest.createGetUrlFunc({ agent })
     request.getUrlFunc = async (connection, signal) => {
-      const response = await getUrl(connection, signal)
-      // Ethers redirects discard this request's owned transport and retry policy.
-      if ([301, 302, 307, 308].includes(response.statusCode)) {
-        throw new Error('RPC_REDIRECT_REQUIRES_EXPLICIT_URL: pass the final RPC URL with --rpc.')
+      for (let attempt = 0; ; attempt += 1) {
+        transport.signal.throwIfAborted()
+        const response = await getUrl(connection, signal)
+        if ([301, 302, 307, 308].includes(response.statusCode)) {
+          throw new Error('RPC_REDIRECT_REQUIRES_EXPLICIT_URL: pass the final RPC URL with --rpc.')
+        }
+        if (response.statusCode !== 429 || attempt === 2) return response
+        const retryAfter = response.headers['retry-after']
+        const serverDelay =
+          typeof retryAfter === 'string' && /^\d+$/.test(retryAfter)
+            ? Number(retryAfter) * 1_000
+            : typeof retryAfter === 'string'
+              ? Date.parse(retryAfter) - Date.now()
+              : Number.NaN
+        const delay =
+          Number.isFinite(serverDelay) && serverDelay >= 0
+            ? Math.min(serverDelay, 2_147_483_647)
+            : 100 * 2 ** attempt
+        await sleep(delay, undefined, { signal: transport.signal })
       }
-      return response
     }
+    // Retries stay in the owned transport; the scan's total deadline still wins.
     request.retryFunc = async () => false
     provider = new JsonRpcProvider(request)
     const verified = await verifyCreate2({ config, provider, wallet, ...scanOptions })
     if (!verified) process.exitCode = 2
   } finally {
+    transport.abort()
     try {
       provider?.destroy()
     } finally {
@@ -245,9 +302,9 @@ async function main() {
   }
 }
 
-if (import.meta.url === new URL(process.argv[1], 'file:').href) {
+if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error))
-    process.exitCode = 1
+    process.exitCode = error?.code === 'CREATE2_MISMATCH' ? 3 : 1
   })
 }

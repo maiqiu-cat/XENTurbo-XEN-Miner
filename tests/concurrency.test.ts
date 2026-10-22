@@ -10,6 +10,33 @@ function deferred<T>() {
 }
 
 describe('bounded concurrency', () => {
+  it('stops dispatching after failure and drains in-flight work before rejecting', async () => {
+    const gate = deferred<number>()
+    const failure = new Error('first worker failed')
+    const called: number[] = []
+    let settled = false
+    const work = mapWithConcurrency([0, 1, 2, 3], 2, async (id) => {
+      called.push(id)
+      if (id === 0) throw failure
+      return gate.promise
+    })
+    const assertion = expect(work).rejects.toBe(failure)
+    void work.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      }
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(called).toEqual([0, 1])
+    expect(settled).toBe(false)
+    gate.resolve(1)
+    await assertion
+    expect(called).toEqual([0, 1])
+  })
   it('caps active work and preserves input order', async () => {
     const gates = Array.from({ length: 5 }, () => deferred<number>())
     let active = 0

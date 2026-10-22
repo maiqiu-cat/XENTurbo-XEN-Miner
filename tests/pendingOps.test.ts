@@ -451,7 +451,11 @@ describe('pending operation reconciliation', () => {
       txHash: '',
       phase: 'awaiting-wallet'
     })
-    expect(attachTxHash).toHaveBeenCalledWith(tracked.id, HASH)
+    expect(attachTxHash).toHaveBeenCalledWith(
+      tracked.id,
+      HASH,
+      expect.objectContaining({ chain: 'eth', wallet: WALLET, ids: [7] })
+    )
     pending.recordPendingOp({
       ...stored.find((record) => record.id === 'batch-1')!,
       phase: 'dropped'
@@ -1103,7 +1107,7 @@ describe('transaction lock lifecycle', () => {
     })
 
     await expect(send).rejects.toThrow('Transaction receipt missing')
-    expect(attachTxHash).toHaveBeenCalledWith('batch-1', HASH)
+    expect(attachTxHash).not.toHaveBeenCalled()
     expect(recordPendingOp).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({

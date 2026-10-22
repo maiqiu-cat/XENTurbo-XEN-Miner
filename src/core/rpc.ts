@@ -26,6 +26,7 @@ export interface RpcHealthState {
   healthyUrls: string[]
   failures: RpcHealthFailure[]
   error: string | null
+  errorKind?: 'configuration' | 'network' | null
 }
 
 export type RpcHealthListener = (chain: ChainKey, state: RpcHealthState) => void
@@ -63,7 +64,8 @@ function emptyHealthState(chain: ChainKey): RpcHealthState {
     totalUrls: 0,
     healthyUrls: [],
     failures: [],
-    error: null
+    error: null,
+    errorKind: null
   }
 }
 
@@ -263,6 +265,7 @@ export function ensureHealthyReadProvider(
       const state: RpcHealthState = {
         ...emptyHealthState(key),
         checkedAt: Date.now(),
+        errorKind: 'configuration',
         error: `RPC_UNAVAILABLE: ${CHAINS[key].name} RPC configuration is invalid: ${message}`
       }
       if ((providerGenerations.get(key) ?? 0) === generation) {
@@ -276,7 +279,8 @@ export function ensureHealthyReadProvider(
       ...getRpcHealthState(key),
       checking: true,
       totalUrls: urls.length,
-      error: null
+      error: null,
+      errorKind: null
     })
 
     // The list is capped at 16. Keep health probes parallel so validation fits
@@ -313,7 +317,8 @@ export function ensureHealthyReadProvider(
         totalUrls: urls.length,
         healthyUrls,
         failures,
-        error
+        error,
+        errorKind: 'network'
       })
       throw new Error(error)
     }
@@ -333,7 +338,8 @@ export function ensureHealthyReadProvider(
       totalUrls: urls.length,
       healthyUrls,
       failures,
-      error: null
+      error: null,
+      errorKind: null
     })
     return provider
   })()
