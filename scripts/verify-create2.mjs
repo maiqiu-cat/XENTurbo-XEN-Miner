@@ -25,6 +25,26 @@ const xenAbi = [
   'function userMints(address) view returns (address user, uint256 term, uint256 maturityTs, uint256 rank, uint256 amplifier, uint256 eaaRate)'
 ]
 
+export function rateLimitDelay(retryAfter, attempt, remainingMs, now = Date.now()) {
+  const serverDelay =
+    typeof retryAfter === 'string' && /^\d+$/.test(retryAfter)
+      ? Number(retryAfter) * 1_000
+      : typeof retryAfter === 'string'
+        ? Date.parse(retryAfter) - now
+        : Number.NaN
+  const fromHeader = Number.isFinite(serverDelay) && serverDelay >= 0
+  const delay = fromHeader ? Math.min(serverDelay, 2_147_483_647) : 100 * 2 ** attempt
+  if (delay >= remainingMs) {
+    const code = fromHeader
+      ? 'RATE_LIMIT_RETRY_AFTER_EXCEEDS_BUDGET'
+      : 'RATE_LIMIT_BACKOFF_EXCEEDS_BUDGET'
+    const error = new Error(code)
+    error.code = code
+    throw error
+  }
+  return delay
+}
+
 function positiveOption(value, flag, maximum) {
   if (typeof value !== 'string' || !/^[1-9][0-9]{0,77}$/.test(value)) {
     throw new Error(`INVALID_SCAN_OPTION: ${flag} requires a positive decimal integer.`)
@@ -130,10 +150,11 @@ export async function verifyCreate2({
   try {
     return await scan()
   } catch (error) {
-    if (error?.code === 'RATE_LIMIT_RETRY_AFTER_EXCEEDS_BUDGET') {
-      log(
-        'NOT_VERIFIED: RATE_LIMIT_RETRY_AFTER_EXCEEDS_BUDGET. Retry later with a fresh full verification.'
-      )
+    if (
+      error?.code === 'RATE_LIMIT_RETRY_AFTER_EXCEEDS_BUDGET' ||
+      error?.code === 'RATE_LIMIT_BACKOFF_EXCEEDS_BUDGET'
+    ) {
+      log(`NOT_VERIFIED: ${error.code}. Retry later with a fresh full verification.`)
       return false
     }
     if (error !== deadlineError) {
@@ -141,7 +162,10 @@ export async function verifyCreate2({
         log(
           'Verification failed. Check the selected chain, contract configuration and RPC response before retrying.'
         )
-      else log(`Verification interrupted; scanned=${scanned}; resume with --from-id ${nextId}.`)
+      else
+        log(
+          `Verification failed; scanned=${scanned}. Resolve the RPC or configuration error, then run a fresh full verification.`
+        )
       throw error
     }
     log(
@@ -285,22 +309,11 @@ async function main() {
           throw new Error('RPC_REDIRECT_REQUIRES_EXPLICIT_URL: pass the final RPC URL with --rpc.')
         }
         if (response.statusCode !== 429 || attempt === 2) return response
-        const retryAfter = response.headers['retry-after']
-        const serverDelay =
-          typeof retryAfter === 'string' && /^\d+$/.test(retryAfter)
-            ? Number(retryAfter) * 1_000
-            : typeof retryAfter === 'string'
-              ? Date.parse(retryAfter) - Date.now()
-              : Number.NaN
-        const delay =
-          Number.isFinite(serverDelay) && serverDelay >= 0
-            ? Math.min(serverDelay, 2_147_483_647)
-            : 100 * 2 ** attempt
-        if (delay >= transportDeadline - performance.now()) {
-          const error = new Error('RATE_LIMIT_RETRY_AFTER_EXCEEDS_BUDGET')
-          error.code = 'RATE_LIMIT_RETRY_AFTER_EXCEEDS_BUDGET'
-          throw error
-        }
+        const delay = rateLimitDelay(
+          response.headers['retry-after'],
+          attempt,
+          transportDeadline - performance.now()
+        )
         await sleep(delay, undefined, { signal: transport.signal })
       }
     }

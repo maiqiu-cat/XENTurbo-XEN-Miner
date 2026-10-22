@@ -119,6 +119,7 @@ function preparedOperation() {
     args: [100n, 1n],
     batch: 'batch-1',
     lockIds: [],
+    lifecycle: { phase: 'prepared' as const },
     state: { estimate: 'done' as const, send: 'wait' as const, confirm: 'wait' as const }
   }
 }

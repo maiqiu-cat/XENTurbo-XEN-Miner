@@ -612,16 +612,16 @@ test('a stalled wallet nonce read times out without opening a transaction reques
   await expect(page.locator('.steps .step-icon.run')).toHaveText('...')
   await expect(page.getByText('Checking pending transactions through the wallet...')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Cancel' })).toBeVisible()
-  await expect(
-    page
-      .getByText(/READ_TIMEOUT: Wallet eth_getTransactionCount exceeded 15000 ms/, { exact: false })
-      .first()
-  ).toBeVisible({ timeout: 17_000 })
-  await expect(
-    page.getByText(
-      'Pending check failed: READ_TIMEOUT: Wallet eth_getTransactionCount exceeded 15000 ms'
-    )
-  ).toBeVisible()
+  const timeoutMessage =
+    'Wallet or network read timed out. Check your connection and wallet, then recheck transaction records. Do not resend.'
+  await expect(page.locator('.modal-body .err-text')).toHaveText(timeoutMessage, {
+    timeout: 17_000
+  })
+  await expect(page.getByRole('region', { name: 'Transaction activity' })).toContainText(
+    `Pending check failed: ${timeoutMessage}`
+  )
+  await expect(page.getByText(/READ_TIMEOUT/)).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeDisabled()
   expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
     sendAttempts: 0,
     successfulBroadcasts: 0
@@ -1418,6 +1418,98 @@ test('unidentifiable journal corruption stays blocked after recovery and reload'
   await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeDisabled()
   expect(await page.evaluate(() => localStorage.getItem('sm.pendingOps.event.broken'))).toBe('{')
   expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+})
+
+for (const change of ['disconnect', 'unsupported-chain', 'same-account'] as const) {
+  test(`recovery dialog releases its UI gate after ${change}`, async ({ page }) => {
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await installInjectedWallet(page)
+    const errors: string[] = []
+    page.on('pageerror', (error) => errors.push(error.message))
+    await page.goto('/')
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
+    await expect(mint).toBeEnabled()
+    await page.getByRole('button', { name: 'Transaction storage recovery', exact: true }).click()
+    await expect(mint).toBeDisabled()
+    await page.evaluate(
+      ({ kind, account }) => {
+        if (kind === 'disconnect') window.__walletMock.emitAccounts([])
+        else if (kind === 'same-account') window.__walletMock.emitAccounts([account])
+        else window.__walletMock.emitChain('0x3e7')
+      },
+      { kind: change, account: ACCOUNT_A }
+    )
+    await expect(page.getByRole('dialog', { name: 'Transaction storage recovery' })).toBeHidden()
+    await page.evaluate(
+      ({ kind, account }) => {
+        if (kind === 'disconnect') window.__walletMock.emitAccounts([account])
+        else if (kind === 'unsupported-chain') window.__walletMock.emitChain('0x1')
+      },
+      { kind: change, account: ACCOUNT_A }
+    )
+    await expect(mint).toBeEnabled()
+    expect(errors).toEqual([])
+    expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+    await captureQaScreenshot(page, `recovery-${change}-restored`)
+  })
+}
+
+test('recovery presents a friendly wallet timeout and retains damaged evidence', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page)
+  await page.goto('/')
+  const errors: string[] = []
+  page.on('pageerror', (error) => errors.push(error.message))
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await page.evaluate(
+    ({ wallet, hash }) => {
+      localStorage.setItem(
+        'sm.vmuLocks',
+        JSON.stringify([
+          { chain: 'eth', wallet, txHash: hash, ids: ['1'], batch: 'damaged', lockedAt: Date.now() }
+        ])
+      )
+      const provider = (
+        window as unknown as {
+          ethereum: { request: (args: { method: string }) => Promise<unknown> }
+        }
+      ).ethereum
+      const request = provider.request.bind(provider)
+      provider.request = async (args) => {
+        if (args.method === 'eth_getTransactionReceipt')
+          throw new Error('READ_TIMEOUT: Wallet receipt fixture')
+        return request(args)
+      }
+    },
+    { wallet: ACCOUNT_A, hash: TX_HASH }
+  )
+  await page.getByRole('button', { name: 'Transaction storage recovery', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Transaction storage recovery' })
+  await expect(dialog).toContainText('Invalid record structure')
+  const download = page.waitForEvent('download')
+  await dialog.getByRole('button', { name: 'Export backup' }).click()
+  await download
+  await expect(dialog.getByRole('button', { name: 'Verify and repair' })).toBeDisabled()
+  await dialog.getByRole('checkbox').check()
+  await dialog.getByRole('button', { name: 'Verify and repair' }).click()
+  await expect(dialog.getByRole('status')).toContainText('Wallet or network read timed out')
+  await expect(dialog.getByRole('status')).not.toContainText('READ_TIMEOUT')
+  await captureQaScreenshot(page, 'recovery-error-desktop')
+  await page.setViewportSize({ width: 390, height: 844 })
+  const bounds = await dialog.boundingBox()
+  expect(bounds!.x).toBeGreaterThanOrEqual(0)
+  expect(bounds!.width).toBeLessThanOrEqual(390)
+  await captureQaScreenshot(page, 'recovery-error-narrow')
+  await dialog.getByRole('button', { name: 'Close recovery' }).click()
+  await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeDisabled()
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks')!).length)).toBe(1)
+  expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+  expect(errors).toEqual([])
 })
 
 test('simultaneous tab submissions produce only one broadcast while reconciliation is unresolved', async ({

@@ -525,6 +525,8 @@ function buildCall(
 
 /** Prepared tx after gas estimation — send must be triggered by a fresh user click. */
 export interface PreparedOp {
+  /** Shared across Vue refs and shallow copies; never reset after cancellation or dispatch. */
+  lifecycle: { phase: 'prepared' | 'sending' | 'dispatched' | 'finished' | 'cancelled' }
   chain: ChainKey
   wallet: string
   op: OpType
@@ -691,6 +693,7 @@ export async function prepareOperation(
     const { fnName, args } = buildCall(op, ids, count, term)
     const preparedAt = Date.now()
     return {
+      lifecycle: { phase: 'prepared' },
       chain,
       wallet,
       op,
@@ -727,6 +730,14 @@ export async function sendPreparedOperation(
   prepared: PreparedOp,
   cb: TxCallbacks = {}
 ): Promise<TxStepState> {
+  const lifecycle = prepared.lifecycle
+  if (lifecycle.phase === 'cancelled') throw new Error('OPERATION_CANCELLED')
+  if (lifecycle.phase !== 'prepared') throw new Error('OPERATION_ALREADY_STARTED')
+  lifecycle.phase = 'sending'
+  const assertSending = () => {
+    if (lifecycle.phase !== 'sending') throw new Error('OPERATION_CANCELLED')
+    assertOperationActive(cb)
+  }
   const state: TxStepState = {
     estimate: 'done',
     send: 'process',
@@ -799,12 +810,12 @@ export async function sendPreparedOperation(
   }
 
   try {
-    assertOperationActive(cb)
+    assertSending()
     log('Starting final checks before opening MetaMask...')
     const walletSend = runWalletExclusive(
       operationKey(prepared.chain, prepared.wallet),
       async () => {
-        assertOperationActive(cb)
+        assertSending()
         // Keep the final safety check, nonce read, and wallet request in one
         // cross-tab critical section so two tabs cannot send concurrently.
         log('Checking unresolved local transaction records...')
@@ -818,8 +829,9 @@ export async function sendPreparedOperation(
 
         log('Rechecking RPC availability and pending nonce...')
         await ensureHealthyReadProvider(prepared.chain)
+        assertSending()
         const inflight = await getPendingTxCount(prepared.chain, prepared.wallet)
-        assertOperationActive(cb)
+        assertSending()
         if (inflight > 0) {
           throw new Error(
             `PENDING_TX: ${inflight} transaction(s) still pending on-chain. Wait for confirmation (or Speed up / Cancel in MetaMask) before submitting another.`
@@ -833,6 +845,7 @@ export async function sendPreparedOperation(
           PREFLIGHT_TIMEOUT_MS,
           'Wallet account and network check'
         )
+        assertSending()
         if (!injectedAccount) throw new Error('No wallet account available. Reconnect your wallet.')
         assertPreparedContext(prepared, injectedAccount, injectedChainId)
         log('Active wallet account and network match the prepared operation.', 'done')
@@ -859,7 +872,7 @@ export async function sendPreparedOperation(
           PREFLIGHT_CONTRACT_TIMEOUT_MS,
           'Wallet transaction data read'
         )
-        assertOperationActive(cb)
+        assertSending()
         prepared.preVmuCount = preVmuCount
         const nonce = walletNonce
         broadcastNonce = nonce
@@ -878,7 +891,7 @@ export async function sendPreparedOperation(
           PREFLIGHT_CONTRACT_TIMEOUT_MS,
           'Selected VMU revalidation'
         )
-        assertOperationActive(cb)
+        assertSending()
         log('Selected VMUs passed the final validation.', 'done')
         if (prepared.op === 'CLAIM_REUSE') {
           const before = await withTimeout(
@@ -889,7 +902,7 @@ export async function sendPreparedOperation(
           if (before.some((vmu) => !vmu.readOk))
             throw new Error('Selected VMU state could not be read before re-minting')
           prepared.beforeRanks = Object.fromEntries(before.map((vmu) => [vmu.id, vmu.rank]))
-          assertOperationActive(cb)
+          assertSending()
         }
         log('Simulating transaction with MetaMask...')
         await withTimeout(
@@ -897,7 +910,7 @@ export async function sendPreparedOperation(
           PREFLIGHT_CONTRACT_TIMEOUT_MS,
           'Wallet transaction simulation'
         )
-        assertOperationActive(cb)
+        assertSending()
         log('Transaction simulation succeeded.', 'done')
 
         try {
@@ -912,11 +925,8 @@ export async function sendPreparedOperation(
             nonce,
             expectedFrom: prepared.wallet,
             onRequestStart: () => {
-              assertOperationActive(cb)
+              assertSending()
               assertPreparedContext(prepared, prepared.wallet, prepared.chainId)
-              state.send = 'process'
-              state.walletPrompted = true
-              log('MetaMask request opened. Review the details and confirm or reject it.')
               recordPendingOp({
                 id: prepared.batch,
                 chain: prepared.chain,
@@ -931,6 +941,10 @@ export async function sendPreparedOperation(
                 nonceAuthoritative: false
               })
               awaitingWalletRecorded = true
+              lifecycle.phase = 'dispatched'
+              state.send = 'process'
+              state.walletPrompted = true
+              log('MetaMask request opened. Review the details and confirm or reject it.')
             },
             onRequestSyncError: () => {
               if (!awaitingWalletRecorded) return
@@ -1069,6 +1083,7 @@ export async function sendPreparedOperation(
     log(`Transaction stopped: ${state.error}`, 'error')
     throw err
   } finally {
+    finishPreparedLifecycle(prepared, resolved || awaitingWalletResolved)
     if (
       lockHeld &&
       prepared.lockIds.length &&
@@ -1076,6 +1091,13 @@ export async function sendPreparedOperation(
     ) {
       releaseLock(prepared.batch)
     }
+  }
+}
+
+function finishPreparedLifecycle(prepared: PreparedOp, settled: boolean): void {
+  const phase = prepared.lifecycle.phase
+  if (phase === 'sending' || (phase === 'dispatched' && settled)) {
+    prepared.lifecycle.phase = 'finished'
   }
 }
 
@@ -1087,8 +1109,9 @@ function isDefinitiveWalletRejection(err: any): boolean {
 
 /** Abort a prepared op that was never sent (user soft lock). */
 export function abortPrepared(prepared: PreparedOp | null | undefined): void {
-  if (!prepared?.lockIds.length) return
-  releaseLock(prepared.batch)
+  if (!prepared || !['prepared', 'sending'].includes(prepared.lifecycle.phase)) return
+  prepared.lifecycle.phase = 'cancelled'
+  if (prepared.lockIds.length) releaseLock(prepared.batch)
 }
 
 export function clearAbandonedSoftLocks(chain: ChainKey, wallet: string): void {
@@ -1133,12 +1156,20 @@ export async function resumePendingLocks(chain: ChainKey, wallet: string): Promi
 export function normalizeError(err: any): string {
   const msg: string = err?.shortMessage || err?.reason || err?.message || String(err)
   if (/OPERATION_CANCELLED/i.test(msg)) return 'Operation cancelled. No transaction was submitted.'
+  if (/OPERATION_ALREADY_STARTED/i.test(msg))
+    return 'This prepared operation has already started or finished. Check wallet Activity and recheck pending operations. Do not resend.'
   if (/Prepared transaction expired/i.test(msg))
     return 'The prepared transaction expired after 2 minutes. Estimate it again before signing.'
   if (/RPC_UNAVAILABLE|RPC_NOT_VALIDATED/i.test(msg))
     return 'No configured RPC endpoint responded on the expected network. Your RPC list was preserved. Check internet access, DNS, firewall, and proxy/VPN settings, then retry; or change endpoints in RPC settings.'
   if (/PENDING_STORAGE_(?:READ|WRITE)_FAILED|LOCK_STORAGE_INVALID/i.test(msg))
     return 'Local transaction storage is unavailable or damaged. Open transaction storage recovery. Do not clear site data or resend; check wallet Activity first.'
+  if (/WALLET_CONTEXT_CHANGED/i.test(msg))
+    return 'Wallet account or network changed. Reconnect the original account and network, then recheck transaction records. Do not resend.'
+  if (/READ_TIMEOUT/i.test(msg))
+    return 'Wallet or network read timed out. Check your connection and wallet, then recheck transaction records. Do not resend.'
+  if (/WALLET_EVIDENCE_UNAVAILABLE/i.test(msg))
+    return 'Wallet transaction evidence is unavailable. Check wallet Activity and the selected network, then recheck. Do not resend.'
   if (/PENDING_STATE_UNCERTAIN/i.test(msg))
     return 'Wallet and read RPC disagree about the pending nonce. Do not retry yet. Open MetaMask Activity, verify the selected network, then recheck.'
   if (/WALLET_ASLEEP/.test(msg))

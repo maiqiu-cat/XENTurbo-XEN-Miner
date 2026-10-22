@@ -11,7 +11,7 @@ import {
   keccak256,
   solidityPackedKeccak256
 } from 'ethers'
-import { parseVerificationArgs, verifyCreate2 } from '../scripts/verify-create2.mjs'
+import { parseVerificationArgs, verifyCreate2, rateLimitDelay } from '../scripts/verify-create2.mjs'
 import { minimalProxyRuntimeCode } from '../src/core/create2'
 
 const FACTORY = '0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2'
@@ -115,6 +115,9 @@ async function runVerification({
   vmuCount = 1,
   proxyShift = 0,
   rateLimitOnce = false,
+  rateLimitAlways = false,
+  rateLimitAtRequest = 1,
+  disconnect = false,
   retryAfter
 }: {
   activeIds?: Array<number | bigint>
@@ -131,6 +134,9 @@ async function runVerification({
   vmuCount?: number | bigint
   proxyShift?: number
   rateLimitOnce?: boolean
+  rateLimitAlways?: boolean
+  rateLimitAtRequest?: number
+  disconnect?: boolean
   retryAfter?: string
 } = {}) {
   const xen = chain === 'eth' ? ETH_XEN : POLYGON_XEN
@@ -140,6 +146,8 @@ async function runVerification({
   const mintProxies: string[] = []
   const rpcMethods: string[] = []
   const stateReads: Array<{ method: string; blockTag: unknown }> = []
+  let httpRequests = 0
+  const startedAt = performance.now()
   const server = createServer((request, response) => {
     let body = ''
     request.setEncoding('utf8')
@@ -151,7 +159,12 @@ async function runVerification({
         | { id: number; method: string; params: unknown[] }
         | Array<{ id: number; method: string; params: unknown[] }>
       const requests = Array.isArray(payload) ? payload : [payload]
-      if (rateLimitOnce) {
+      httpRequests += 1
+      if (disconnect) {
+        request.socket.destroy()
+        return
+      }
+      if (rateLimitAlways || (rateLimitOnce && httpRequests >= rateLimitAtRequest)) {
         rateLimitOnce = false
         response.writeHead(429, {
           Connection: 'close',
@@ -259,6 +272,7 @@ async function runVerification({
     stateReads: Array<{ method: string; blockTag: unknown }>
     providerDestroyCount: number
     openConnections: number
+    elapsedMs: number
   }>((resolve, reject) => {
     const child = spawn(
       process.execPath,
@@ -301,7 +315,8 @@ async function runVerification({
           rpcMethods,
           stateReads,
           providerDestroyCount: stdout.match(/^TEST_PROVIDER_DESTROYED$/gm)?.length ?? 0,
-          openConnections: connections.size
+          openConnections: connections.size,
+          elapsedMs: performance.now() - startedAt
         })
       )
     })
@@ -368,12 +383,51 @@ describe('CREATE2 verification release gate', () => {
       activeIds: [1],
       rateLimitOnce: true,
       retryAfter: '60',
-      extraArgs: ['--deadline-ms', '250']
+      extraArgs: ['--deadline-ms', '1500']
     })
     expect(result.code).toBe(2)
     expect(result.stdout).toContain('NOT_VERIFIED: RATE_LIMIT_RETRY_AFTER_EXCEEDS_BUDGET')
     expect(result.stdout).not.toContain('resume with')
     expect(result.openConnections).toBe(0)
+  })
+
+  it.each([{ rateLimitAlways: true }, { redirect: true }, { disconnect: true }])(
+    'does not advise resuming a failed verification: %j',
+    async (failure) => {
+      const result = await runVerification(failure)
+      expect(result.code).toBe(1)
+      expect(result.stdout).toContain('fresh full verification')
+      expect(result.stdout).not.toContain('resume with')
+      expect(result.stdout).not.toContain('CREATE2 derivation VERIFIED')
+      expect(result.openConnections).toBe(0)
+    }
+  )
+
+  it('bounds cleanup when ethers bootstrap encounters a second-request rate limit', async () => {
+    const result = await runVerification({
+      rateLimitOnce: true,
+      rateLimitAtRequest: 2,
+      retryAfter: '60',
+      extraArgs: ['--deadline-ms', '1500']
+    })
+    expect(result.code).toBe(2)
+    expect(result.stdout).toContain('NOT_VERIFIED: RATE_LIMIT_RETRY_AFTER_EXCEEDS_BUDGET')
+    expect(result.stdout).not.toContain('resume with')
+    expect(result.stdout).not.toContain('CREATE2 derivation VERIFIED')
+    expect(result.providerDestroyCount).toBe(1)
+    expect(result.openConnections).toBe(0)
+    expect(result.elapsedMs).toBeLessThan(4000)
+  })
+
+  it('distinguishes Retry-After from fallback backoff without a sub-second process deadline', () => {
+    expect(() => rateLimitDelay('60', 0, 1500)).toThrow('RATE_LIMIT_RETRY_AFTER_EXCEEDS_BUDGET')
+    expect(() => rateLimitDelay(undefined, 1, 150)).toThrow('RATE_LIMIT_BACKOFF_EXCEEDS_BUDGET')
+    expect(() => rateLimitDelay('invalid', 0, 100)).toThrow('RATE_LIMIT_BACKOFF_EXCEEDS_BUDGET')
+    expect(rateLimitDelay(undefined, 1, 201)).toBe(200)
+    expect(rateLimitDelay('1', 0, 1500)).toBe(1000)
+    expect(
+      rateLimitDelay('Thu, 22 Oct 2026 12:00:01 GMT', 0, 1500, Date.UTC(2026, 9, 22, 12))
+    ).toBe(1000)
   })
 
   it.each(['--wallet', '--rpc', '--chain'])(

@@ -1134,6 +1134,7 @@ describe('transaction lock lifecycle', () => {
       args: [[7n]],
       batch: 'batch-1',
       lockIds: [7],
+      lifecycle: { phase: 'prepared' },
       state: { estimate: 'done', send: 'wait', confirm: 'wait' }
     })
 

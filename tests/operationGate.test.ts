@@ -203,6 +203,7 @@ describe('operation gate', () => {
       args: [100n, 1n],
       batch: 'batch-1',
       lockIds: [],
+      lifecycle: { phase: 'prepared' },
       state: { estimate: 'done', send: 'wait', confirm: 'wait' }
     })
 
@@ -295,6 +296,7 @@ describe('operation gate', () => {
       args: [100n, 1n],
       batch: 'batch-1',
       lockIds: [],
+      lifecycle: { phase: 'prepared' as const },
       state: { estimate: 'done' as const, send: 'wait' as const, confirm: 'wait' as const }
     }
 
@@ -396,6 +398,7 @@ describe('operation gate', () => {
         args: [[4n], 100n],
         batch: 'batch-1',
         lockIds: [4],
+        lifecycle: { phase: 'prepared' },
         state: { estimate: 'done', send: 'wait', confirm: 'wait' }
       })
     ).rejects.toThrow('VMU state changed on-chain')

@@ -13,6 +13,19 @@ interface Damage {
   rows: unknown[]
   invalid: number[]
   array: boolean
+  kind: 'invalid-json' | 'not-array' | 'invalid-record'
+}
+
+export interface RecoveryResult {
+  repaired: number
+  blocked: number
+  backupKey: string | null
+  blockedReasons: {
+    unidentified: number
+    otherContext: number
+    unconfirmed: number
+    readLimit: number
+  }
 }
 
 const isTransactionKey = (key: string) =>
@@ -49,20 +62,27 @@ function damage(snapshot: StorageSnapshot): Damage[] {
         }
         const record =
           parsed && typeof parsed === 'object' && 'record' in parsed ? parsed.record : null
-        return [{ key, rows: [record], invalid: [0], array: false }]
+        return [{ key, rows: [record], invalid: [0], array: false, kind: 'invalid-record' }]
       }
-      if (!Array.isArray(parsed)) return [{ key, rows: [null], invalid: [0], array: false }]
+      if (!Array.isArray(parsed))
+        return [{ key, rows: [null], invalid: [0], array: false, kind: 'not-array' }]
       const valid = key === 'sm.vmuLocks' ? isValidLock : normalizeRecord
       const invalid = parsed.flatMap((row, i) => (valid(row) ? [] : [i]))
-      return invalid.length ? [{ key, rows: parsed, invalid, array: true }] : []
+      return invalid.length
+        ? [{ key, rows: parsed, invalid, array: true, kind: 'invalid-record' }]
+        : []
     } catch {
-      return [{ key, rows: [null], invalid: [0], array: false }]
+      return [{ key, rows: [null], invalid: [0], array: false, kind: 'invalid-json' }]
     }
   })
 }
 
 export function damagedRecordCount(snapshot: StorageSnapshot): number {
   return damage(snapshot).reduce((sum, item) => sum + item.invalid.length, 0)
+}
+
+export function transactionStorageIssues(snapshot: StorageSnapshot) {
+  return damage(snapshot).map(({ key, kind, invalid }) => ({ key, kind, count: invalid.length }))
 }
 
 export function storageBackupJson(snapshot: StorageSnapshot): string {
@@ -75,7 +95,7 @@ export async function recoverTransactionStorage(
   chain: ChainKey,
   wallet: string,
   signal?: AbortSignal
-): Promise<{ repaired: number; blocked: number; backupKey: string | null }> {
+): Promise<RecoveryResult> {
   const assertUnchanged = () => {
     assertReadActive(signal)
     if (JSON.stringify(inspectTransactionStorage()) !== JSON.stringify(expected))
@@ -99,6 +119,7 @@ export async function recoverTransactionStorage(
     await assertAccount()
     const changes: { key: string; raw: string | null; count: number }[] = []
     let blocked = 0
+    const blockedReasons = { unidentified: 0, otherContext: 0, unconfirmed: 0, readLimit: 0 }
     // Bound wallet reads per invocation; another inspection can resume safely.
     let reads = 0
     for (const item of damage(expected)) {
@@ -107,21 +128,34 @@ export async function recoverTransactionStorage(
         const row = item.rows[index] as Record<string, unknown> | null
         if (
           !row ||
-          row.chain !== chain ||
+          (row.chain !== 'eth' && row.chain !== 'polygon') ||
           typeof row.wallet !== 'string' ||
-          row.wallet.toLowerCase() !== wallet.toLowerCase() ||
+          !/^0x[0-9a-f]{40}$/i.test(row.wallet) ||
           typeof row.txHash !== 'string' ||
-          !/^0x[0-9a-f]{64}$/i.test(row.txHash) ||
-          reads >= 20
+          !/^0x[0-9a-f]{64}$/i.test(row.txHash)
         ) {
           blocked += 1
+          blockedReasons.unidentified += 1
+          continue
+        }
+        if (row.chain !== chain || row.wallet.toLowerCase() !== wallet.toLowerCase()) {
+          blocked += 1
+          blockedReasons.otherContext += 1
+          continue
+        }
+        if (reads >= 20) {
+          blocked += 1
+          blockedReasons.readLimit += 1
           continue
         }
         reads += 1
         const evidence = await readWalletEvidence(chain, wallet, row.txHash, { signal })
         // A corrupt nonce is never authoritative. Only a matching mined receipt is sufficient.
         if (evidence.settlement?.receipt) settled.add(index)
-        else blocked += 1
+        else {
+          blocked += 1
+          blockedReasons.unconfirmed += 1
+        }
       }
       if (settled.size)
         changes.push({
@@ -132,7 +166,7 @@ export async function recoverTransactionStorage(
     }
     await assertAccount()
     assertUnchanged()
-    if (!changes.length) return { repaired: 0, blocked, backupKey: null }
+    if (!changes.length) return { repaired: 0, blocked, backupKey: null, blockedReasons }
     const backupKey = `sm.storageRecovery.backup.${crypto.randomUUID()}`
     const backup = storageBackupJson(expected)
     // Keep an exact durable archive before removing even a wallet-settled malformed record.
@@ -160,7 +194,12 @@ export async function recoverTransactionStorage(
         'Recovery stopped during a storage change. The original backup is retained. Inspect again; do not clear site data or resend.'
       )
     }
-    return { repaired: changes.reduce((n, change) => n + change.count, 0), blocked, backupKey }
+    return {
+      repaired: changes.reduce((n, change) => n + change.count, 0),
+      blocked,
+      backupKey,
+      blockedReasons
+    }
   } finally {
     session.dispose()
   }

@@ -14,6 +14,7 @@ import {
   type PreparedOp
 } from '@/core/txManager'
 import MinerView from '@/views/MinerView.vue'
+import StorageRecovery from '@/components/StorageRecovery.vue'
 
 vi.mock('@/core/txManager', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/core/txManager')>()),
@@ -23,7 +24,8 @@ vi.mock('@/core/txManager', async (importOriginal) => ({
   resumePendingLocks: vi.fn(async () => false),
   clearAbandonedSoftLocks: vi.fn()
 }))
-vi.mock('@/core/pendingOps', () => ({
+vi.mock('@/core/pendingOps', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/core/pendingOps')>()),
   refreshPendingOps: vi.fn(),
   trackPendingTxHash: vi.fn(),
   markPendingOpDropped: vi.fn(),
@@ -120,6 +122,87 @@ it('blocks every operation after a new scope check fails and until its retry suc
   expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('false')
 })
 
+it.each(['disconnect', 'unsupported-chain'] as const)(
+  'clears the recovery gate after %s unmounts the dialog',
+  async (kind) => {
+    const view = render()
+    await flushPromises()
+    await view.getComponent(StorageRecovery).get('button').trigger('click')
+    expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('true')
+    const wallet = useWalletStore()
+    if (kind === 'disconnect') wallet.address = null
+    else wallet.chainId = 999
+    await nextTick()
+    await flushPromises()
+    wallet.$patch({ address: '0x1111111111111111111111111111111111111111', chainId: 1 })
+    await nextTick()
+    await flushPromises()
+    expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('false')
+    const mint = view.findAll('button').find((button) => button.text() === 'Confirm Mint')!
+    expect(mint.attributes('disabled')).toBeUndefined()
+  }
+)
+
+it('explains the recovery gate and requires successful reconciliation after recovery changes', async () => {
+  const view = render()
+  await flushPromises()
+  const recovery = view.getComponent(StorageRecovery)
+  await recovery.get('button').trigger('click')
+  expect(view.get('[data-testid="mint-list"]').text()).toContain(
+    'Transaction storage recovery is open'
+  )
+  vi.mocked(refreshPendingOps).mockRejectedValue(new Error('PENDING_STORAGE_READ_FAILED: fixture'))
+  recovery.vm.$emit('changed')
+  recovery.vm.$emit('open', false)
+  await flushPromises()
+  expect(refreshPendingOps).toHaveBeenLastCalledWith(
+    'eth',
+    useWalletStore().address,
+    expect.objectContaining({ reverifyResults: true })
+  )
+  expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('true')
+  expect(view.text()).toContain('Open transaction storage recovery')
+  expect(view.text()).not.toContain('PENDING_STORAGE_READ_FAILED')
+  vi.mocked(refreshPendingOps).mockResolvedValue(empty)
+  recovery.vm.$emit('changed')
+  await flushPromises()
+  expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('false')
+})
+
+it('closes recovery on a same-account generation change without bypassing wallet verification', async () => {
+  const view = render()
+  await flushPromises()
+  await view.getComponent(StorageRecovery).get('button').trigger('click')
+  expect(document.querySelector('[role="dialog"]')).not.toBeNull()
+  let resolve!: (value: typeof empty) => void
+  vi.mocked(refreshPendingOps).mockReturnValue(
+    new Promise((done) => {
+      resolve = done
+    })
+  )
+  const wallet = useWalletStore()
+  wallet.$patch({
+    contextGen: wallet.contextGen + 1,
+    contractWalletChecked: false,
+    contractWalletChecking: true
+  })
+  await nextTick()
+  await flushPromises()
+  try {
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+    expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('true')
+  } finally {
+    resolve(empty)
+    await flushPromises()
+  }
+  expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('true')
+  wallet.$patch({ contractWalletChecked: true, contractWalletChecking: false })
+  await nextTick()
+  expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('false')
+  const mint = view.findAll('button').find((button) => button.text() === 'Confirm Mint')!
+  expect(mint.attributes('disabled')).toBeUndefined()
+})
+
 it.each([false, true])(
   'does not revive signing after a failed shared check (immediate retry: %s)',
   async (immediateRetry) => {
@@ -140,6 +223,7 @@ it.each([false, true])(
       args: [100n, 1n],
       batch: 'prepared-ui-test',
       lockIds: [],
+      lifecycle: { phase: 'prepared' },
       state: { estimate: 'done', send: 'wait', confirm: 'wait', readyToSign: true }
     }
     vi.mocked(prepareOperation).mockImplementation(async (_params, callbacks) => {

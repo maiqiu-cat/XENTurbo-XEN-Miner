@@ -24,6 +24,7 @@ const harness = vi.hoisted(() => ({
     args: [100n, 1n],
     batch: 'isolated-review',
     lockIds: [],
+    lifecycle: { phase: 'prepared' as const },
     state: { estimate: 'done', send: 'wait', confirm: 'wait', readyToSign: true, logs: [] }
   }
 }))

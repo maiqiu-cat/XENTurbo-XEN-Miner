@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, onScopeDispose, ref, watch } from 'vue'
 import type { ChainKey } from '@/config/chains'
+import { normalizeError } from '@/core/txManager'
 import {
-  damagedRecordCount,
   inspectTransactionStorage,
   recoverTransactionStorage,
   storageBackupJson,
+  transactionStorageIssues,
   type StorageSnapshot
 } from '@/core/storageRecovery'
 
@@ -17,7 +18,13 @@ const snapshot = ref<StorageSnapshot | null>(null)
 const message = ref('')
 const exported = ref(false)
 const acknowledged = ref(false)
-const damaged = computed(() => (snapshot.value ? damagedRecordCount(snapshot.value) : 0))
+const issues = computed(() => (snapshot.value ? transactionStorageIssues(snapshot.value) : []))
+const damaged = computed(() => issues.value.reduce((sum, issue) => sum + issue.count, 0))
+const damageLabels = {
+  'invalid-json': 'Unreadable JSON',
+  'not-array': 'Expected a record array',
+  'invalid-record': 'Invalid record structure'
+}
 let controller: AbortController | null = null
 
 function inspect() {
@@ -71,12 +78,22 @@ async function recover() {
     if (active.signal.aborted) return
     inspect()
     message.value = `${result.repaired} settled record(s) archived and repaired. ${result.blocked} record(s) remain blocked. Unidentified or unconfirmed records are never discarded.`
+    const reasons = result.blockedReasons
+    const details = [
+      reasons.unidentified &&
+        `${reasons.unidentified} missing or unreadable transaction identities.`,
+      reasons.otherContext && `${reasons.otherContext} belong to another account or network.`,
+      reasons.unconfirmed && `${reasons.unconfirmed} without a matching mined receipt.`,
+      reasons.readLimit &&
+        `${reasons.readLimit} deferred by the 20-record verification limit; inspect again to continue.`
+    ].filter(Boolean)
+    if (details.length) message.value += ` ${details.join(' ')}`
   } catch (error) {
     if (!open.value) return
     message.value = active.signal.aborted
       ? 'Recovery cancelled or timed out. Inspect again; no unverified records were removed.'
       : error instanceof Error
-        ? error.message
+        ? normalizeError(error)
         : 'Recovery failed. Original records were retained.'
   } finally {
     clearTimeout(timer)
@@ -85,7 +102,7 @@ async function recover() {
   }
 }
 watch(() => [props.chain, props.wallet], close, { flush: 'sync' })
-onScopeDispose(() => controller?.abort())
+onScopeDispose(close)
 </script>
 
 <template>
@@ -114,6 +131,12 @@ onScopeDispose(() => controller?.abort())
         <p>
           Damaged records: {{ damaged }}. Mining stays blocked until transaction checks succeed.
         </p>
+        <ul v-if="issues.length" class="recovery-issues">
+          <li v-for="issue in issues" :key="issue.key">
+            <code>{{ issue.key }}</code
+            >: {{ damageLabels[issue.kind] }} ({{ issue.count }})
+          </li>
+        </ul>
         <p class="dim">
           Keep the backup private. It contains wallet addresses and transaction history. Do not
           clear site data or resend transactions.
@@ -171,6 +194,12 @@ onScopeDispose(() => controller?.abort())
 .recovery-message {
   overflow-wrap: anywhere;
   min-height: 24px;
+}
+.recovery-issues {
+  overflow-wrap: anywhere;
+  padding-left: 20px;
+  max-height: 120px;
+  overflow-y: auto;
 }
 .recovery-ack {
   display: flex;

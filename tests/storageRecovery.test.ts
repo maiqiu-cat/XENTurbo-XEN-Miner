@@ -6,7 +6,8 @@ import {
   damagedRecordCount,
   inspectTransactionStorage,
   recoverTransactionStorage,
-  storageBackupJson
+  storageBackupJson,
+  transactionStorageIssues
 } from '@/core/storageRecovery'
 
 const wallet = '0x0000000000000000000000000000000000000001'
@@ -92,6 +93,8 @@ describe('receipt-authenticated transaction storage recovery', () => {
         kind === 'journal' ? null : JSON.stringify(kind === 'locks' ? [validLock] : [])
       )
       expect(request.mock.calls.some(([args]) => args.method === 'eth_sendTransaction')).toBe(false)
+      expect(damagedRecordCount(inspectTransactionStorage())).toBe(0)
+      expect(countUnresolvedPendingOps('eth', wallet)).toBe(0)
     }
   )
   it.each(['broken-json', 'missing-hash', 'other-wallet', 'other-chain', 'pending'] as const)(
@@ -105,7 +108,14 @@ describe('receipt-authenticated transaction storage recovery', () => {
       const raw = kind === 'broken-json' ? '{' : JSON.stringify({ ...badEvent, record })
       localStorage.setItem(eventKey, raw)
       const result = await recoverTransactionStorage(inspectTransactionStorage(), 'eth', wallet)
-      expect(result).toEqual({ repaired: 0, blocked: 1, backupKey: null })
+      expect(result).toMatchObject({ repaired: 0, blocked: 1, backupKey: null })
+      const reason =
+        kind === 'other-wallet' || kind === 'other-chain'
+          ? 'otherContext'
+          : kind === 'pending'
+            ? 'unconfirmed'
+            : 'unidentified'
+      expect(result.blockedReasons[reason]).toBe(1)
       expect(localStorage.getItem(eventKey)).toBe(raw)
       expect(() => countUnresolvedPendingOps('eth', wallet)).toThrow('PENDING_STORAGE_READ_FAILED')
     }
@@ -177,9 +187,12 @@ describe('receipt-authenticated transaction storage recovery', () => {
         }
         return original(args)
       })
-      await expect(
-        recoverTransactionStorage(snapshot, 'eth', wallet, controller.signal)
-      ).rejects.toThrow()
+      const recovery = recoverTransactionStorage(snapshot, 'eth', wallet, controller.signal)
+      if (kind === 'abort') await expect(recovery).rejects.toMatchObject({ name: 'AbortError' })
+      else
+        await expect(recovery).rejects.toThrow(
+          kind === 'wallet' ? 'Wallet account changed' : 'Transaction records changed'
+        )
       expect(localStorage.getItem(eventKey)).toBe(JSON.stringify(badEvent))
       expect(removeListener).toHaveBeenCalled()
     }
@@ -207,5 +220,61 @@ describe('receipt-authenticated transaction storage recovery', () => {
     ).find((key) => key.startsWith('sm.storageRecovery.backup.'))!
     expect(localStorage.getItem(archive)).toBe(storageBackupJson(snapshot))
     expect(localStorage.getItem('sm.vmuLocks')).toBe(snapshot.entries[0].raw)
+  })
+
+  it('accepts a wallet-authenticated reverted receipt as settled without sending', async () => {
+    receipt = { ...(receipt as object), status: '0x0' }
+    localStorage.setItem(eventKey, JSON.stringify(badEvent))
+    const result = await recoverTransactionStorage(inspectTransactionStorage(), 'eth', wallet)
+    expect(result).toMatchObject({ repaired: 1, blocked: 0 })
+    expect(damagedRecordCount(inspectTransactionStorage())).toBe(0)
+    expect(countUnresolvedPendingOps('eth', wallet)).toBe(0)
+    expect(request.mock.calls.some(([args]) => args.method === 'eth_sendTransaction')).toBe(false)
+  })
+
+  it('limits one recovery to 20 records and distinguishes deferred work from unknown identity', async () => {
+    const records = Array.from({ length: 21 }, (_, i) => ({ ...badLock, batch: `broken-${i}` }))
+    records.push({ ...badLock, batch: 'unknown', txHash: '' })
+    localStorage.setItem('sm.vmuLocks', JSON.stringify(records))
+    const result = await recoverTransactionStorage(inspectTransactionStorage(), 'eth', wallet)
+    expect(result).toMatchObject({
+      repaired: 20,
+      blocked: 2,
+      blockedReasons: { readLimit: 1, unidentified: 1, otherContext: 0, unconfirmed: 0 }
+    })
+    expect(
+      request.mock.calls.filter(([args]) => args.method === 'eth_getTransactionReceipt')
+    ).toHaveLength(20)
+    expect(JSON.parse(localStorage.getItem('sm.vmuLocks')!)).toEqual(records.slice(20))
+    const resumed = await recoverTransactionStorage(inspectTransactionStorage(), 'eth', wallet)
+    expect(resumed).toMatchObject({
+      repaired: 1,
+      blocked: 1,
+      blockedReasons: { readLimit: 0, unidentified: 1 }
+    })
+    expect(JSON.parse(localStorage.getItem('sm.vmuLocks')!)).toEqual(records.slice(21))
+    expect(() => countUnresolvedPendingOps('eth', wallet)).toThrow('LOCK_STORAGE_INVALID')
+  })
+
+  it.each([
+    ['{', 'invalid-json'],
+    ['{}', 'not-array'],
+    [JSON.stringify([{ ...badLock, txHash: undefined, lockedAt: 1 }]), 'invalid-record']
+  ])('classifies %s and never removes unidentified lock evidence', async (raw, kind) => {
+    localStorage.setItem('sm.vmuLocks', raw)
+    const snapshot = inspectTransactionStorage()
+    expect(transactionStorageIssues(snapshot)).toEqual([{ key: 'sm.vmuLocks', kind, count: 1 }])
+    const result = await recoverTransactionStorage(snapshot, 'eth', wallet)
+    expect(result).toMatchObject({
+      repaired: 0,
+      blocked: 1,
+      backupKey: null,
+      blockedReasons: { unidentified: 1 }
+    })
+    expect(localStorage.getItem('sm.vmuLocks')).toBe(raw)
+    expect(
+      request.mock.calls.filter(([args]) => args.method === 'eth_getTransactionReceipt')
+    ).toHaveLength(0)
+    expect(() => countUnresolvedPendingOps('eth', wallet)).toThrow('LOCK_STORAGE_INVALID')
   })
 })

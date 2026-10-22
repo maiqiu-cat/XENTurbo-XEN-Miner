@@ -1,4 +1,5 @@
 import { Interface } from 'ethers'
+import { reactive } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CONTRACTS } from '@/config/contracts'
 import type { Eip1193Request, InjectedProvider } from '@/core/eip1193'
@@ -80,7 +81,13 @@ async function installOfflineHarness(storageFailure?: 'QuotaExceededError' | 'Se
   }))
   vi.doMock('@/core/chainReader', () => ({
     readFee: vi.fn(async () => 0n),
-    readVmuStatuses: vi.fn(async () => new Map([[1, 'CLAIMABLE']])),
+    readVmuStatuses: vi.fn(
+      async () =>
+        new Map([
+          [1, 'CLAIMABLE'],
+          [2, 'CLAIMABLE']
+        ])
+    ),
     readVmuStates: vi.fn(async () => []),
     readVmuCount: vi.fn(async () => 1),
     readVmuProxyDeployments: vi.fn(async () => new Map())
@@ -156,7 +163,8 @@ async function installOfflineHarness(storageFailure?: 'QuotaExceededError' | 'Se
   const locks = await import('@/core/localLock')
   const wallet = await import('@/core/wallet')
   expect(vi.isMockFunction(wallet.writeFactory)).toBe(false)
-  const prepare = () => tx.prepareOperation({ chain: 'eth', wallet: WALLET, op: 'CLAIM', ids: [1] })
+  const prepare = (id = 1) =>
+    tx.prepareOperation({ chain: 'eth', wallet: WALLET, op: 'CLAIM', ids: [id] })
   const sendRequests = () =>
     request.mock.calls.map(([args]) => args).filter((args) => args.method === 'eth_sendTransaction')
 
@@ -667,8 +675,7 @@ describe('offline transaction safety integration (H-08)', () => {
   it('serializes two fresh simultaneous sends and blocks the second on the real journal', async () => {
     const harness = await installOfflineHarness()
     const first = await harness.prepare()
-    harness.tx.abortPrepared(first)
-    const second = await harness.prepare()
+    const second = await harness.prepare(2)
     const results = Promise.allSettled([
       harness.tx.sendPreparedOperation(first),
       harness.tx.sendPreparedOperation(second)
@@ -691,6 +698,71 @@ describe('offline transaction safety integration (H-08)', () => {
     ])
     expect(harness.sendRequests()).toHaveLength(1)
     expect(harness.pending.countUnresolvedPendingOps('eth', WALLET)).toBe(1)
+  })
+
+  it.each(['original', 'copy', 'reactive', 'lockless'] as const)(
+    'rejects a cancelled %s prepared context before wallet or RPC work',
+    async (kind) => {
+      const harness = await installOfflineHarness()
+      const prepared =
+        kind === 'lockless'
+          ? await harness.tx.prepareOperation({
+              chain: 'eth',
+              wallet: WALLET,
+              op: 'CREATE_EMPTY_SLOT',
+              count: 1
+            })
+          : await harness.prepare()
+      const reference =
+        kind === 'copy' ? { ...prepared } : kind === 'reactive' ? reactive(prepared) : prepared
+      harness.tx.abortPrepared(prepared)
+      harness.tx.abortPrepared(prepared)
+      harness.request.mockClear()
+      harness.readProvider.getTransactionCount.mockClear()
+      harness.walletResponse.resolve(HASH)
+      await expect(harness.tx.sendPreparedOperation(reference)).rejects.toThrow(
+        'OPERATION_CANCELLED'
+      )
+      expect(harness.request).not.toHaveBeenCalled()
+      expect(harness.readProvider.getTransactionCount).not.toHaveBeenCalled()
+      expect(harness.locks.lockedIds('eth', WALLET).size).toBe(0)
+      expect(harness.pending.countUnresolvedPendingOps('eth', WALLET)).toBe(0)
+      const fresh = await harness.prepare()
+      expect(fresh.batch).not.toBe(prepared.batch)
+    }
+  )
+
+  it('cancels a send during preflight without reaching the wallet request', async () => {
+    const harness = await installOfflineHarness()
+    const prepared = await harness.prepare()
+    harness.readProvider.getTransactionCount.mockImplementation(async () => {
+      harness.tx.abortPrepared(prepared)
+      return NONCE
+    })
+    harness.walletResponse.resolve(HASH)
+    await expect(harness.tx.sendPreparedOperation(prepared)).rejects.toThrow('OPERATION_CANCELLED')
+    expect(harness.sendRequests()).toHaveLength(0)
+    expect(harness.pending.countUnresolvedPendingOps('eth', WALLET)).toBe(0)
+  })
+
+  it('does not release a dispatched operation and rejects reuse of its prepared object', async () => {
+    const harness = await installOfflineHarness()
+    const prepared = await harness.prepare()
+    const sending = harness.tx.sendPreparedOperation(prepared)
+    const firstFailure = expect(sending).rejects.toThrow('Transaction receipt missing')
+    await vi.waitFor(() => expect(harness.sendRequests()).toHaveLength(1))
+    const reused = harness.tx.sendPreparedOperation({ ...prepared })
+    const reusedFailure = expect(reused).rejects.toThrow('OPERATION_ALREADY_STARTED')
+    harness.tx.abortPrepared(prepared)
+    expect(harness.locks.lockedIds('eth', WALLET)).toEqual(new Set([1]))
+    expect(harness.pending.countUnresolvedPendingOps('eth', WALLET)).toBe(1)
+    harness.walletResponse.resolve(HASH)
+    await firstFailure
+    await reusedFailure
+    expect(harness.sendRequests()).toHaveLength(1)
+    expect(harness.locks.pendingLocks('eth', WALLET)).toEqual([
+      expect.objectContaining({ txHash: HASH })
+    ])
   })
 
   it('drops only a late code-4001 request, allowing a new explicit send', async () => {

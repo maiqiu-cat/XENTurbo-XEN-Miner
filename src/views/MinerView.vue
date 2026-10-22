@@ -129,6 +129,8 @@ const {
 )
 
 const pendingBlockedReason = computed(() => {
+  if (recoveryOpen.value)
+    return 'Blocked: Transaction storage recovery is open. Close it before starting another operation.'
   if (!pendingReady.value) {
     return pendingError.value
       ? 'Blocked: pending transaction check failed. Recheck before submitting.'
@@ -230,6 +232,7 @@ let opSeq = 0
 const prepared = ref<PreparedOp | null>(null)
 // Detach the old UI context, but preserve records for non-cancellable wallet sends.
 watch([() => wallet.address, () => wallet.chainKey, () => wallet.contextGen], () => {
+  recoveryOpen.value = false
   const walletRequestOpen = txState.value?.walletPrompted === true
   const broadcasted =
     Boolean(txState.value?.txHash) ||
@@ -586,6 +589,7 @@ const explorerAddrUrl = computed(() => {
       </p>
       <StorageRecovery
         v-if="activeChain && wallet.address"
+        :key="wallet.contextGen"
         :chain="activeChain"
         :wallet="wallet.address"
         :disabled="busy"

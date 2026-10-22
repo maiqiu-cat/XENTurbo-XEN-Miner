@@ -148,6 +148,17 @@ response cannot authorize deletion. Unreadable JSON, unidentified records and
 unconfirmed transactions remain blocked for manual investigation. This is not a
 reset-site-data control and does not guarantee recovery of lost transaction identity.
 
+The recovery panel distinguishes unreadable JSON, invalid containers and malformed
+records. Unidentified records, other wallet/network records, missing mined receipts
+and the 20-record verification limit are reported separately. A deferred record is
+not a settled record. Closing recovery or changing the wallet context cancels its
+read-only work; submitting again still requires successful pending reconciliation.
+
+Cancelling a prepared operation invalidates that preparation, including its shared
+UI references. A fresh preparation is required before sending. Once the request
+has been handed to the wallet, cancellation cannot remove its pending evidence or
+make the same prepared object reusable.
+
 ### PR #7 Validation Scope
 
 The previously reported **147 tests / 6 failures** was an early, focused negative
@@ -169,6 +180,14 @@ an active on-chain witness. Exit code 2 means **not verified**, including a budg
 limit, no VMUs, no active witness, an out-of-range start, or a rate-limit delay
 that cannot fit the budget; none of these is a release pass. Exit code 3 denotes
 a proven boundary/derivation mismatch; other errors use exit code 1.
+
+RPC and transport failures require fixing the cause and starting a fresh full
+verification; only scan limits and scan deadlines advertise continuation. Rate-limit
+diagnostics distinguish a server `Retry-After` from fallback exponential backoff
+that cannot fit the budget. Both remain **not verified**. During a failed ethers
+network bootstrap, its outstanding one-second retry delay can briefly postpone
+process exit; provider and HTTP resources are still destroyed. Network detection
+and CREATE2 boundary checks are not disabled to hide that dependency behavior.
 
 ## Page and performance analytics
 

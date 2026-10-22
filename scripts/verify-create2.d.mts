@@ -42,3 +42,9 @@ export function parseVerificationArgs(
 ): VerificationArgs
 
 export function verifyCreate2(options: VerificationOptions): Promise<boolean>
+export function rateLimitDelay(
+  retryAfter: string | undefined,
+  attempt: number,
+  remainingMs: number,
+  now?: number
+): number
