@@ -268,11 +268,109 @@ describe('usePendingTx', () => {
     expect(refreshPendingOps).toHaveBeenCalledTimes(1)
 
     first.resolve({ views: [], pendingNonceGap: 0, unresolvedCount: 0, confirmedOps: [] })
-    await Promise.all([first.promise, overlappingA, overlappingB])
+    await first.promise
     await vi.waitFor(() => expect(refreshPendingOps).toHaveBeenCalledTimes(2))
 
     second.resolve({ views: [], pendingNonceGap: 0, unresolvedCount: 0, confirmedOps: [] })
-    await second.promise
+    await Promise.all([second.promise, overlappingA, overlappingB])
+    scope.stop()
+  })
+
+  it('merges stronger overlapping checks and resolves callers only after that refresh', async () => {
+    const first = deferred<Awaited<ReturnType<typeof refreshPendingOps>>>()
+    const second = deferred<Awaited<ReturnType<typeof refreshPendingOps>>>()
+    vi.mocked(refreshPendingOps)
+      .mockReset()
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise)
+    const scope = effectScope()
+    const state = scope.run(() =>
+      usePendingTx(
+        () => '0x1',
+        () => 'eth'
+      )
+    )!
+    let completed = false
+    const explicit = state.check({ freshRpc: true, reverifyResults: true }).then(() => {
+      completed = true
+    })
+    const reuse = state.check({ freshRpc: false })
+    expect(refreshPendingOps).toHaveBeenCalledTimes(1)
+    first.resolve({ views: [], pendingNonceGap: 0, unresolvedCount: 0, confirmedOps: [] })
+    await vi.waitFor(() => expect(refreshPendingOps).toHaveBeenCalledTimes(2))
+    expect(refreshPendingOps).toHaveBeenLastCalledWith(
+      'eth',
+      '0x1',
+      expect.objectContaining({
+        freshRpc: true,
+        reverifyResults: true
+      })
+    )
+    expect(completed).toBe(false)
+    expect(state.checking.value).toBe(true)
+    second.resolve({ views: [], pendingNonceGap: 1, unresolvedCount: 1, confirmedOps: [] })
+    await Promise.all([explicit, reuse])
+    expect(completed).toBe(true)
+    expect(state.hasPending.value).toBe(true)
+    scope.stop()
+  })
+
+  it('invalidates readiness while hidden until the visibility refresh succeeds', async () => {
+    const empty = { views: [], pendingNonceGap: 0, unresolvedCount: 0, confirmedOps: [] }
+    const resumed = deferred<typeof empty>()
+    vi.mocked(refreshPendingOps)
+      .mockReset()
+      .mockResolvedValueOnce(empty)
+      .mockReturnValueOnce(resumed.promise)
+    const scope = effectScope()
+    const state = scope.run(() =>
+      usePendingTx(
+        () => '0x1',
+        () => 'eth'
+      )
+    )!
+    await vi.waitFor(() => expect(state.ready.value).toBe(true))
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
+    document.dispatchEvent(new Event('visibilitychange'))
+    expect(state.ready.value).toBe(false)
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    document.dispatchEvent(new Event('visibilitychange'))
+    expect(state.ready.value).toBe(false)
+    resumed.resolve(empty)
+    await vi.waitFor(() => expect(state.ready.value).toBe(true))
+    scope.stop()
+  })
+
+  it('settles a queued manual check when its account is invalidated without leaking options', async () => {
+    const first = deferred<Awaited<ReturnType<typeof refreshPendingOps>>>()
+    const empty = { views: [], pendingNonceGap: 0, unresolvedCount: 0, confirmedOps: [] }
+    vi.mocked(refreshPendingOps)
+      .mockReset()
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValue(empty)
+    const address = ref<string | null>('0x1')
+    const scope = effectScope()
+    const state = scope.run(() =>
+      usePendingTx(
+        () => address.value,
+        () => 'eth'
+      )
+    )!
+    const queued = state.check({ freshRpc: true, reverifyResults: true })
+    address.value = null
+    await expect(queued).resolves.toBe(0)
+    address.value = '0x2'
+    await vi.waitFor(() => expect(refreshPendingOps).toHaveBeenCalledTimes(2))
+    expect(refreshPendingOps).toHaveBeenLastCalledWith(
+      'eth',
+      '0x2',
+      expect.objectContaining({ freshRpc: false })
+    )
+    expect(vi.mocked(refreshPendingOps).mock.lastCall?.[2]?.reverifyResults).toBeUndefined()
+    first.resolve({ ...empty, pendingNonceGap: 9 })
+    await first.promise
+    await nextTick()
+    expect(state.pendingCount.value).toBe(0)
     scope.stop()
   })
 

@@ -125,6 +125,17 @@ visible and are rejected explicitly until edited, rather than silently selecting
 defaults or deleting the saved configuration. Configuration errors are shown
 separately from network failures. Transaction controls remain blocked until the
 current wallet and chain have completed pending reconciliation successfully.
+Returning from a hidden tab requires a new reconciliation. An explicit Recheck
+also retains its stronger RPC and result-verification options when another
+check is already running.
+
+If browser transaction storage fails after the wallet returns a hash, the
+transaction remains submitted. The Miner keeps the hash in the current tab and
+attempts a separate recovery copy; the earlier pending record continues to block
+resubmission. Keep the page open, save the explorer link, and check wallet Activity.
+Do not clear site data or resend to resolve a storage error. When both durable
+writes fail, the hash cannot be guaranteed to survive a reload. Unreadable pending
+records block submission and are preserved for recovery.
 
 ## Page and performance analytics
 
@@ -263,6 +274,11 @@ Exit codes are `0` for verified, `1` for arguments/RPC errors, `2` for unverifie
 and `3` for a proxy boundary mismatch. Scan progress and continuation IDs are
 reported on interruption. The scan budget bounds verification, not an OS-level
 process kill deadline.
+Chain and proxy-boundary mismatches require investigating the configuration or
+RPC response; continuing at another page does not resolve those failures. A
+boundary mismatch alone does not establish a faulty derivation: historical proxy
+destruction or inconsistent RPC state requires separate investigation. The gate
+remains non-successful until a complete witness check passes.
 
 Use `--rpc https://...` to override the selected chain's default RPC. Plain HTTP
 is permitted only for explicit loopback test endpoints. Redirects are rejected;
@@ -270,6 +286,8 @@ supply the final endpoint URL. HTTP 429 responses receive at most two retries,
 respecting Retry-After within the total verification budget. Release probes use
 strict JSON-RPC batch/ABI validation and reject redirects. Their chain IDs must
 use canonical hexadecimal quantities, so a noncanonical `0x01` is rejected.
+Remote diagnostic control characters are escaped to keep each CLI result on one
+line, and transport failures include their available underlying cause.
 
 Playwright uses a dedicated local production-preview server on port 4173. If that
 port is occupied by another application, keep that application running and set

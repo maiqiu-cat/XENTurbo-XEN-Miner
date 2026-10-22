@@ -175,6 +175,36 @@ describe('custom RPC validation', () => {
 })
 
 describe('runtime RPC health selection', () => {
+  it('discards an old in-flight health result after configuration changes', async () => {
+    writeCustomRpc('eth', ['https://old.example/'])
+    let finishOld!: (value: string) => void
+    const old = new Promise<string>((resolve) => {
+      finishOld = resolve
+    })
+    const request = vi.fn((url: string) =>
+      url === 'https://old.example/' ? old : Promise.resolve('0x1')
+    )
+    const publications: string[][] = []
+    const unsubscribe = onRpcHealthChange((_chain, state) => {
+      if (!state.checking) publications.push(state.healthyUrls)
+    })
+    try {
+      const first = ensureHealthyReadProvider('eth', request)
+      expect(request).toHaveBeenCalledWith('https://old.example/')
+      writeCustomRpc('eth', ['https://new.example/'])
+      resetProviders('eth')
+      const current = await ensureHealthyReadProvider('eth', request)
+      finishOld('0x1')
+      await expect(first).resolves.toBe(current)
+      expect(getReadProvider('eth')).toBe(current)
+      expect(getRpcHealthState('eth').healthyUrls).toEqual(['https://new.example/'])
+      expect(publications.flat()).not.toContain('https://old.example/')
+      expect(readCustomRpc('eth')).toEqual(['https://new.example/'])
+    } finally {
+      unsubscribe()
+    }
+  })
+
   it('bounds background probe concurrency without dropping configured nodes', async () => {
     const urls = Array.from({ length: MAX_RPC_ENDPOINTS }, (_, i) => `https://rpc${i}.example/`)
     writeCustomRpc('eth', urls)

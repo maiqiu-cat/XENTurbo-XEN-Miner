@@ -686,9 +686,7 @@ test('prepared signing stays blocked if a shared pending check fails during a tr
   await page.getByRole('button', { name: 'Open MetaMask & Sign' }).click()
   await page.evaluate(() => window.__pendingCheckGate.reject())
   await expect.poll(() => page.evaluate(() => window.__pendingCheckGate.reads)).toBe(4)
-  await expect(page.locator('.modal-body .err-text')).toContainText(
-    'verifying pending transactions'
-  )
+  await expect(page.locator('.modal-body .err-text')).toContainText('Pending check offline fixture')
   expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
     sendAttempts: 0,
     successfulBroadcasts: 0
@@ -696,6 +694,10 @@ test('prepared signing stays blocked if a shared pending check fails during a tr
   await page.evaluate(() => window.__pendingCheckGate.release())
   await page.getByRole('button', { name: 'Close', exact: true }).click()
   await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
+  expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+    sendAttempts: 0,
+    successfulBroadcasts: 0
+  })
 })
 
 for (const kind of ['wallet', 'chain'] as const) {
@@ -1270,5 +1272,96 @@ test('two tabs serialize wallet sends with a shared Web Lock', async ({ page, co
 
   await expect(page.getByText('Transaction rejected', { exact: true })).toBeVisible()
   await expect.poll(() => second.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(1)
+  await second.close()
+})
+
+test('a timely hash survives journal failure with a clear submitted state and recovery link', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page, { successfulSend: true })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
+  await page.locator('tbody input[type="checkbox"]').first().check()
+  await page.getByRole('button', { name: 'Claim only', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Open MetaMask & Sign' })).toBeVisible()
+  await page.evaluate(() => {
+    const set = Storage.prototype.setItem
+    Storage.prototype.setItem = function (key, value) {
+      if (key.startsWith('sm.pendingOps.event.') && JSON.parse(value).record?.phase === 'broadcast')
+        throw new DOMException('Offline fixture journal full', 'QuotaExceededError')
+      return set.call(this, key, value)
+    }
+  })
+  await page.getByRole('button', { name: 'Open MetaMask & Sign' }).click()
+  const modal = page.locator('.modal-body').filter({ has: page.getByTestId('tx-log') })
+  await expect(modal.locator('.err-text')).toContainText('Transaction submitted')
+  for (const message of ['MetaMask request opened', 'Transaction submitted:']) {
+    await expect(
+      modal.getByTestId('tx-log-entry').filter({ hasText: message }).locator('.tx-log-marker')
+    ).toHaveText('OK')
+  }
+  await expect(modal.locator('.err-text')).toContainText('Do not resend')
+  await expect(modal.locator('.steps li').nth(1).locator('.step-icon')).toHaveText('OK')
+  await expect(modal.locator('.step-icon.run')).toHaveCount(0)
+  await expect(modal.getByRole('link', { name: 'View on explorer' })).toHaveAttribute(
+    'href',
+    `https://etherscan.io/tx/${TX_HASH}`
+  )
+  await expect(modal.getByRole('button', { name: 'Close', exact: true })).toBeVisible()
+  expect(
+    await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks') ?? '[]')[0])
+  ).toMatchObject({ txHash: TX_HASH })
+  expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+    sendAttempts: 1,
+    successfulBroadcasts: 1
+  })
+  await captureQaScreenshot(page, 'broadcast-storage-recovery')
+  await modal.getByRole('button', { name: 'Close', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeDisabled()
+})
+
+test('simultaneous tab submissions produce only one broadcast while reconciliation is unresolved', async ({
+  page,
+  context
+}) => {
+  const second = await context.newPage()
+  for (const candidate of [page, second]) {
+    await emulateDesktopGoogleChrome(candidate)
+    await mockSameOriginRpc(candidate)
+    await installInjectedWallet(candidate, { successfulSend: true })
+    await candidate.goto('/')
+    await candidate.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    await candidate.getByRole('button', { name: 'Confirm Mint' }).click()
+    await expect(candidate.getByRole('button', { name: 'Open MetaMask & Sign' })).toBeVisible()
+    await candidate.evaluate(() => {
+      window.__walletMock.setSendDelay(500)
+      window.__walletMock.setRejected('eth_getTransactionReceipt', true)
+    })
+  }
+  await Promise.all(
+    [page, second].map((candidate) =>
+      candidate.getByRole('button', { name: 'Open MetaMask & Sign' }).click()
+    )
+  )
+  await expect
+    .poll(async () => {
+      const errors = await Promise.all(
+        [page, second].map((candidate) =>
+          candidate.locator('.modal-body .err-text').allTextContents()
+        )
+      )
+      return errors
+        .flat()
+        .some((error) => error.includes('previous local transaction record is unresolved'))
+    })
+    .toBe(true)
+  const counts = await Promise.all(
+    [page, second].map((candidate) => candidate.evaluate(() => window.__walletMock.stats()))
+  )
+  expect(counts.reduce((total, stats) => total + stats.sendAttempts, 0)).toBe(1)
+  expect(counts.reduce((total, stats) => total + stats.successfulBroadcasts, 0)).toBe(1)
   await second.close()
 })

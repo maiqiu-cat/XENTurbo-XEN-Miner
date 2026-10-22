@@ -32,6 +32,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.clearAllTimers()
   vi.useRealTimers()
+  vi.restoreAllMocks()
   vi.unstubAllGlobals()
   vi.doUnmock('@/core/rpc')
   vi.doUnmock('@/core/chainReader')
@@ -214,7 +215,379 @@ async function detachAtWalletTimeout(harness: Awaited<ReturnType<typeof installO
   return { prepared, onStep }
 }
 
+function mockRevertedReceipt(harness: Awaited<ReturnType<typeof installOfflineHarness>>) {
+  const request = harness.request.getMockImplementation()!
+  harness.request.mockImplementation(async (args) => {
+    if (args.method === 'eth_getTransactionByHash') return null
+    if (args.method === 'eth_getTransactionReceipt')
+      return {
+        transactionHash: HASH,
+        from: WALLET,
+        to: CONTRACTS.eth.factory,
+        status: '0x0',
+        blockNumber: '0x1',
+        blockHash: `0x${'b'.repeat(64)}`
+      }
+    return request(args)
+  })
+}
+
 describe('offline transaction safety integration (H-08)', () => {
+  it.each([
+    { late: false, cacheFails: false },
+    { late: false, cacheFails: true },
+    { late: true, cacheFails: false },
+    { late: true, cacheFails: true }
+  ])(
+    'recovers a hash after journal reads fail (late=$late, cacheFails=$cacheFails)',
+    async ({ late, cacheFails }) => {
+      const harness = await installOfflineHarness()
+      const prepared = late
+        ? (await detachAtWalletTimeout(harness)).prepared
+        : await harness.prepare()
+      const sending = late ? null : harness.tx.sendPreparedOperation(prepared)
+      const rejected = sending
+        ? expect(sending).rejects.toThrow('PENDING_STORAGE_READ_FAILED')
+        : null
+      await vi.waitFor(() => expect(harness.sendRequests()).toHaveLength(1))
+      const get = harness.storage.getItem.bind(harness.storage)
+      const reads = vi.spyOn(harness.storage, 'getItem').mockImplementation((key) => {
+        if (key.startsWith('sm.pendingOps.event.'))
+          throw new DOMException('read denied', 'SecurityError')
+        return get(key)
+      })
+      const set = vi.mocked(harness.storage.setItem).getMockImplementation()!
+      if (cacheFails)
+        vi.mocked(harness.storage.setItem).mockImplementation((key, value) => {
+          if (key === 'sm.vmuLocks') throw new DOMException('cache unavailable', 'SecurityError')
+          return set(key, value)
+        })
+      harness.walletResponse.resolve(HASH)
+      await vi.advanceTimersByTimeAsync(0)
+      if (rejected) await rejected
+      expect(() => harness.pending.listPendingOps('eth', WALLET)).toThrow(
+        'PENDING_STORAGE_READ_FAILED'
+      )
+      if (!cacheFails)
+        expect(harness.locks.pendingLocks('eth', WALLET)[0]).toMatchObject({ txHash: HASH })
+      reads.mockRestore()
+      vi.mocked(harness.storage.setItem).mockImplementation(set)
+      await harness.pending.refreshPendingOps('eth', WALLET)
+      expect(harness.pending.listPendingOps('eth', WALLET)).toEqual([
+        expect.objectContaining({ id: prepared.batch, txHash: HASH, phase: 'broadcast' })
+      ])
+      vi.resetModules()
+      const reloaded = await import('@/core/pendingOps')
+      expect(reloaded.listPendingOps('eth', WALLET)[0]).toMatchObject({ txHash: HASH })
+      expect(reloaded.countUnresolvedPendingOps('eth', WALLET)).toBe(1)
+      expect(harness.sendRequests()).toHaveLength(1)
+    }
+  )
+
+  it.each([false, true])(
+    'persists settlement before deleting the sole reload recovery hash (journal fails: %s)',
+    async (journalFails) => {
+      const harness = await installOfflineHarness()
+      harness.pending.recordPendingOp({
+        id: 'recover',
+        chain: 'eth',
+        wallet: WALLET,
+        op: 'CLAIM',
+        ids: [1],
+        count: 0,
+        term: 0,
+        txHash: '',
+        phase: 'awaiting-wallet',
+        nonce: NONCE
+      })
+      harness.locks.attachTxHash('recover', HASH, {
+        chain: 'eth',
+        wallet: WALLET,
+        ids: [1],
+        op: 'CLAIM'
+      })
+      mockRevertedReceipt(harness)
+      vi.resetModules()
+      const tx = await import('@/core/txManager')
+      const pending = await import('@/core/pendingOps')
+      const locks = await import('@/core/localLock')
+      const set = vi.mocked(harness.storage.setItem).getMockImplementation()!
+      if (journalFails) {
+        vi.mocked(harness.storage.setItem).mockImplementation((key, value) => {
+          if (key.startsWith('sm.pendingOps.event.'))
+            throw new DOMException('journal full', 'QuotaExceededError')
+          return set(key, value)
+        })
+        expect(await tx.resumePendingLocks('eth', WALLET)).toBe(false)
+        expect(locks.pendingLocks('eth', WALLET)[0]).toMatchObject({ txHash: HASH })
+        expect(pending.listPendingOps('eth', WALLET)[0]).toMatchObject({ phase: 'awaiting-wallet' })
+        vi.mocked(harness.storage.setItem).mockImplementation(set)
+      }
+      expect(await tx.resumePendingLocks('eth', WALLET)).toBe(true)
+      expect(pending.listPendingOps('eth', WALLET)).toEqual([
+        expect.objectContaining({
+          id: 'recover',
+          txHash: HASH,
+          phase: 'reverted',
+          receipt: expect.objectContaining({ status: 0 })
+        })
+      ])
+      expect(locks.pendingLocks('eth', WALLET)).toEqual([])
+      expect(harness.sendRequests()).toHaveLength(0)
+    }
+  )
+
+  it('retries terminal-lock cleanup after a temporary cache-write failure', async () => {
+    const harness = await installOfflineHarness()
+    harness.pending.recordPendingOp({
+      id: 'settled',
+      chain: 'eth',
+      wallet: WALLET,
+      op: 'CLAIM',
+      ids: [1],
+      count: 0,
+      term: 0,
+      txHash: HASH,
+      phase: 'broadcast',
+      nonce: NONCE
+    })
+    mockRevertedReceipt(harness)
+    const set = vi.mocked(harness.storage.setItem).getMockImplementation()!
+    vi.mocked(harness.storage.setItem).mockImplementation((key, value) => {
+      if (key === 'sm.vmuLocks') throw new DOMException('cache full', 'QuotaExceededError')
+      return set(key, value)
+    })
+    expect((await harness.pending.refreshPendingOps('eth', WALLET)).unresolvedCount).toBe(0)
+    expect(harness.pending.listPendingOps('eth', WALLET)[0].phase).toBe('reverted')
+    expect(harness.locks.broadcastLockedIds('eth', WALLET)).toEqual(new Set([1]))
+    vi.mocked(harness.storage.setItem).mockImplementation(set)
+    await harness.pending.refreshPendingOps('eth', WALLET)
+    expect(harness.locks.pendingLocks('eth', WALLET)).toEqual([])
+    expect(harness.locks.broadcastLockedIds('eth', WALLET)).toEqual(new Set())
+    expect(harness.sendRequests()).toHaveLength(0)
+  })
+
+  it.each(['GENERAL_MINT', 'CREATE_EMPTY_SLOT'] as const)(
+    'recovers the hash of a lockless %s operation after journal failure and reload',
+    async (op) => {
+      const harness = await installOfflineHarness()
+      const params = {
+        id: 'lockless',
+        chain: 'eth' as const,
+        wallet: WALLET,
+        op,
+        ids: [],
+        count: 1,
+        term: 10,
+        nonce: NONCE
+      }
+      harness.pending.recordPendingOp({ ...params, txHash: '', phase: 'awaiting-wallet' })
+      const setItem = vi.mocked(harness.storage.setItem).getMockImplementation()!
+      vi.mocked(harness.storage.setItem).mockImplementation((key, value) => {
+        if (key.startsWith('sm.pendingOps.event.'))
+          throw new DOMException('journal full', 'QuotaExceededError')
+        return setItem(key, value)
+      })
+      expect(() =>
+        harness.pending.recordPendingOp({ ...params, txHash: HASH, phase: 'broadcast' })
+      ).toThrow('PENDING_STORAGE_WRITE_FAILED')
+      expect(harness.locks.pendingLocks('eth', WALLET)).toEqual([
+        expect.objectContaining({ batch: params.id, txHash: HASH, ids: [], op, count: 1 })
+      ])
+      expect(harness.pending.listPendingOps('eth', WALLET)[0]).toMatchObject({ txHash: HASH })
+      vi.mocked(harness.storage.setItem).mockImplementation(setItem)
+      vi.resetModules()
+      const reloaded = await import('@/core/pendingOps')
+      await reloaded.refreshPendingOps('eth', WALLET).catch(() => undefined)
+      expect(reloaded.listPendingOps('eth', WALLET)).toEqual([
+        expect.objectContaining({ id: params.id, txHash: HASH, op, count: 1 })
+      ])
+      expect(reloaded.countUnresolvedPendingOps('eth', WALLET)).toBe(1)
+      expect(harness.sendRequests()).toHaveLength(0)
+    }
+  )
+
+  it('preserves duplicate evidence until the replacement journal event is saved', async () => {
+    const harness = await installOfflineHarness()
+    const record = {
+      chain: 'eth',
+      wallet: WALLET,
+      op: 'CLAIM',
+      ids: [1],
+      count: 0,
+      term: 0,
+      txHash: HASH,
+      phase: 'broadcast',
+      origin: 'local',
+      submittedAt: Date.now(),
+      updatedAt: Date.now()
+    }
+    harness.storage.setItem(
+      'sm.pendingOps',
+      JSON.stringify([
+        { ...record, id: 'first' },
+        { ...record, id: 'second' }
+      ])
+    )
+    expect(harness.pending.listPendingOps('eth', WALLET)).toHaveLength(2)
+    const setItem = vi.mocked(harness.storage.setItem).getMockImplementation()!
+    vi.mocked(harness.storage.setItem).mockImplementation((key, value) => {
+      if (key.startsWith('sm.pendingOps.event.') && JSON.parse(value).record !== null)
+        throw new DOMException('journal full', 'QuotaExceededError')
+      return setItem(key, value)
+    })
+    expect(() =>
+      harness.pending.recordPendingOp({
+        id: 'first',
+        chain: 'eth',
+        wallet: WALLET,
+        op: 'CLAIM',
+        ids: [1],
+        count: 0,
+        term: 0,
+        txHash: HASH,
+        phase: 'broadcast'
+      })
+    ).toThrow('PENDING_STORAGE_WRITE_FAILED')
+    expect(
+      harness.pending
+        .listPendingOps('eth', WALLET)
+        .map((item) => item.id)
+        .sort()
+    ).toEqual(['first', 'second'])
+  })
+
+  it.each(['journal', 'both'] as const)(
+    'shows a submitted transaction and preserves the pending gate when %s storage fails after a timely hash',
+    async (failure) => {
+      const harness = await installOfflineHarness()
+      const prepared = await harness.prepare()
+      const onStep = vi.fn()
+      const sending = harness.tx.sendPreparedOperation(prepared, { onStep })
+      const assertion = expect(sending).rejects.toThrow('PENDING_STORAGE_WRITE_FAILED')
+      await vi.waitFor(() => expect(harness.sendRequests()).toHaveLength(1))
+      const setItem = vi.mocked(harness.storage.setItem).getMockImplementation()!
+      vi.mocked(harness.storage.setItem).mockImplementation((key, value) => {
+        if (key.startsWith('sm.pendingOps.event.') || (failure === 'both' && key === 'sm.vmuLocks'))
+          throw new DOMException('storage full', 'QuotaExceededError')
+        return setItem(key, value)
+      })
+
+      harness.walletResponse.resolve(HASH)
+      await assertion
+      const state = onStep.mock.lastCall?.[0]
+      expect(state).toMatchObject({
+        txHash: HASH,
+        send: 'done',
+        confirm: 'error',
+        walletPrompted: false
+      })
+      expect(state.error).toContain('Do not resend')
+      expect(state.error).toContain('Do not clear')
+      expect(state.error).toContain('Keep this page open')
+      expect(state.logs.at(-1)).toMatchObject({ status: 'error' })
+      expect(state.logs.some((entry: { status: string }) => entry.status === 'process')).toBe(false)
+      expect(state.logs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            status: 'done',
+            message: expect.stringContaining('MetaMask request opened')
+          }),
+          expect.objectContaining({
+            status: 'done',
+            message: expect.stringContaining('Transaction submitted:')
+          })
+        ])
+      )
+      expect(harness.readProvider.waitForTransaction).not.toHaveBeenCalled()
+      expect(harness.pending.countUnresolvedPendingOps('eth', WALLET)).toBe(1)
+      expect(harness.pending.listPendingOps('eth', WALLET)[0]).toMatchObject({
+        id: prepared.batch,
+        phase: 'broadcast',
+        txHash: HASH
+      })
+      const persisted = Array.from({ length: harness.storage.length }, (_, i) =>
+        harness.storage.key(i)
+      )
+        .filter((key): key is string => key?.startsWith('sm.pendingOps.event.') === true)
+        .map((key) => JSON.parse(harness.storage.getItem(key)!))
+      expect(persisted).toEqual([
+        expect.objectContaining({
+          record: expect.objectContaining({
+            id: prepared.batch,
+            phase: 'awaiting-wallet',
+            txHash: ''
+          })
+        })
+      ])
+      if (failure === 'journal') {
+        expect(harness.locks.pendingLocks('eth', WALLET)).toEqual([
+          expect.objectContaining({ batch: prepared.batch, ids: [1], txHash: HASH, op: 'CLAIM' })
+        ])
+      }
+
+      // A fresh attempt must still fail after the unsigned reservation expires.
+      vi.mocked(harness.storage.setItem).mockImplementation(setItem)
+      await vi.advanceTimersByTimeAsync(harness.tx.WALLET_RESPONSE_TIMEOUT_MS)
+      if (failure === 'both') {
+        const retry = await harness.prepare()
+        await expect(harness.tx.sendPreparedOperation(retry)).rejects.toThrow(
+          'LOCAL_PENDING_UNRESOLVED'
+        )
+      } else {
+        await expect(harness.prepare()).rejects.toThrow()
+      }
+      expect(harness.sendRequests()).toHaveLength(1)
+    }
+  )
+
+  it('continues confirmation after a timely hash when only the lock cache write fails', async () => {
+    const harness = await installOfflineHarness()
+    const prepared = await harness.prepare()
+    const onStep = vi.fn()
+    const sending = harness.tx.sendPreparedOperation(prepared, { onStep })
+    const assertion = expect(sending).rejects.toThrow('Transaction receipt missing')
+    await vi.waitFor(() => expect(harness.sendRequests()).toHaveLength(1))
+    const setItem = vi.mocked(harness.storage.setItem).getMockImplementation()!
+    vi.mocked(harness.storage.setItem).mockImplementation((key, value) => {
+      if (key === 'sm.vmuLocks') throw new DOMException('lock storage full', 'QuotaExceededError')
+      return setItem(key, value)
+    })
+    harness.walletResponse.resolve(HASH)
+    await assertion
+    expect(harness.readProvider.waitForTransaction).toHaveBeenCalledWith(
+      HASH,
+      1,
+      expect.any(Number)
+    )
+    expect(onStep.mock.lastCall?.[0]).toMatchObject({ send: 'done', txHash: HASH })
+    expect(harness.pending.listPendingOps('eth', WALLET)).toEqual([
+      expect.objectContaining({ id: prepared.batch, txHash: HASH, phase: 'broadcast' })
+    ])
+    expect(harness.sendRequests()).toHaveLength(1)
+  })
+
+  it('actively releases a non-expired soft lock after late code-4001 rejection', async () => {
+    // Advance timeout timers without advancing the lock's wall clock.
+    const now = Date.now()
+    vi.spyOn(Date, 'now').mockReturnValue(now)
+    const harness = await installOfflineHarness()
+    const { prepared } = await detachAtWalletTimeout(harness)
+    expect(Date.now()).toBe(now)
+    expect(harness.locks.lockedIds('eth', WALLET)).toEqual(new Set([1]))
+    harness.locks.tryAcquireLock({ chain: 'eth', wallet: OTHER_WALLET, ids: [1], batch: 'other' })
+    harness.walletResponse.reject(harness.userRejection)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(harness.locks.lockedIds('eth', WALLET)).toEqual(new Set())
+    expect(harness.locks.lockedIds('eth', OTHER_WALLET)).toEqual(new Set([1]))
+    expect(harness.pending.listPendingOps('eth', WALLET)[0]).toMatchObject({
+      id: prepared.batch,
+      phase: 'dropped'
+    })
+    expect(harness.activeLocks.size).toBe(0)
+    expect(harness.sendRequests()).toHaveLength(1)
+  })
+
   it('persists a late hash across reload and blocks a queued resend', async () => {
     const harness = await installOfflineHarness()
     const { prepared, onStep } = await detachAtWalletTimeout(harness)
@@ -378,9 +751,45 @@ describe('offline transaction safety integration (H-08)', () => {
     harness.walletResponse.resolve(HASH)
     await vi.advanceTimersByTimeAsync(0)
     expect(harness.pending.listPendingOps('eth', WALLET)).toEqual([
-      expect.objectContaining({ id: prepared.batch, txHash: '', phase: 'awaiting-wallet' })
+      expect.objectContaining({ id: prepared.batch, txHash: HASH, phase: 'broadcast' })
     ])
     expect(harness.pending.countUnresolvedPendingOps('eth', WALLET)).toBe(1)
     expect(harness.sendRequests()).toHaveLength(1)
+    expect(harness.locks.pendingLocks('eth', WALLET)).toEqual([
+      expect.objectContaining({ batch: prepared.batch, txHash: HASH, ids: [1] })
+    ])
+
+    vi.mocked(harness.storage.setItem).mockImplementation(setItem)
+    vi.resetModules()
+    const reloaded = await import('@/core/pendingOps')
+    // Hydration runs before network reconciliation; the offline wallet has no receipt methods.
+    await reloaded.refreshPendingOps('eth', WALLET).catch(() => undefined)
+    expect(reloaded.listPendingOps('eth', WALLET)).toEqual([
+      expect.objectContaining({ id: prepared.batch, phase: 'broadcast', txHash: HASH })
+    ])
+    expect(reloaded.countUnresolvedPendingOps('eth', WALLET)).toBe(1)
   })
+
+  it.each(['corrupt event', 'read failure'] as const)(
+    'blocks sending without deleting evidence after a journal %s',
+    async (failure) => {
+      const harness = await installOfflineHarness()
+      const prepared = await harness.prepare()
+      const key = 'sm.pendingOps.event.unreadable'
+      harness.storage.setItem(key, '{invalid')
+      const get = harness.storage.getItem.bind(harness.storage)
+      if (failure === 'read failure')
+        vi.spyOn(harness.storage, 'getItem').mockImplementation((name) => {
+          if (name === key) throw new DOMException('read denied', 'SecurityError')
+          return get(name)
+        })
+      const onStep = vi.fn()
+      await expect(harness.tx.sendPreparedOperation(prepared, { onStep })).rejects.toThrow(
+        'PENDING_STORAGE_READ_FAILED'
+      )
+      expect(harness.sendRequests()).toHaveLength(0)
+      expect(get(key)).toBe('{invalid')
+      expect(onStep.mock.lastCall?.[0].error).toContain('Do not clear')
+    }
+  )
 })

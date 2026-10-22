@@ -2,7 +2,7 @@
 
 import { Interface } from 'ethers'
 import { CHAIN_CONFIG } from './chain-config.mjs'
-import { isMainModule, normalizeProbeUrl } from './cli-utils.mjs'
+import { isMainModule, normalizeProbeUrl, diagnosticError, safeLogText } from './cli-utils.mjs'
 import { rpcBatchResults, rpcStringResult, rpcChainId, rpcAbiWord } from './rpc-response.mjs'
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
@@ -55,7 +55,7 @@ export async function probeReleaseEndpoint(url, config, fetchImpl = fetch) {
     return {
       healthy: false,
       url,
-      error: `REQUEST_FAILED: ${error instanceof Error ? error.message : String(error)}`
+      error: `REQUEST_FAILED: ${diagnosticError(error)}`
     }
   }
   if (!response.ok) return { healthy: false, url, error: `HTTP_STATUS: ${response.status}` }
@@ -93,7 +93,7 @@ export async function probeReleaseEndpoint(url, config, fetchImpl = fetch) {
     return {
       healthy: false,
       url,
-      error: `INVALID_RESULT: ${error instanceof Error ? error.message : String(error)}`
+      error: `INVALID_RESULT: ${diagnosticError(error)}`
     }
   }
 }
@@ -110,7 +110,7 @@ async function main() {
         passed = result
         break
       }
-      console.error(`WARN chain=${config.key} rpc=${url} ${result.error}`)
+      console.error(safeLogText(`WARN chain=${config.key} rpc=${url} ${result.error}`))
     }
     if (!passed) {
       failed = true
@@ -126,7 +126,7 @@ async function main() {
 
 if (isMainModule(import.meta.url)) {
   main().catch((error) => {
-    console.error(error instanceof Error ? error.message : String(error))
+    console.error(diagnosticError(error))
     process.exitCode = 1
   })
 }

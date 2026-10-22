@@ -750,6 +750,14 @@ export async function sendPreparedOperation(
   const recordBroadcast = (txHash: string) => {
     broadcasted = true
     awaitingWalletResolved = true
+    state.txHash = txHash
+    state.walletPrompted = false
+    state.send = 'done'
+    appendTxLog(
+      state,
+      `Transaction submitted: ${txHash.slice(0, 10)}...${txHash.slice(-8)}.`,
+      'done'
+    )
     recordPendingOp({
       id: prepared.batch,
       chain: prepared.chain,
@@ -947,11 +955,8 @@ export async function sendPreparedOperation(
       recordBroadcast,
       settleLateWalletFailure
     )
-    state.txHash = txHash
-    state.walletPrompted = false
     recordBroadcast(txHash)
-    state.send = 'done'
-    log(`Transaction submitted: ${txHash.slice(0, 10)}...${txHash.slice(-8)}.`, 'done')
+    emit()
 
     state.confirm = 'process'
     log('Waiting for the transaction to be confirmed on-chain...')
@@ -1054,8 +1059,12 @@ export async function sendPreparedOperation(
       recordWalletDrop()
     }
     if (!broadcasted && state.send !== 'done') state.send = 'error'
-    else if (state.confirm === 'process') state.confirm = 'error'
-    if (!state.error) state.error = normalizeError(err)
+    else if (broadcasted || state.confirm === 'process') state.confirm = 'error'
+    if (!state.error)
+      state.error =
+        broadcasted && /PENDING_STORAGE_(?:READ|WRITE)_FAILED/i.test(err?.message || '')
+          ? 'Transaction submitted, but its local record could not be saved. Do not resend. Do not clear site data. Keep this page open, save the transaction hash from the explorer link, and check wallet Activity before rechecking pending operations.'
+          : normalizeError(err)
     log(`Transaction stopped: ${state.error}`, 'error')
     throw err
   } finally {
@@ -1095,8 +1104,23 @@ export async function resumePendingLocks(chain: ChainKey, wallet: string): Promi
     try {
       const { settlement } = await readWalletEvidence(chain, wallet, lock.txHash)
       if (settlement) {
+        // The cache may hold the only durable hash after a journal-write failure.
+        recordPendingOp({
+          id: lock.batch,
+          chain,
+          wallet,
+          op: lock.op ?? 'GENERAL_MINT',
+          ids: lock.ids,
+          count: lock.count ?? 0,
+          term: lock.term ?? 0,
+          txHash: lock.txHash,
+          phase: settlement.phase,
+          settlement,
+          submittedAt: lock.lockedAt,
+          origin: 'legacy-unknown',
+          nonceAuthoritative: false
+        })
         resolvedAny = true
-        releaseLock(lock.batch)
       }
     } catch {
       // keep lock
@@ -1112,8 +1136,8 @@ export function normalizeError(err: any): string {
     return 'The prepared transaction expired after 2 minutes. Estimate it again before signing.'
   if (/RPC_UNAVAILABLE|RPC_NOT_VALIDATED/i.test(msg))
     return 'No configured RPC endpoint responded on the expected network. Your RPC list was preserved. Check internet access, DNS, firewall, and proxy/VPN settings, then retry; or change endpoints in RPC settings.'
-  if (/PENDING_STORAGE_WRITE_FAILED/i.test(msg))
-    return 'Browser storage is full or unavailable. Clear old site data before sending another transaction.'
+  if (/PENDING_STORAGE_(?:READ|WRITE)_FAILED/i.test(msg))
+    return 'Local transaction storage is unavailable or damaged. Do not clear site data or resend. Check wallet Activity and restore storage access before rechecking pending operations.'
   if (/PENDING_STATE_UNCERTAIN/i.test(msg))
     return 'Wallet and read RPC disagree about the pending nonce. Do not retry yet. Open MetaMask Activity, verify the selected network, then recheck.'
   if (/WALLET_ASLEEP/.test(msg))

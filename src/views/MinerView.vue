@@ -268,7 +268,7 @@ async function operate(
     ]
   }
   // Fresh check right before starting — polling may be a few seconds stale.
-  const n = await checkPending()
+  const { count: n, error: checkError } = await checkPendingForSubmit()
   if (
     seq !== opSeq ||
     wallet.contextGen !== requestedContextGen ||
@@ -277,9 +277,10 @@ async function operate(
   ) {
     return
   }
-  if (!pendingReady.value || pendingError.value) {
+  if (checkError || !pendingReady.value || pendingError.value) {
     busy.value = false
     const error =
+      checkError ??
       pendingError.value ??
       'Pending transaction check has not completed. Recheck before submitting.'
     txState.value = {
@@ -334,15 +335,40 @@ async function operate(
   }
 }
 
+async function checkPendingForSubmit(): Promise<{ count: number; error: string | null }> {
+  let failure: string | null = null
+  let fail!: (count: number) => void
+  const failed = new Promise<number>((resolve) => {
+    fail = resolve
+  })
+  // A queued recheck may recover, but must not revive a click whose check already failed.
+  const stop = watch(
+    pendingError,
+    (message) => {
+      if (message) {
+        failure = message
+        fail(0)
+      }
+    },
+    { flush: 'sync' }
+  )
+  try {
+    const count = await Promise.race([checkPending(), failed])
+    return { count, error: failure }
+  } finally {
+    stop()
+  }
+}
+
 /** Phase 2: must run from a click so MetaMask gets a fresh user gesture. */
 async function signPrepared() {
   const prep = prepared.value
   if (!prep) return
   const seq = opSeq
   const requestedContextGen = wallet.contextGen
-  const n = await checkPending()
+  const { count: n, error: checkError } = await checkPendingForSubmit()
   if (seq !== opSeq || wallet.contextGen !== requestedContextGen || prepared.value !== prep) return
-  if (!pendingReady.value || n > 0 || pendingError.value) {
+  if (checkError || !pendingReady.value || n > 0 || pendingError.value) {
     abortPrepared(prep)
     prepared.value = null
     busy.value = false
@@ -352,6 +378,7 @@ async function signPrepared() {
       confirm: 'wait',
       readyToSign: false,
       error:
+        checkError ??
         pendingError.value ??
         pendingBlockedReason.value ??
         `A previous transaction is still pending (${n}). Wait for it in MetaMask, then retry.`

@@ -1,6 +1,25 @@
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
+export function safeLogText(value) {
+  return String(value).replace(
+    /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu,
+    (character) => `\\u${character.codePointAt(0).toString(16).padStart(4, '0')}`
+  )
+}
+
+export function diagnosticError(error) {
+  const message = error instanceof Error ? error.message : String(error)
+  const cause = error instanceof Error ? error.cause : null
+  const detail =
+    cause && typeof cause === 'object'
+      ? [cause.code, cause.message].filter((part) => typeof part === 'string').join(': ')
+      : typeof cause === 'string'
+        ? cause
+        : ''
+  return safeLogText(message.slice(0, 500) + (detail ? ` (${detail.slice(0, 200)})` : ''))
+}
+
 export function isMainModule(moduleUrl, entrypoint = process.argv[1]) {
   if (!entrypoint) return false
   return realpathSync(entrypoint) === realpathSync(fileURLToPath(moduleUrl))

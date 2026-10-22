@@ -1,3 +1,5 @@
+import { safeLogText } from './cli-utils.mjs'
+
 export function rpcBatchResults(payload, ids) {
   if (!Array.isArray(payload) || payload.length > ids.length) {
     throw new Error('INVALID_BATCH: unexpected number or type of RPC results.')
@@ -28,7 +30,7 @@ export function rpcStringResult(results, id, label) {
   if (Object.hasOwn(item, 'error')) {
     const detail =
       typeof item.error?.message === 'string'
-        ? item.error.message.slice(0, 200)
+        ? safeLogText(item.error.message.slice(0, 200))
         : 'RPC returned an error'
     throw new Error(
       `${label === 'FEE' ? 'FEE_CALL_FAILED' : 'RPC_CALL_FAILED'}: ${label}: ${detail}`

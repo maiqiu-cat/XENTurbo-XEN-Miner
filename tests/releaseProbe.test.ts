@@ -25,6 +25,20 @@ function validPayload() {
 }
 
 describe('release chain probe', () => {
+  it.each([1, 2, 3, 4, 5, 6])('escapes remote error controls for RPC result %s', async (id) => {
+    const payload = validPayload().map((entry) =>
+      entry.id === id
+        ? { jsonrpc: '2.0', id, error: { message: '\u001b]0;forged\u0007\r\nPASS forged\u009b2J' } }
+        : entry
+    )
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, json: async () => payload })
+    const result = await probeReleaseEndpoint('https://rpc.example', config, fetchImpl)
+    expect(result.healthy).toBe(false)
+    for (const control of ['\r', '\n', '\u001b', '\u0007', '\u009b'])
+      expect(result.error).not.toContain(control)
+    expect(result.error).toContain('\\u001b')
+  })
+
   it('requires the expected chain, all contract code, FEE and vmuCount reads', async () => {
     const fetchImpl = vi.fn().mockResolvedValue({
       ok: true,
@@ -70,24 +84,27 @@ describe('release chain probe', () => {
   })
 
   it.each([
-    ['duplicate IDs', () => [...validPayload().slice(0, 5), validPayload()[0]]],
+    ['duplicate IDs', () => [...validPayload().slice(0, 5), validPayload()[0]], 'DUPLICATE_ID'],
     [
       'wrong version',
-      () => validPayload().map((item, index) => (index === 0 ? { ...item, jsonrpc: '1.0' } : item))
+      () => validPayload().map((item, index) => (index === 0 ? { ...item, jsonrpc: '1.0' } : item)),
+      'INVALID_BATCH_MEMBER'
     ],
     [
       'noncanonical chain',
-      () => validPayload().map((item, index) => (index === 0 ? { ...item, result: '0x01' } : item))
+      () => validPayload().map((item, index) => (index === 0 ? { ...item, result: '0x01' } : item)),
+      'INVALID_CHAIN_ID'
     ],
-    ['missing result', () => validPayload().slice(0, 5)],
+    ['missing result', () => validPayload().slice(0, 5), 'RPC_RESULT_MISSING: vmuCount'],
     [
       'conflicting error',
       () =>
         validPayload().map((item, index) =>
           index === 0 ? { ...item, error: { message: 'denied' } } : item
-        )
+        ),
+      'INVALID_RESULT: RPC result and error are mutually exclusive'
     ]
-  ])('rejects malformed RPC batches: %s', async (_name, payload) => {
+  ])('rejects malformed RPC batches: %s', async (_name, payload, error) => {
     const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => payload() }))
     expect(
       await probeReleaseEndpoint(
@@ -95,6 +112,6 @@ describe('release chain probe', () => {
         config,
         fetchImpl as unknown as typeof fetch
       )
-    ).toMatchObject({ healthy: false })
+    ).toMatchObject({ healthy: false, error: expect.stringContaining(error) })
   })
 })

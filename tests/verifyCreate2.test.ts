@@ -139,6 +139,7 @@ async function runVerification({
   const connections = new Set<Socket>()
   const mintProxies: string[] = []
   const rpcMethods: string[] = []
+  const stateReads: Array<{ method: string; blockTag: unknown }> = []
   const server = createServer((request, response) => {
     let body = ''
     request.setEncoding('utf8')
@@ -169,6 +170,8 @@ async function runVerification({
       let readsMint = false
       for (const { method, params } of requests) {
         rpcMethods.push(method)
+        if (method === 'eth_call' || method === 'eth_getCode')
+          stateReads.push({ method, blockTag: params[1] })
         if (method !== 'eth_call') continue
         const call = params[0] as { data: string; to: string }
         if (call.to.toLowerCase() === FACTORY.toLowerCase()) readsCount = true
@@ -253,6 +256,7 @@ async function runVerification({
     stderr: string
     mintProxies: string[]
     rpcMethods: string[]
+    stateReads: Array<{ method: string; blockTag: unknown }>
     providerDestroyCount: number
     openConnections: number
   }>((resolve, reject) => {
@@ -295,6 +299,7 @@ async function runVerification({
           stderr,
           mintProxies,
           rpcMethods,
+          stateReads,
           providerDestroyCount: stdout.match(/^TEST_PROVIDER_DESTROYED$/gm)?.length ?? 0,
           openConnections: connections.size
         })
@@ -304,6 +309,24 @@ async function runVerification({
 }
 
 describe('CREATE2 verification release gate', () => {
+  it.each(['eth', 'polygon'] as const)(
+    'pins every state read to the captured block on %s',
+    async (chain) => {
+      const result = await runVerification({
+        chain,
+        chainId: chain === 'eth' ? 1 : 137,
+        vmuCount: 8,
+        activeIds: [7]
+      })
+      expect(result.code).toBe(0)
+      expect(result.stateReads.filter((read) => read.method === 'eth_getCode')).toHaveLength(3)
+      expect(result.stateReads.filter((read) => read.method === 'eth_call').length).toBeGreaterThan(
+        2
+      )
+      expect(result.stateReads.every((read) => read.blockTag === '0x1')).toBe(true)
+    }
+  )
+
   it('ends with NOT_VERIFIED when DNS lookup never completes in an isolated fixture', () => {
     const entrypoint = new URL('../scripts/verify-create2.mjs', import.meta.url)
     const script = `
@@ -328,6 +351,7 @@ describe('CREATE2 verification release gate', () => {
       expect(result.code).toBe(3)
       expect(result.stderr).toContain('CREATE2_MISMATCH')
       expect(result.stdout).not.toContain('CREATE2 derivation VERIFIED')
+      expect(result.stdout).not.toContain('resume with --from-id')
       expect(result.providerDestroyCount).toBe(1)
     }
   )

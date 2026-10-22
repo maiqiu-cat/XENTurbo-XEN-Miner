@@ -11,7 +11,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { Contract, FetchRequest, JsonRpcProvider, getAddress } from 'ethers'
 import { computeProxyAddress, minimalProxyRuntimeCode } from '../src/core/create2.ts'
 import { getChainConfig } from './chain-config.mjs'
-import { cliValue, isMainModule, normalizeProbeUrl } from './cli-utils.mjs'
+import { cliValue, isMainModule, normalizeProbeUrl, diagnosticError } from './cli-utils.mjs'
 
 const SCAN_BATCH_SIZE = 5
 const DEFAULT_SCAN_LIMIT = 1_000
@@ -131,7 +131,11 @@ export async function verifyCreate2({
     return await scan()
   } catch (error) {
     if (error !== deadlineError) {
-      log(`Verification interrupted; scanned=${scanned}; resume with --from-id ${nextId}.`)
+      if (error?.code === 'CREATE2_MISMATCH' || error?.message?.startsWith('CHAIN_ID_MISMATCH:'))
+        log(
+          'Verification failed. Check the selected chain, contract configuration and RPC response before retrying.'
+        )
+      else log(`Verification interrupted; scanned=${scanned}; resume with --from-id ${nextId}.`)
       throw error
     }
     log(
@@ -304,7 +308,7 @@ async function main() {
 
 if (isMainModule(import.meta.url)) {
   main().catch((error) => {
-    console.error(error instanceof Error ? error.message : String(error))
+    console.error(diagnosticError(error))
     process.exitCode = error?.code === 'CREATE2_MISMATCH' ? 3 : 1
   })
 }

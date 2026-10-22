@@ -197,7 +197,7 @@ describe('pending operation reconciliation', () => {
   it.each([null, { status: 1 }])(
     'legacy lock recovery requires wallet receipt evidence',
     async (walletReceipt) => {
-      const { releaseLock } = await installPendingHarness({
+      const { pending, releaseLock } = await installPendingHarness({
         latestNonce: 7,
         pendingNonce: 8,
         receipt: { status: 1 },
@@ -216,8 +216,23 @@ describe('pending operation reconciliation', () => {
       ])
       const { resumePendingLocks } = await import('../src/core/txManager')
       expect(await resumePendingLocks('eth', WALLET)).toBe(walletReceipt !== null)
-      if (walletReceipt) expect(releaseLock).toHaveBeenCalledWith('old-lock')
-      else expect(releaseLock).not.toHaveBeenCalled()
+      if (walletReceipt) {
+        expect(releaseLock).toHaveBeenCalledWith(
+          'old-lock',
+          expect.objectContaining({
+            chain: 'eth',
+            wallet: WALLET,
+            txHash: HASH,
+            phase: 'confirmed'
+          })
+        )
+        expect(pending.listPendingOps('eth', WALLET)[0]).toMatchObject({
+          id: 'old-lock',
+          txHash: HASH,
+          phase: 'confirmed',
+          origin: 'wallet-verified'
+        })
+      } else expect(releaseLock).not.toHaveBeenCalled()
     }
   )
 
@@ -590,24 +605,32 @@ describe('pending operation reconciliation', () => {
       pendingNonce: 8,
       walletReceipt: { status: 1 }
     })
-    const locks = await import('../src/core/localLock')
-    vi.mocked(locks.pendingLocks).mockReturnValue([
-      {
-        chain: 'eth',
-        wallet: WALLET,
-        ids: [8],
-        txHash: `0x${'2'.repeat(64)}`,
-        batch: 'batch-1',
-        lockedAt: Date.now()
-      }
-    ])
+    const locks =
+      await vi.importActual<typeof import('../src/core/localLock')>('../src/core/localLock')
+    releaseLock.mockImplementation(locks.releaseLock)
+    releaseLocksByTxHash.mockImplementation(locks.releaseLocksByTxHash)
+    localStorage.setItem(
+      'sm.vmuLocks',
+      JSON.stringify([
+        {
+          chain: 'eth',
+          wallet: WALLET,
+          ids: [8],
+          txHash: `0x${'2'.repeat(64)}`,
+          batch: 'batch-1',
+          lockedAt: Date.now()
+        }
+      ])
+    )
     const { settlement } = await (
       await import('../src/core/walletEvidence')
     ).readWalletEvidence('eth', WALLET, HASH)
 
     recordBroadcast(pending, { id: 'batch-1', phase: 'confirmed', settlement })
 
-    expect(releaseLock).not.toHaveBeenCalled()
+    expect(locks.pendingLocks('eth', WALLET)).toEqual([
+      expect.objectContaining({ batch: 'batch-1', ids: [8], txHash: `0x${'2'.repeat(64)}` })
+    ])
     expect(releaseLocksByTxHash).toHaveBeenCalledWith(HASH, { chain: 'eth', wallet: WALLET })
   })
 
@@ -937,7 +960,14 @@ describe('pending operation reconciliation', () => {
     const dropped = pending.markPendingOpDropped('batch-1')
 
     expect(dropped?.phase).toBe('dropped')
-    expect(releaseLock).toHaveBeenCalledWith('batch-1')
+    expect(releaseLock).toHaveBeenCalledWith(
+      'batch-1',
+      expect.objectContaining({
+        chain: 'eth',
+        wallet: WALLET,
+        txHash: HASH
+      })
+    )
     expect(releaseLocksByTxHash).toHaveBeenCalledWith(HASH, { chain: 'eth', wallet: WALLET })
   })
 

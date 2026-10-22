@@ -6,6 +6,9 @@ import {
   broadcastLockedIds,
   lockedIds,
   pendingLocks,
+  releaseLock,
+  releaseLocksByTxHash,
+  clearSoftLocks,
   tryAcquireLock
 } from '@/core/localLock'
 import { useVmuStore } from '@/stores/vmuStore'
@@ -33,6 +36,66 @@ afterEach(() => {
   localStorage.clear()
 })
 describe('broadcast lock recovery', () => {
+  it.each([
+    'corrupt JSON',
+    'empty string',
+    'non-array',
+    'invalid record',
+    'read failure',
+    'invalid hash',
+    'invalid timestamp',
+    'invalid id'
+  ] as const)('preserves the cache when acquisition or cleanup encounters %s', (failure) => {
+    tryAcquireLock({ ...metadata, wallet: OTHER, batch: 'keep' })
+    const storage = localStorage
+    if (failure === 'corrupt JSON') storage.setItem('sm.vmuLocks', '{invalid')
+    if (failure === 'empty string') storage.setItem('sm.vmuLocks', '')
+    if (failure === 'non-array') storage.setItem('sm.vmuLocks', '{}')
+    if (failure === 'invalid record') {
+      const list = JSON.parse(storage.getItem('sm.vmuLocks')!)
+      storage.setItem('sm.vmuLocks', JSON.stringify([...list, { txHash: HASH }]))
+    }
+    if (failure === 'invalid hash' || failure === 'invalid timestamp' || failure === 'invalid id') {
+      storage.setItem(
+        'sm.vmuLocks',
+        JSON.stringify([
+          {
+            ...metadata,
+            batch: 'keep',
+            lockedAt: failure === 'invalid timestamp' ? null : Date.now() - 180_000,
+            txHash: failure === 'invalid hash' ? 123 : HASH,
+            ids: failure === 'invalid id' ? [1.5] : [1]
+          }
+        ])
+      )
+    }
+    const before = storage.getItem('sm.vmuLocks')
+    const setItem = vi.fn()
+    vi.stubGlobal('localStorage', {
+      getItem: () => {
+        if (failure === 'read failure') throw new Error('storage unavailable')
+        return before
+      },
+      setItem
+    })
+    expect(() => tryAcquireLock({ ...metadata, batch: 'new' })).toThrow()
+    expect(() => releaseLock('keep')).not.toThrow()
+    expect(() => releaseLocksByTxHash(HASH)).not.toThrow()
+    expect(() => clearSoftLocks('eth', WALLET)).not.toThrow()
+    expect(setItem).not.toHaveBeenCalled()
+    expect(storage.getItem('sm.vmuLocks')).toBe(before)
+  })
+
+  it('checks release identity against the same snapshot it mutates', () => {
+    attachTxHash('shared', HASH, metadata)
+    releaseLock('shared', { chain: 'eth', wallet: WALLET, txHash: `0x${'b'.repeat(64)}` })
+    expect(pendingLocks('eth', WALLET)).toHaveLength(1)
+    releaseLock('shared', { chain: 'eth', wallet: OTHER, txHash: HASH })
+    expect(pendingLocks('eth', WALLET)).toHaveLength(1)
+    releaseLock('shared', { chain: 'eth', wallet: WALLET, txHash: HASH })
+    expect(pendingLocks('eth', WALLET)).toHaveLength(0)
+  })
+
   it('keeps unsigned expiry but reconstructs an expired and pruned broadcast reservation', () => {
     expect(tryAcquireLock({ ...metadata, batch: 'late' })).toBe(true)
     vi.advanceTimersByTime(119_999)

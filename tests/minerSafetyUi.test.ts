@@ -119,57 +119,64 @@ it('blocks every operation after a new scope check fails and until its retry suc
   expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('false')
 })
 
-it('does not sign after a shared pending check fails while its trailing retry is unresolved', async () => {
-  const prepared: PreparedOp = {
-    chain: 'eth',
-    wallet: useWalletStore().address!,
-    op: 'GENERAL_MINT',
-    ids: [],
-    count: 1,
-    term: 100,
-    chainId: 1,
-    factoryAddress: '0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2',
-    contextKey: 'prepared-ui-test',
-    preparedAt: Date.now(),
-    expiresAt: Date.now() + 120_000,
-    gasLimit: 100_000n,
-    fnName: 'bulkClaimRank',
-    args: [100n, 1n],
-    batch: 'prepared-ui-test',
-    lockIds: [],
-    state: { estimate: 'done', send: 'wait', confirm: 'wait', readyToSign: true }
-  }
-  vi.mocked(prepareOperation).mockImplementation(async (_params, callbacks) => {
-    callbacks?.onStep?.(prepared.state)
-    return prepared
-  })
-  const view = render()
-  const button = (name: string) => view.findAll('button').find((entry) => entry.text() === name)!
-  await flushPromises()
-  await button('Confirm Mint').trigger('click')
-  await flushPromises()
-  expect(button('Open MetaMask & Sign')).toBeDefined()
-
-  let reject!: (error: Error) => void
-  let resolveRetry!: (value: typeof empty) => void
-  const background = new Promise<typeof empty>((_resolve, fail) => {
-    reject = fail
-  })
-  const retry = new Promise<typeof empty>((resolve) => {
-    resolveRetry = resolve
-  })
-  vi.mocked(refreshPendingOps).mockReturnValueOnce(background).mockReturnValueOnce(retry)
-  view.findComponent({ name: 'PendingOpsPanel' }).vm.$emit('recheck')
-  await button('Open MetaMask & Sign').trigger('click')
-  reject(new Error('shared pending check failed'))
-  await flushPromises()
-  try {
-    expect(view.text()).toContain('pending transactions')
-    expect(sendPreparedOperation).not.toHaveBeenCalled()
-    expect(abortPrepared).toHaveBeenCalledWith(prepared)
-  } finally {
-    resolveRetry(empty)
+it.each([false, true])(
+  'does not revive signing after a failed shared check (immediate retry: %s)',
+  async (immediateRetry) => {
+    const prepared: PreparedOp = {
+      chain: 'eth',
+      wallet: useWalletStore().address!,
+      op: 'GENERAL_MINT',
+      ids: [],
+      count: 1,
+      term: 100,
+      chainId: 1,
+      factoryAddress: '0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2',
+      contextKey: 'prepared-ui-test',
+      preparedAt: Date.now(),
+      expiresAt: Date.now() + 120_000,
+      gasLimit: 100_000n,
+      fnName: 'bulkClaimRank',
+      args: [100n, 1n],
+      batch: 'prepared-ui-test',
+      lockIds: [],
+      state: { estimate: 'done', send: 'wait', confirm: 'wait', readyToSign: true }
+    }
+    vi.mocked(prepareOperation).mockImplementation(async (_params, callbacks) => {
+      callbacks?.onStep?.(prepared.state)
+      return prepared
+    })
+    const view = render()
+    const button = (name: string) => view.findAll('button').find((entry) => entry.text() === name)!
     await flushPromises()
+    await button('Confirm Mint').trigger('click')
+    await flushPromises()
+    expect(button('Open MetaMask & Sign')).toBeDefined()
+
+    let reject!: (error: Error) => void
+    let resolveRetry!: (value: typeof empty) => void
+    const background = new Promise<typeof empty>((_resolve, fail) => {
+      reject = fail
+    })
+    const retry = new Promise<typeof empty>((resolve) => {
+      resolveRetry = resolve
+    })
+    vi.mocked(refreshPendingOps)
+      .mockReturnValueOnce(background)
+      .mockReturnValueOnce(immediateRetry ? Promise.resolve(empty) : retry)
+    view.findComponent({ name: 'PendingOpsPanel' }).vm.$emit('recheck')
+    await button('Open MetaMask & Sign').trigger('click')
+    reject(new Error('shared pending check failed'))
+    await flushPromises()
+    try {
+      expect(view.get('.modal-body .err-text').text()).toContain('shared pending check failed')
+      expect(sendPreparedOperation).not.toHaveBeenCalled()
+      expect(abortPrepared).toHaveBeenCalledWith(prepared)
+    } finally {
+      resolveRetry(empty)
+      await flushPromises()
+    }
+    expect(sendPreparedOperation).not.toHaveBeenCalled()
+    expect(button('Open MetaMask & Sign')).toBeUndefined()
+    expect(button('Confirm Mint').attributes('disabled')).toBeUndefined()
   }
-  expect(button('Confirm Mint').attributes('disabled')).toBeUndefined()
-})
+)

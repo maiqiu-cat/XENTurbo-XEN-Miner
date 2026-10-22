@@ -51,6 +51,52 @@ async function runHealthGate(payload: unknown) {
 }
 
 describe('RPC health release gate', () => {
+  it('reports the wrong chain before an accompanying FEE call failure', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => [
+        { id: 1, jsonrpc: '2.0', result: '0x89' },
+        { id: 2, jsonrpc: '2.0', error: { message: 'contract is absent' } }
+      ]
+    })
+    const result = await checkRpcEndpoint('https://rpc.example.test', config, fetchImpl)
+    expect(result).toMatchObject({
+      healthy: false,
+      error: expect.stringContaining('CHAIN_ID_MISMATCH')
+    })
+    expect(result.error).not.toContain('FEE_CALL_FAILED')
+  })
+
+  it('preserves a nested transport cause in a bounded single-line diagnostic', async () => {
+    const fetchImpl = vi.fn().mockRejectedValue(
+      new TypeError('fetch failed', {
+        cause: Object.assign(new Error('connection refused\nforged PASS'), { code: 'ECONNREFUSED' })
+      })
+    )
+    const result = await checkRpcEndpoint('https://rpc.example.test', config, fetchImpl)
+    expect(result.error).toContain('ECONNREFUSED')
+    expect(result.error).toContain('connection refused')
+    expect(result.error).not.toContain('\n')
+    expect(result.healthy).toBe(false)
+  })
+
+  it.each(['\nPASS forged\r', '\u001b[2J\u001b[H', '\u202ePASS\u2028forged'])(
+    'escapes untrusted terminal controls (%j)',
+    async (message) => {
+      const result = await runHealthGate([
+        healthyPayload()[0],
+        { id: 2, jsonrpc: '2.0', error: { message } }
+      ])
+      expect(result.code).toBe(1)
+      expect(result.stderr.trim().split('\n')).toHaveLength(1)
+      expect(result.stderr).not.toContain(message)
+      for (const control of ['\u001b', '\u202e', '\u2028', '\r'])
+        expect(result.stderr).not.toContain(control)
+      expect(result.stderr).toContain('FEE_CALL_FAILED')
+      expect(result.stdout).toContain('PASS https://good.example.test')
+    }
+  )
+
   it('requires HTTPS before probing an RPC endpoint', async () => {
     const fetchImpl = vi.fn()
 

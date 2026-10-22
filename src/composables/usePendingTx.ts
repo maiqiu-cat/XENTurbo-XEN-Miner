@@ -30,7 +30,12 @@ export function usePendingTx(
   let gen = 0
   let active: { generation: number; promise: Promise<number>; controller: AbortController } | null =
     null
-  let trailing = false
+  type CheckOptions = { freshRpc?: boolean; reverifyResults?: boolean }
+  let trailing: {
+    options: CheckOptions
+    promise: Promise<number>
+    resolve: (value: number) => void
+  } | null = null
   const activePollMs = 8_000
   const idlePollMs = 30_000
 
@@ -46,7 +51,7 @@ export function usePendingTx(
     ready.value = false
   }
 
-  function check(options: { freshRpc?: boolean; reverifyResults?: boolean } = {}): Promise<number> {
+  function check(options: CheckOptions = {}): Promise<number> {
     const addr = address()
     const key = chain()
     if (!addr || !key) {
@@ -55,8 +60,18 @@ export function usePendingTx(
     }
     const myGen = gen
     if (active?.generation === myGen) {
-      trailing = true
-      return active.promise
+      if (!trailing) {
+        let resolve!: (value: number) => void
+        const promise = new Promise<number>((done) => {
+          resolve = done
+        })
+        trailing = { options: { ...options }, promise, resolve }
+      } else {
+        trailing.options.freshRpc =
+          trailing.options.freshRpc !== false || options.freshRpc !== false
+        trailing.options.reverifyResults ||= options.reverifyResults === true
+      }
+      return trailing.promise
     }
 
     checking.value = true
@@ -69,7 +84,7 @@ export function usePendingTx(
         localUnresolvedCount.value = unresolvedCount
         ops.value = views
         lastCheckedAt.value = Date.now()
-        ready.value = true
+        ready.value = pageVisible()
         if (confirmedOps?.length) onConfirmed?.(confirmedOps)
         return pendingNonceGap
       })
@@ -84,8 +99,9 @@ export function usePendingTx(
         if (myGen !== gen) return
         checking.value = false
         if (trailing) {
-          trailing = false
-          void check()
+          const queued = trailing
+          trailing = null
+          void check(queued.options).then(queued.resolve)
         }
       })
     active = { generation: myGen, promise, controller }
@@ -109,8 +125,10 @@ export function usePendingTx(
   function stopPolling() {
     active?.controller.abort()
     gen += 1
-    trailing = false
+    trailing?.resolve(pendingCount.value)
+    trailing = null
     checking.value = false
+    ready.value = false
     if (timer) {
       clearTimeout(timer)
       timer = null

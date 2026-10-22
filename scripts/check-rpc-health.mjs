@@ -2,7 +2,13 @@
 
 import { Interface } from 'ethers'
 import { CHAIN_CONFIG, getChainConfig } from './chain-config.mjs'
-import { isMainModule, cliValue, normalizeProbeUrl } from './cli-utils.mjs'
+import {
+  isMainModule,
+  cliValue,
+  normalizeProbeUrl,
+  diagnosticError,
+  safeLogText
+} from './cli-utils.mjs'
 import { rpcBatchResults, rpcStringResult, rpcChainId, rpcAbiWord } from './rpc-response.mjs'
 
 const factoryInterface = new Interface(['function FEE() view returns (uint256)'])
@@ -14,7 +20,7 @@ export async function checkRpcEndpoint(url, config, fetchImpl = fetch) {
     return {
       url,
       healthy: false,
-      error: `INVALID_RPC_RESPONSE: ${error instanceof Error ? error.message : String(error)}`
+      error: `INVALID_RPC_RESPONSE: ${diagnosticError(error)}`
     }
   }
 }
@@ -50,7 +56,7 @@ async function inspectRpcEndpoint(url, config, fetchImpl) {
     return {
       url,
       healthy: false,
-      error: `REQUEST_FAILED: ${error instanceof Error ? error.message : String(error)}`
+      error: `REQUEST_FAILED: ${diagnosticError(error)}`
     }
   }
 
@@ -63,13 +69,12 @@ async function inspectRpcEndpoint(url, config, fetchImpl) {
     return {
       url,
       healthy: false,
-      error: `INVALID_JSON: ${error instanceof Error ? error.message : String(error)}`
+      error: `INVALID_JSON: ${diagnosticError(error)}`
     }
   }
 
   const results = rpcBatchResults(payload, [1, 2])
   const chainId = rpcChainId(rpcStringResult(results, 1, 'eth_chainId'))
-  const feeResult = rpcStringResult(results, 2, 'FEE')
   if (chainId !== BigInt(config.chainId)) {
     return {
       url,
@@ -79,13 +84,14 @@ async function inspectRpcEndpoint(url, config, fetchImpl) {
   }
 
   try {
+    const feeResult = rpcStringResult(results, 2, 'FEE')
     const [fee] = factoryInterface.decodeFunctionResult('FEE', rpcAbiWord(feeResult, 'FEE'))
     return { url, healthy: true, chainId: Number(chainId), fee }
   } catch (error) {
     return {
       url,
       healthy: false,
-      error: `FEE_CALL_FAILED: ${error instanceof Error ? error.message : String(error)}`
+      error: `FEE_CALL_FAILED: ${diagnosticError(error)}`
     }
   }
 }
@@ -117,10 +123,12 @@ async function main() {
     for (const url of urls) {
       const result = await checkRpcEndpoint(url, config)
       if (result.healthy) {
-        console.log(`PASS ${result.url} https=true chainId=${result.chainId} FEE=${result.fee}`)
+        console.log(
+          safeLogText(`PASS ${result.url} https=true chainId=${result.chainId} FEE=${result.fee}`)
+        )
       } else {
         failed = true
-        console.error(`FAIL ${result.url} ${result.error}`)
+        console.error(safeLogText(`FAIL ${result.url} ${result.error}`))
       }
     }
   }
@@ -130,7 +138,7 @@ async function main() {
 
 if (isMainModule(import.meta.url)) {
   main().catch((error) => {
-    console.error(error instanceof Error ? error.message : String(error))
+    console.error(diagnosticError(error))
     process.exitCode = 1
   })
 }

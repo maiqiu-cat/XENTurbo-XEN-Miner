@@ -29,8 +29,8 @@ describe('bounded concurrency', () => {
         settled = true
       }
     )
-    await Promise.resolve()
-    await Promise.resolve()
+    // Cross a real macrotask boundary so an early Promise.all rejection settles.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
     expect(called).toEqual([0, 1])
     expect(settled).toBe(false)
     gate.resolve(1)
