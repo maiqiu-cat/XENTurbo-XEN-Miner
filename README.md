@@ -137,6 +137,39 @@ Do not clear site data or resend to resolve a storage error. When both durable
 writes fail, the hash cannot be guaranteed to survive a reload. Unreadable pending
 records block submission and are preserved for recovery.
 
+The **Transaction storage recovery** control inspects the journal and lock cache
+without clearing them. Export and retain the private JSON backup first. Repair
+requires the connected wallet to return a mined receipt matching the damaged
+record's account, network, transaction hash and Miner contract. The original
+snapshot is also archived in browser storage and read back before any repair.
+Valid records and unrelated accounts are preserved; changes from another tab
+invalidate the preview. A zero nonce gap, an expired lock, or a public RPC
+response cannot authorize deletion. Unreadable JSON, unidentified records and
+unconfirmed transactions remain blocked for manual investigation. This is not a
+reset-site-data control and does not guarantee recovery of lost transaction identity.
+
+### PR #7 Validation Scope
+
+The previously reported **147 tests / 6 failures** was an early, focused negative
+control: production source and scripts were at `ead7a18`; only
+`tests/concurrency.test.ts`, `tests/localLock.test.ts` and
+`tests/transactionSafety.integration.test.ts` contained the new regression tests.
+Eight files were run (those three plus `usePendingTx`, `checkRpcHealth`,
+`releaseProbe`, `rpc` and `verifyCreate2`): 141 passed and 6 failed. It was not the
+final test suite running against old code, nor old tests failing on new code.
+The six failures covered three lock-cache preservation cases, two timely-hash
+storage-failure states and one late-hash fallback. The later `194355b` candidate
+passed 548 unit/integration tests and 30 browser tests in isolated local validation.
+These historical counts are not a claim about subsequent revisions.
+
+P2-C remains **unproven**: the historical destroy/count semantics have not been
+matched to both current deployed implementations and historical chain evidence.
+CREATE2 verification still requires pinned-block boundary bytecode checks and
+an active on-chain witness. Exit code 2 means **not verified**, including a budget
+limit, no VMUs, no active witness, an out-of-range start, or a rate-limit delay
+that cannot fit the budget; none of these is a release pass. Exit code 3 denotes
+a proven boundary/derivation mismatch; other errors use exit code 1.
+
 ## Page and performance analytics
 
 The production hostname `miner.xenturbo.io` automatically loads the configured

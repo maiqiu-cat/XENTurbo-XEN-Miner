@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { createServer } from 'node:http'
 import { Interface } from 'ethers'
 import { checkRpcEndpoint } from '../scripts/check-rpc-health.mjs'
 
@@ -51,6 +52,42 @@ async function runHealthGate(payload: unknown) {
 }
 
 describe('RPC health release gate', () => {
+  it('retains the real Fetch redirect cause without following a local 302', async () => {
+    let hits = 0
+    const server = createServer((_request, response) => {
+      hits += 1
+      response.writeHead(302, { Location: '/target' })
+      response.end()
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = server.address() as { port: number }
+      const result = await checkRpcEndpoint('https://rpc.example.test', config, (_url, options) =>
+        fetch(`http://127.0.0.1:${address.port}`, options)
+      )
+      expect(result.healthy).toBe(false)
+      expect(result.error).toContain('REQUEST_FAILED')
+      expect(result.error).toMatch(/redirect/i)
+      expect(hits).toBe(1)
+    } finally {
+      server.closeAllConnections()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+  it('reports a FEE error with exactly one classification prefix', async () => {
+    const result = await checkRpcEndpoint(
+      'https://rpc.example.test',
+      config,
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => [
+          healthyPayload()[0],
+          { id: 2, jsonrpc: '2.0', error: { message: 'reverted' } }
+        ]
+      })
+    )
+    expect(result.error?.match(/FEE_CALL_FAILED/g)).toHaveLength(1)
+  })
   it('reports the wrong chain before an accompanying FEE call failure', async () => {
     const fetchImpl = vi.fn().mockResolvedValue({
       ok: true,

@@ -4,7 +4,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
-import { cliValue, isMainModule, normalizeProbeUrl } from '../scripts/cli-utils.mjs'
+import {
+  cliValue,
+  diagnosticError,
+  isMainModule,
+  normalizeProbeUrl,
+  safeLogText
+} from '../scripts/cli-utils.mjs'
 import { getChainConfig } from '../scripts/chain-config.mjs'
 
 const directories: string[] = []
@@ -12,6 +18,21 @@ afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true })
 })
 describe('CLI release gates', () => {
+  it('escapes controls and truncates only at complete escape boundaries', () => {
+    expect(safeLogText('a\n\x1b\u202e')).toBe('a\\u000a\\u001b\\u202e')
+    expect(safeLogText('ab\\u001bmore', 5)).toBe('ab...')
+    const text = diagnosticError(new Error('a'.repeat(498) + '\\u001b' + 'z'.repeat(10)))
+    expect(text).toBe('a'.repeat(498) + '...')
+  })
+  it('summarizes bounded aggregate causes without empty trailing separators or controls', () => {
+    const cause = new AggregateError(
+      [Object.assign(new Error(''), { code: 'ECONNREFUSED' }), new Error('reset\n')],
+      ''
+    )
+    const text = diagnosticError(new Error('fetch failed', { cause }))
+    expect(text).toBe('fetch failed (ECONNREFUSED; reset\\u000a)')
+    expect(text).not.toContain('ECONNREFUSED: ')
+  })
   it.each([
     ['verify-create2.mjs', [], 'CHAIN_REQUIRED'],
     ['check-rpc-health.mjs', ['--chain', 'bogus'], 'Unsupported chain'],

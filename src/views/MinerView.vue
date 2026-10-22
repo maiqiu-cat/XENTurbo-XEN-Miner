@@ -22,6 +22,7 @@ import RpcSettings from '@/components/RpcSettings.vue'
 import TxModal from '@/components/TxModal.vue'
 import MintList from '@/components/MintList.vue'
 import PendingOpsPanel from '@/components/PendingOpsPanel.vue'
+import StorageRecovery from '@/components/StorageRecovery.vue'
 import { CONTRACTS } from '@/config/contracts'
 import { APP_VERSION } from '@/config/version'
 
@@ -87,6 +88,7 @@ const {
   localUnresolvedCount,
   ops: pendingOps,
   checking: pendingChecking,
+  queued: pendingQueued,
   error: pendingError,
   check: checkPending,
   trackHash: trackPendingHash,
@@ -203,6 +205,7 @@ const txVisible = ref(false)
 const txState = ref<TxStepState | null>(null)
 const txTitle = ref('')
 const busy = ref(false)
+const recoveryOpen = ref(false)
 const waitingWallet = computed(
   () =>
     txState.value?.walletPrompted === true &&
@@ -218,6 +221,7 @@ const canOperate = computed(
     wallet.contractWalletChecked &&
     !rpcUnavailable.value &&
     !busy.value &&
+    !recoveryOpen.value &&
     pendingReady.value &&
     !hasPending.value
 )
@@ -574,9 +578,20 @@ const explorerAddrUrl = computed(() => {
         @track="onTrackHash"
         @mark-dropped="onMarkPendingDropped"
       />
-      <p v-if="!pendingReady" class="dim" role="status">
+      <p v-if="pendingBlockedReason" class="dim" role="status">
         {{ pendingBlockedReason }} <span v-if="pendingError">{{ pendingError }}</span>
       </p>
+      <p v-if="pendingQueued" class="dim" role="status">
+        A fresh pending check is queued behind the current check. Waiting for both checks to finish.
+      </p>
+      <StorageRecovery
+        v-if="activeChain && wallet.address"
+        :chain="activeChain"
+        :wallet="wallet.address"
+        :disabled="busy"
+        @open="recoveryOpen = $event"
+        @changed="checkPending({ reverifyResults: true })"
+      />
       <p v-if="trackError" class="card warn-card">{{ trackError }}</p>
 
       <!-- operation tabs -->
@@ -706,7 +721,12 @@ const explorerAddrUrl = computed(() => {
       <!-- mint list -->
       <MintList
         :busy="
-          busy || !pendingReady || hasPending || rpcUnavailable || !wallet.contractWalletChecked
+          busy ||
+          recoveryOpen ||
+          !pendingReady ||
+          hasPending ||
+          rpcUnavailable ||
+          !wallet.contractWalletChecked
         "
         :blocked-reason="
           rpcUnavailable

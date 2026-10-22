@@ -91,7 +91,7 @@ async function inspectRpcEndpoint(url, config, fetchImpl) {
     return {
       url,
       healthy: false,
-      error: `FEE_CALL_FAILED: ${diagnosticError(error)}`
+      error: `FEE_CALL_FAILED: ${diagnosticError(error).replace(/^FEE_CALL_FAILED:\s*/, '')}`
     }
   }
 }

@@ -130,6 +130,12 @@ export async function verifyCreate2({
   try {
     return await scan()
   } catch (error) {
+    if (error?.code === 'RATE_LIMIT_RETRY_AFTER_EXCEEDS_BUDGET') {
+      log(
+        'NOT_VERIFIED: RATE_LIMIT_RETRY_AFTER_EXCEEDS_BUDGET. Retry later with a fresh full verification.'
+      )
+      return false
+    }
     if (error !== deadlineError) {
       if (error?.code === 'CREATE2_MISMATCH' || error?.message?.startsWith('CHAIN_ID_MISMATCH:'))
         log(
@@ -165,11 +171,6 @@ export async function verifyCreate2({
       return false
     }
 
-    if (fromId > vmuCount) {
-      log('NOT_VERIFIED: --from-id is beyond the wallet VMU count.')
-      return false
-    }
-
     // Pin both the inventory and boundary probes to one block, so concurrent
     // minting cannot turn a newly deployed next proxy into a false mismatch.
     const derive = (id) =>
@@ -200,6 +201,13 @@ export async function verifyCreate2({
         mismatch.code = 'CREATE2_MISMATCH'
         throw mismatch
       }
+    }
+
+    if (fromId > vmuCount) {
+      log(
+        'NOT_VERIFIED: --from-id is beyond the wallet VMU count; boundary probes passed, but no active witness was checked.'
+      )
+      return false
     }
 
     const scanEnd = fromId + BigInt(scanLimit) - 1n
@@ -263,6 +271,7 @@ async function main() {
   const { config, rpcUrl, wallet, ...scanOptions } = parseVerificationArgs(process.argv.slice(2))
   const agent = new URL(rpcUrl).protocol === 'https:' ? new HttpsAgent() : new HttpAgent()
   const transport = new AbortController()
+  const transportDeadline = performance.now() + scanOptions.deadlineMs
   let provider
   try {
     const request = new FetchRequest(rpcUrl)
@@ -287,6 +296,11 @@ async function main() {
           Number.isFinite(serverDelay) && serverDelay >= 0
             ? Math.min(serverDelay, 2_147_483_647)
             : 100 * 2 ** attempt
+        if (delay >= transportDeadline - performance.now()) {
+          const error = new Error('RATE_LIMIT_RETRY_AFTER_EXCEEDS_BUDGET')
+          error.code = 'RATE_LIMIT_RETRY_AFTER_EXCEEDS_BUDGET'
+          throw error
+        }
         await sleep(delay, undefined, { signal: transport.signal })
       }
     }

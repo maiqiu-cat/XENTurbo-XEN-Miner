@@ -3,7 +3,13 @@ import type { ChainKey } from '@/config/chains'
 import { CHAINS } from '@/config/chains'
 import { CONTRACTS } from '@/config/contracts'
 import { ensureHealthyReadProvider, ensureRecentReadProvider, getReadProvider } from './rpc'
-import { attachTxHash, pendingLocks, releaseLock, releaseLocksByTxHash } from './localLock'
+import {
+  assertLockStorageReadable,
+  attachTxHash,
+  pendingLocks,
+  releaseLock,
+  releaseLocksByTxHash
+} from './localLock'
 import type { OpType } from './txManager'
 import { mapWithConcurrency } from '@/utils/concurrency'
 import { assertReadActive, withReadDeadline } from './readDeadline'
@@ -117,7 +123,7 @@ const factoryIface = new Interface([
   'function bulkClaimMintRewardAndClaimRank(uint256[] ids, uint256 term)'
 ])
 
-function normalizeRecord(r: unknown): PendingOpRecord | null {
+export function normalizeRecord(r: unknown): PendingOpRecord | null {
   if (!r || typeof r !== 'object') return null
   const o = r as Record<string, unknown>
   const valid =
@@ -224,6 +230,20 @@ function newerStorageEvent(
   return candidate.key > current.key ? candidate : current
 }
 
+export function parsePendingStorageEvent(raw: string): PendingStorageEvent {
+  const parsed = JSON.parse(raw) as Partial<PendingStorageEvent> | null
+  const record = parsed?.record === null ? null : normalizeRecord(parsed?.record)
+  if (
+    !parsed ||
+    typeof parsed.recordId !== 'string' ||
+    typeof parsed.updatedAt !== 'number' ||
+    !Number.isFinite(parsed.updatedAt) ||
+    (parsed.record !== null && (!record || record.id !== parsed.recordId))
+  )
+    throw new Error('Invalid pending transaction event')
+  return { recordId: parsed.recordId, updatedAt: parsed.updatedAt, record }
+}
+
 function readStoredEvents(): StoredPendingEvent[] {
   const keys = Array.from({ length: localStorage.length }, (_, index) =>
     localStorage.key(index)
@@ -232,20 +252,7 @@ function readStoredEvents(): StoredPendingEvent[] {
   for (const key of keys) {
     const raw = localStorage.getItem(key)
     if (raw === null) continue
-    const parsed = JSON.parse(raw) as Partial<PendingStorageEvent>
-    const record = parsed.record === null ? null : normalizeRecord(parsed.record)
-    if (
-      typeof parsed.recordId !== 'string' ||
-      typeof parsed.updatedAt !== 'number' ||
-      !Number.isFinite(parsed.updatedAt) ||
-      (parsed.record !== null && (!record || record.id !== parsed.recordId))
-    ) {
-      throw new Error('Invalid pending transaction event')
-    }
-    events.push({
-      key,
-      value: { recordId: parsed.recordId, updatedAt: parsed.updatedAt, record }
-    })
+    events.push({ key, value: parsePendingStorageEvent(raw) })
   }
   return events
 }
@@ -265,6 +272,7 @@ function migrateLegacyRecords(): void {
 }
 
 function readAll(): PendingOpRecord[] {
+  assertLockStorageReadable()
   try {
     migrateLegacyRecords()
     const events = readStoredEvents()

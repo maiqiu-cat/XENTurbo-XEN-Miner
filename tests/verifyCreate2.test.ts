@@ -371,7 +371,8 @@ describe('CREATE2 verification release gate', () => {
       extraArgs: ['--deadline-ms', '250']
     })
     expect(result.code).toBe(2)
-    expect(result.stdout).toContain('NOT_VERIFIED: DEADLINE_EXCEEDED')
+    expect(result.stdout).toContain('NOT_VERIFIED: RATE_LIMIT_RETRY_AFTER_EXCEEDS_BUDGET')
+    expect(result.stdout).not.toContain('resume with')
     expect(result.openConnections).toBe(0)
   })
 
@@ -608,6 +609,17 @@ describe('CREATE2 verification release gate', () => {
     expect(result.stdout).toContain('NOT_VERIFIED')
     expect(result.mintProxies).toEqual([])
     expect(result.providerDestroyCount).toBe(1)
+  })
+
+  it('still detects a wrong proxy boundary when --from-id exceeds the inventory', async () => {
+    const result = await runVerification({
+      vmuCount: 5,
+      proxyShift: 1,
+      extraArgs: ['--from-id', '6']
+    })
+    expect(result.code).toBe(3)
+    expect(result.stderr).toContain('CREATE2_MISMATCH')
+    expect(result.mintProxies).toEqual([])
   })
 
   it.each([

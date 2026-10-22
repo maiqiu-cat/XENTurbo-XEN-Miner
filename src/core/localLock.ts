@@ -32,7 +32,7 @@ const KEY = 'sm.vmuLocks'
 // block Claim forever after the user closes the modal / refreshes.
 const SOFT_LOCK_TTL_MS = 2 * 60 * 1000
 
-function isValidLock(l: unknown): l is LockRecord {
+export function isValidLock(l: unknown): l is LockRecord {
   if (!l || typeof l !== 'object') return false
   const r = l as Record<string, unknown>
   return (
@@ -64,9 +64,13 @@ function readAll(strict = false): LockRecord[] {
     const now = Date.now()
     return list.filter(isValidLock).filter((l) => isAlive(l, now))
   } catch (error) {
-    if (strict) throw error
+    if (strict) throw new Error('LOCK_STORAGE_INVALID: Local lock records cannot be read. Open transaction storage recovery; do not clear site data or resend.', { cause: error })
     return []
   }
+}
+
+export function assertLockStorageReadable(): void {
+  readAll(true)
 }
 
 const lockRevision = shallowRef(0)

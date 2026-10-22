@@ -776,6 +776,7 @@ export async function sendPreparedOperation(
   }
 
   const recordWalletDrop = (releaseImmediately = false) => {
+    if (awaitingWalletResolved) return
     recordPendingOp({
       id: prepared.batch,
       chain: prepared.chain,
@@ -1136,8 +1137,8 @@ export function normalizeError(err: any): string {
     return 'The prepared transaction expired after 2 minutes. Estimate it again before signing.'
   if (/RPC_UNAVAILABLE|RPC_NOT_VALIDATED/i.test(msg))
     return 'No configured RPC endpoint responded on the expected network. Your RPC list was preserved. Check internet access, DNS, firewall, and proxy/VPN settings, then retry; or change endpoints in RPC settings.'
-  if (/PENDING_STORAGE_(?:READ|WRITE)_FAILED/i.test(msg))
-    return 'Local transaction storage is unavailable or damaged. Do not clear site data or resend. Check wallet Activity and restore storage access before rechecking pending operations.'
+  if (/PENDING_STORAGE_(?:READ|WRITE)_FAILED|LOCK_STORAGE_INVALID/i.test(msg))
+    return 'Local transaction storage is unavailable or damaged. Open transaction storage recovery. Do not clear site data or resend; check wallet Activity first.'
   if (/PENDING_STATE_UNCERTAIN/i.test(msg))
     return 'Wallet and read RPC disagree about the pending nonce. Do not retry yet. Open MetaMask Activity, verify the selected network, then recheck.'
   if (/WALLET_ASLEEP/.test(msg))

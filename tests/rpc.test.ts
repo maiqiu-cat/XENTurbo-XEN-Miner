@@ -175,6 +175,22 @@ describe('custom RPC validation', () => {
 })
 
 describe('runtime RPC health selection', () => {
+  it('does not dispatch remaining old probes after a synchronous configuration change', async () => {
+    writeCustomRpc('eth', ['https://old-a.example/', 'https://old-b.example/'])
+    const request = vi.fn(async (url: string) => {
+      if (url === 'https://old-a.example/') {
+        writeCustomRpc('eth', ['https://new.example/'])
+        resetProviders('eth')
+      }
+      return '0x1'
+    })
+    await ensureHealthyReadProvider('eth', request)
+    expect(request.mock.calls.map(([url]) => url)).toEqual([
+      'https://old-a.example/',
+      'https://new.example/'
+    ])
+    expect(getRpcHealthState('eth').healthyUrls).toEqual(['https://new.example/'])
+  })
   it('discards an old in-flight health result after configuration changes', async () => {
     writeCustomRpc('eth', ['https://old.example/'])
     let finishOld!: (value: string) => void

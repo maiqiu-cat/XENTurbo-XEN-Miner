@@ -1,23 +1,41 @@
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
-export function safeLogText(value) {
-  return String(value).replace(
-    /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu,
-    (character) => `\\u${character.codePointAt(0).toString(16).padStart(4, '0')}`
-  )
+export function safeLogText(value, limit = Infinity) {
+  let output = ''
+  // Treat existing escapes as units so nested diagnostic formatting cannot cut them in half.
+  for (const match of String(value).matchAll(/\\u[0-9a-fA-F]{4,6}|./gsu)) {
+    const token = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(match[0])
+      ? `\\u${match[0].codePointAt(0).toString(16).padStart(4, '0')}`
+      : match[0]
+    if (output.length + token.length > limit) return `${output}...`
+    output += token
+  }
+  return output
 }
 
 export function diagnosticError(error) {
   const message = error instanceof Error ? error.message : String(error)
   const cause = error instanceof Error ? error.cause : null
-  const detail =
-    cause && typeof cause === 'object'
-      ? [cause.code, cause.message].filter((part) => typeof part === 'string').join(': ')
-      : typeof cause === 'string'
-        ? cause
-        : ''
-  return safeLogText(message.slice(0, 500) + (detail ? ` (${detail.slice(0, 200)})` : ''))
+  const seen = new Set()
+  const describeCause = (value, depth = 0) => {
+    if (typeof value === 'string') return value
+    if (!value || typeof value !== 'object' || seen.has(value) || depth > 2) return ''
+    seen.add(value)
+    const parts = [value.code, value.message].filter(
+      (part) => typeof part === 'string' && part.trim()
+    )
+    if (Array.isArray(value.errors)) {
+      const nested = value.errors
+        .slice(0, 3)
+        .map((item) => describeCause(item, depth + 1))
+        .filter(Boolean)
+      if (nested.length) parts.push(nested.join('; '))
+    }
+    return parts.join(': ')
+  }
+  const detail = describeCause(cause)
+  return safeLogText(message, 500) + (detail ? ` (${safeLogText(detail, 200)})` : '')
 }
 
 export function isMainModule(moduleUrl, entrypoint = process.argv[1]) {

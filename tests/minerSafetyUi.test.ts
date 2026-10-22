@@ -15,7 +15,8 @@ import {
 } from '@/core/txManager'
 import MinerView from '@/views/MinerView.vue'
 
-vi.mock('@/core/txManager', () => ({
+vi.mock('@/core/txManager', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/core/txManager')>()),
   prepareOperation: vi.fn(),
   sendPreparedOperation: vi.fn(),
   abortPrepared: vi.fn(),

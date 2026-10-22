@@ -145,7 +145,8 @@ async function installPendingHarness(options: {
     ensureRecentReadProvider: ensureHealthyReadProvider,
     getReadProvider: () => provider
   }))
-  vi.doMock('../src/core/localLock', () => ({
+  vi.doMock('../src/core/localLock', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../src/core/localLock')>()),
     attachTxHash,
     pendingLocks: vi.fn(() => []),
     releaseLock,

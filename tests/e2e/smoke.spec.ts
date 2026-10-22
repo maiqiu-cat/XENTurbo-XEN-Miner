@@ -46,11 +46,13 @@ declare global {
       setStalled(method: string, stalled: boolean): void
       setRejected(method: string, rejected: boolean): void
       setSendDelay(delayMs: number): void
+      setMinedReceipt(value: boolean): void
       nonceReadCount(): number
       stats(): WalletMockStats
     }
     __confirmedWrites: Array<{ id: string; hasOutcome: boolean }>
     __pendingCheckGate: { reads: number; reject(): void; release(): void }
+    __restoreStorage?: () => void
   }
 }
 
@@ -308,6 +310,7 @@ async function installInjectedWallet(
       let successfulBroadcasts = 0
       let sendDelayMs = 0
       let nonceReads = 0
+      let minedReceipt: boolean | null = null
       const stalledMethods = new Set<string>(initiallyStalled)
       const rejectedMethods = new Set<string>()
 
@@ -343,7 +346,7 @@ async function installInjectedWallet(
             case 'eth_getTransactionByHash':
               return null
             case 'eth_getTransactionReceipt':
-              return successfulBroadcasts > 0
+              return (minedReceipt ?? successfulBroadcasts > 0)
                 ? {
                     transactionHash: txHash,
                     blockHash: `0x${'b'.repeat(64)}`,
@@ -410,6 +413,9 @@ async function installInjectedWallet(
         },
         setSendDelay(delayMs: number) {
           sendDelayMs = delayMs
+        },
+        setMinedReceipt(value: boolean) {
+          minedReceipt = value
         },
         nonceReadCount() {
           return nonceReads
@@ -1289,6 +1295,9 @@ test('a timely hash survives journal failure with a clear submitted state and re
   await expect(page.getByRole('button', { name: 'Open MetaMask & Sign' })).toBeVisible()
   await page.evaluate(() => {
     const set = Storage.prototype.setItem
+    window.__restoreStorage = () => {
+      Storage.prototype.setItem = set
+    }
     Storage.prototype.setItem = function (key, value) {
       if (key.startsWith('sm.pendingOps.event.') && JSON.parse(value).record?.phase === 'broadcast')
         throw new DOMException('Offline fixture journal full', 'QuotaExceededError')
@@ -1319,8 +1328,96 @@ test('a timely hash survives journal failure with a clear submitted state and re
     successfulBroadcasts: 1
   })
   await captureQaScreenshot(page, 'broadcast-storage-recovery')
+  await page.evaluate(() => {
+    window.__restoreStorage?.()
+    window.__walletMock.setMinedReceipt(false)
+  })
   await modal.getByRole('button', { name: 'Close', exact: true }).click()
+  await page.getByRole('button', { name: 'Recheck', exact: true }).click()
+  await expect(page.getByText(/Blocked: 1 unresolved transaction/).first()).toBeVisible()
   await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeDisabled()
+  expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(1)
+})
+
+test('storage recovery exports original evidence and repairs only wallet-settled damage', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page)
+  await page.goto('/')
+  await page.evaluate(
+    ({ wallet, hash }) => {
+      localStorage.setItem(
+        'sm.vmuLocks',
+        JSON.stringify([
+          { chain: 'eth', wallet, txHash: hash, ids: ['1'], batch: 'corrupt', lockedAt: Date.now() }
+        ])
+      )
+      window.__walletMock.setMinedReceipt(true)
+    },
+    { wallet: ACCOUNT_A, hash: TX_HASH }
+  )
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await page.getByRole('button', { name: 'Transaction storage recovery', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Transaction storage recovery' })
+  await expect(dialog).toContainText('Damaged records: 1')
+  await expect(dialog.getByRole('button', { name: 'Verify and repair' })).toBeDisabled()
+  const download = page.waitForEvent('download')
+  await dialog.getByRole('button', { name: 'Export backup' }).click()
+  expect((await download).suggestedFilename()).toMatch(/^xenturbo-transaction-backup-/)
+  await dialog.getByRole('checkbox').check()
+  await captureQaScreenshot(page, 'storage-recovery-desktop')
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect(dialog).toBeVisible()
+  const bounds = await dialog.boundingBox()
+  expect(bounds!.width).toBeLessThanOrEqual(390)
+  expect(bounds!.x).toBeGreaterThanOrEqual(0)
+  await captureQaScreenshot(page, 'storage-recovery-narrow')
+  await dialog.getByRole('button', { name: 'Verify and repair' }).click()
+  await expect(dialog.getByRole('status')).toContainText(
+    '1 settled record(s) archived and repaired. 0 record(s) remain blocked.'
+  )
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks')!))).toEqual([])
+  expect(
+    await page.evaluate(
+      () =>
+        Object.keys(localStorage).filter((key) => key.startsWith('sm.storageRecovery.backup.'))
+          .length
+    )
+  ).toBe(1)
+  await dialog.getByRole('button', { name: 'Close recovery' }).click()
+  await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
+  expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+})
+
+test('unidentifiable journal corruption stays blocked after recovery and reload', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page)
+  await page.goto('/')
+  await page.evaluate(() => localStorage.setItem('sm.pendingOps.event.broken', '{'))
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await page.getByRole('button', { name: 'Transaction storage recovery', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Transaction storage recovery' })
+  const download = page.waitForEvent('download')
+  await dialog.getByRole('button', { name: 'Export backup' }).click()
+  await download
+  await dialog.getByRole('checkbox').check()
+  await dialog.getByRole('button', { name: 'Verify and repair' }).click()
+  await expect(dialog.getByRole('status')).toContainText(
+    '0 settled record(s) archived and repaired. 1 record(s) remain blocked.'
+  )
+  await captureQaScreenshot(page, 'storage-recovery-blocked')
+  await dialog.getByRole('button', { name: 'Close recovery' }).click()
+  await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeDisabled()
+  await page.reload()
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeDisabled()
+  expect(await page.evaluate(() => localStorage.getItem('sm.pendingOps.event.broken'))).toBe('{')
+  expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
 })
 
 test('simultaneous tab submissions produce only one broadcast while reconciliation is unresolved', async ({

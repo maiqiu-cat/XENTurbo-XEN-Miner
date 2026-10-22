@@ -21,6 +21,26 @@ function deferred<T>() {
 }
 
 describe('usePendingTx', () => {
+  it('does not restore readiness after a direct successful check on a hidden page', async () => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
+    vi.mocked(refreshPendingOps).mockResolvedValue({
+      views: [],
+      pendingNonceGap: 0,
+      unresolvedCount: 0,
+      confirmedOps: []
+    })
+    const scope = effectScope()
+    const state = scope.run(() =>
+      usePendingTx(
+        () => '0x1',
+        () => 'eth'
+      )
+    )!
+    await state.check()
+    expect(refreshPendingOps).toHaveBeenCalledTimes(1)
+    expect(state.ready.value).toBe(false)
+    scope.stop()
+  })
   it('refreshes mining inventory when manual Track authenticates an already mined record', async () => {
     const wallet = '0x0000000000000000000000000000000000000001'
     const record = {
@@ -265,6 +285,7 @@ describe('usePendingTx', () => {
     await vi.waitFor(() => expect(refreshPendingOps).toHaveBeenCalledTimes(1))
     const overlappingA = state.check()
     const overlappingB = state.check()
+    expect(state.queued.value).toBe(true)
     expect(refreshPendingOps).toHaveBeenCalledTimes(1)
 
     first.resolve({ views: [], pendingNonceGap: 0, unresolvedCount: 0, confirmedOps: [] })
@@ -273,6 +294,7 @@ describe('usePendingTx', () => {
 
     second.resolve({ views: [], pendingNonceGap: 0, unresolvedCount: 0, confirmedOps: [] })
     await Promise.all([second.promise, overlappingA, overlappingB])
+    expect(state.queued.value).toBe(false)
     scope.stop()
   })
 

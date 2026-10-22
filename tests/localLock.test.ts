@@ -123,7 +123,7 @@ describe('broadcast lock recovery', () => {
       },
       setItem: set
     })
-    expect(() => attachTxHash('late', HASH, metadata)).toThrow('storage unavailable')
+    expect(() => attachTxHash('late', HASH, metadata)).toThrow('LOCK_STORAGE_INVALID')
     expect(set).not.toHaveBeenCalled()
     expect(storage.getItem('sm.vmuLocks')).toBe(before)
   })

@@ -1,5 +1,6 @@
 import { computed, onScopeDispose, ref, watch, type Ref } from 'vue'
 import type { ChainKey } from '@/config/chains'
+import { normalizeError } from '@/core/txManager'
 import {
   canMarkPendingOpDropped,
   markPendingOpDropped,
@@ -25,6 +26,7 @@ export function usePendingTx(
   const lastCheckedAt = ref<number | null>(null)
   const error = ref<string | null>(null)
   const ready = ref(false)
+  const queued = ref(false)
 
   let timer: ReturnType<typeof setTimeout> | null = null
   let gen = 0
@@ -49,6 +51,7 @@ export function usePendingTx(
     lastCheckedAt.value = null
     error.value = null
     ready.value = false
+    queued.value = false
   }
 
   function check(options: CheckOptions = {}): Promise<number> {
@@ -60,6 +63,7 @@ export function usePendingTx(
     }
     const myGen = gen
     if (active?.generation === myGen) {
+      queued.value = true
       if (!trailing) {
         let resolve!: (value: number) => void
         const promise = new Promise<number>((done) => {
@@ -91,7 +95,7 @@ export function usePendingTx(
       .catch((err: any) => {
         if (myGen !== gen) return pendingCount.value
         ready.value = false
-        error.value = err?.shortMessage || err?.message || 'Failed to check pending txs'
+        error.value = normalizeError(err)
         return pendingCount.value
       })
       .finally(() => {
@@ -99,9 +103,10 @@ export function usePendingTx(
         if (myGen !== gen) return
         checking.value = false
         if (trailing) {
-          const queued = trailing
+          const next = trailing
           trailing = null
-          void check(queued.options).then(queued.resolve)
+          queued.value = false
+          void check(next.options).then(next.resolve)
         }
       })
     active = { generation: myGen, promise, controller }
@@ -127,6 +132,7 @@ export function usePendingTx(
     gen += 1
     trailing?.resolve(pendingCount.value)
     trailing = null
+    queued.value = false
     checking.value = false
     ready.value = false
     if (timer) {
@@ -203,6 +209,7 @@ export function usePendingTx(
     hasPending,
     ready,
     checking,
+    queued,
     lastCheckedAt,
     error,
     check,

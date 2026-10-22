@@ -245,7 +245,8 @@ describe('offline transaction safety integration (H-08)', () => {
       const prepared = late
         ? (await detachAtWalletTimeout(harness)).prepared
         : await harness.prepare()
-      const sending = late ? null : harness.tx.sendPreparedOperation(prepared)
+      const onStep = vi.fn()
+      const sending = late ? null : harness.tx.sendPreparedOperation(prepared, { onStep })
       const rejected = sending
         ? expect(sending).rejects.toThrow('PENDING_STORAGE_READ_FAILED')
         : null
@@ -265,6 +266,14 @@ describe('offline transaction safety integration (H-08)', () => {
       harness.walletResponse.resolve(HASH)
       await vi.advanceTimersByTimeAsync(0)
       if (rejected) await rejected
+      if (!late) {
+        expect(onStep.mock.lastCall?.[0]).toMatchObject({
+          send: 'done',
+          confirm: 'error',
+          txHash: HASH
+        })
+        expect(onStep.mock.lastCall?.[0].error).toContain('Do not resend')
+      }
       expect(() => harness.pending.listPendingOps('eth', WALLET)).toThrow(
         'PENDING_STORAGE_READ_FAILED'
       )
@@ -535,7 +544,7 @@ describe('offline transaction safety integration (H-08)', () => {
           'LOCAL_PENDING_UNRESOLVED'
         )
       } else {
-        await expect(harness.prepare()).rejects.toThrow()
+        await expect(harness.prepare()).rejects.toThrow('Some selected VMUs are already pending')
       }
       expect(harness.sendRequests()).toHaveLength(1)
     }
@@ -578,6 +587,13 @@ describe('offline transaction safety integration (H-08)', () => {
     harness.locks.tryAcquireLock({ chain: 'eth', wallet: OTHER_WALLET, ids: [1], batch: 'other' })
     harness.walletResponse.reject(harness.userRejection)
     await vi.advanceTimersByTimeAsync(0)
+    const droppedWrites = vi
+      .mocked(harness.storage.setItem)
+      .mock.calls.filter(
+        ([key, value]) =>
+          key.startsWith('sm.pendingOps.event.') && JSON.parse(value).record?.phase === 'dropped'
+      )
+    expect(droppedWrites).toHaveLength(1)
     expect(harness.locks.lockedIds('eth', WALLET)).toEqual(new Set())
     expect(harness.locks.lockedIds('eth', OTHER_WALLET)).toEqual(new Set([1]))
     expect(harness.pending.listPendingOps('eth', WALLET)[0]).toMatchObject({
@@ -632,6 +648,49 @@ describe('offline transaction safety integration (H-08)', () => {
     ])
     expect(harness.sendRequests()).toHaveLength(1)
     expect(reloadedLocks.broadcastLockedIds('eth', WALLET)).toEqual(new Set([1]))
+  })
+
+  it('attaches a late hash to the existing non-expired soft lock exactly once', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now())
+    const harness = await installOfflineHarness()
+    const { prepared } = await detachAtWalletTimeout(harness)
+    expect(harness.locks.lockedIds('eth', WALLET)).toEqual(new Set([1]))
+    harness.walletResponse.resolve(HASH)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(harness.locks.pendingLocks('eth', WALLET)).toEqual([
+      expect.objectContaining({ batch: prepared.batch, txHash: HASH, ids: [1] })
+    ])
+    expect(harness.pending.countUnresolvedPendingOps('eth', WALLET)).toBe(1)
+    expect(harness.sendRequests()).toHaveLength(1)
+  })
+
+  it('serializes two fresh simultaneous sends and blocks the second on the real journal', async () => {
+    const harness = await installOfflineHarness()
+    const first = await harness.prepare()
+    harness.tx.abortPrepared(first)
+    const second = await harness.prepare()
+    const results = Promise.allSettled([
+      harness.tx.sendPreparedOperation(first),
+      harness.tx.sendPreparedOperation(second)
+    ])
+    await vi.waitFor(() => expect(harness.sendRequests()).toHaveLength(1))
+    harness.walletResponse.resolve(HASH)
+    await vi.advanceTimersByTimeAsync(0)
+    const settled = await results
+    expect(settled).toEqual([
+      {
+        status: 'rejected',
+        reason: expect.objectContaining({ message: 'Transaction receipt missing' })
+      },
+      {
+        status: 'rejected',
+        reason: expect.objectContaining({
+          message: expect.stringContaining('LOCAL_PENDING_UNRESOLVED')
+        })
+      }
+    ])
+    expect(harness.sendRequests()).toHaveLength(1)
+    expect(harness.pending.countUnresolvedPendingOps('eth', WALLET)).toBe(1)
   })
 
   it('drops only a late code-4001 request, allowing a new explicit send', async () => {
