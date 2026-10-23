@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Interface } from 'ethers'
 import {
   createInMemoryExclusiveGate,
@@ -6,7 +6,12 @@ import {
   runWalletExclusive
 } from '../src/core/operationGate'
 
+beforeEach(() => {
+  expect(vi.isFakeTimers()).toBe(false)
+})
+
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
 })
 

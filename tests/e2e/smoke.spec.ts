@@ -36,10 +36,13 @@ async function captureQaScreenshot(page: Page, name: string): Promise<void> {
 async function expectPendingNonceReads(page: Page, expected: number): Promise<void> {
   // With the clock paused, advance only the short timers needed by wallet/RPC batching.
   await expect
-    .poll(async () => {
-      await page.clock.runFor(50)
-      return page.evaluate(() => window.__pendingCheckGate.reads)
-    })
+    .poll(
+      async () => {
+        await page.clock.runFor(50)
+        return page.evaluate(() => window.__pendingCheckGate.reads)
+      },
+      { timeout: 15_000, intervals: [100] }
+    )
     .toBe(expected)
 }
 
@@ -532,6 +535,15 @@ test('all unavailable RPC endpoints block chain actions and can be rechecked', a
   await expect(page.getByRole('button', { name: 'RPC', exact: true })).toBeVisible()
   await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
   await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeDisabled()
+  const networkMessage =
+    'No configured RPC endpoint responded on the expected network. Your RPC list was preserved. Check internet access, DNS, firewall, and proxy/VPN settings, then retry; or change endpoints in RPC settings.'
+  await expect(page.locator('.err-banner')).toHaveText(networkMessage)
+  const pendingError = page.locator('p.dim[role="status"]').filter({
+    hasText: 'Blocked: pending transaction check failed'
+  })
+  await expect(pendingError).toContainText(networkMessage)
+  await expect(page.locator('body')).not.toContainText('RPC_UNAVAILABLE')
+  await captureQaScreenshot(page, 'rpc-network-unavailable')
   const requestsBeforeRecheck = rpc.requestCount()
 
   await page.getByRole('button', { name: 'Recheck RPC' }).click()
@@ -544,6 +556,9 @@ test('all unavailable RPC endpoints block chain actions and can be rechecked', a
 
   await expect(page.getByText(/No usable Ethereum RPC endpoints/)).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
+  await expect(page.locator('.err-banner')).toHaveCount(0)
+  await expect(pendingError).toHaveCount(0)
+  expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
 })
 
 test('mobile Chrome is blocked by the PC Chrome guard', async ({ browser, baseURL }) => {
@@ -732,6 +747,8 @@ for (const { width, stableGutter } of [1280, 390].flatMap((width) =>
       viewportWidth: innerWidth,
       documentWidth: document.documentElement.scrollWidth,
       documentClientWidth: document.documentElement.clientWidth,
+      documentHeight: document.documentElement.scrollHeight,
+      documentClientHeight: document.documentElement.clientHeight,
       scrollbarGutter: getComputedStyle(document.documentElement).scrollbarGutter
     }))
     if (stableGutter) expect(layoutBefore.scrollbarGutter).toBe('stable')
@@ -779,6 +796,8 @@ for (const { width, stableGutter } of [1280, 390].flatMap((width) =>
       viewportWidth: innerWidth,
       documentWidth: document.documentElement.scrollWidth,
       documentClientWidth: document.documentElement.clientWidth,
+      documentHeight: document.documentElement.scrollHeight,
+      documentClientHeight: document.documentElement.clientHeight,
       left: element.getBoundingClientRect().left,
       right: element.getBoundingClientRect().right,
       scrollWidth: element.scrollWidth,
@@ -919,6 +938,11 @@ for (const width of [1280, 390]) {
     await emulateDesktopGoogleChrome(page)
     await mockSameOriginRpc(page)
     await installInjectedWallet(page)
+    let invalidEndpointRequests = 0
+    await page.route(/^https:\/\/legacy-rpc[0-9]*\.example\//, async (route) => {
+      invalidEndpointRequests += 1
+      await route.abort()
+    })
     const errors: string[] = []
     page.on('pageerror', (error) => errors.push(error.message))
     await page.goto('/')
@@ -945,6 +969,7 @@ for (const width of [1280, 390]) {
     await expect(remint).toBeDisabled()
     await expect(mint).toBeDisabled()
     expect(await page.evaluate(() => localStorage.getItem('sm.customRpc'))).toBe(stored)
+    expect(invalidEndpointRequests).toBe(0)
     await captureQaScreenshot(page, `selected-rpc-config-${width}`)
 
     await page.getByRole('button', { name: 'RPC', exact: true }).click()
@@ -956,6 +981,7 @@ for (const width of [1280, 390]) {
     await expect(claim).toBeEnabled()
     await expect(remint).toBeEnabled()
     await expect(reason).toHaveCount(0)
+    expect(invalidEndpointRequests).toBe(0)
     expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
       sendAttempts: 0,
       successfulBroadcasts: 0
@@ -1096,6 +1122,8 @@ test('prepared signing stays blocked if a shared pending check fails during a tr
     }
     provider.request = async (args) => {
       if (args.method === 'eth_getTransactionCount') {
+        // Require the polling helper to handle delayed dispatch on the paused clock.
+        await new Promise((resolve) => setTimeout(resolve, 600))
         window.__pendingCheckGate.reads += 1
         if (window.__pendingCheckGate.reads <= 2) return first
         await retry

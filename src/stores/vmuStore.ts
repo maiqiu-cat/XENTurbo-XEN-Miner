@@ -14,7 +14,8 @@ import { broadcastLockedIds } from '@/core/localLock'
 import {
   ensureHealthyReadProvider,
   RpcConfigurationError,
-  rpcConfigurationMessage
+  rpcConfigurationMessage,
+  rpcUnavailableMessage
 } from '@/core/rpc'
 import { assertReadActive, withReadDeadline } from '@/core/readDeadline'
 import { estimateGroupXen } from '@/utils/rewards'
@@ -337,7 +338,9 @@ export const useVmuStore = defineStore('vmu', {
           this.error =
             err instanceof RpcConfigurationError
               ? rpcConfigurationMessage(err.message)
-              : err?.shortMessage || err?.message || 'Failed to read chain'
+              : /RPC_UNAVAILABLE|RPC_NOT_VALIDATED/i.test(err?.shortMessage || err?.message || '')
+                ? rpcUnavailableMessage()
+                : err?.shortMessage || err?.message || 'Failed to read chain'
         } finally {
           if (isCurrent()) this.loading = false
         }
@@ -447,7 +450,9 @@ export const useVmuStore = defineStore('vmu', {
               error instanceof RpcConfigurationError
                 ? rpcConfigurationMessage(error.message)
                 : error instanceof Error
-                  ? error.message
+                  ? /RPC_UNAVAILABLE|RPC_NOT_VALIDATED/i.test(error.message)
+                    ? rpcUnavailableMessage()
+                    : error.message
                   : 'Failed to refresh affected VMUs'
         } finally {
           if (isCurrent()) this.loading = false

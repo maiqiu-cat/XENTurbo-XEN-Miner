@@ -140,6 +140,70 @@ describe('vmu store request invalidation', () => {
     }
   )
 
+  for (const kind of ['full', 'affected'] as const) {
+    it.each([
+      ['eth', 'RPC_UNAVAILABLE: Ethereum has 0/4 responsive configured RPC endpoints.'],
+      ['polygon', 'RPC_UNAVAILABLE: Polygon has 0/4 responsive configured RPC endpoints.'],
+      ['eth', 'RPC_NOT_VALIDATED: Ethereum RPC endpoints must pass a health check before use.'],
+      ['eth', 'RPC_UNAVAILABLE: https://rpc.example/private?key=fixture-secret']
+    ] as const)(
+      `explains a %s network failure during a ${kind} refresh: %s`,
+      async (chain, message) => {
+        const store = useVmuStore()
+        const vmu = mintingVmu()
+        store.$patch({ chain, wallet: walletA, vmuCount: 1, vmus: [vmu], syncedAt: 123 })
+        rpcHealth.ensureHealthyReadProvider.mockRejectedValueOnce(
+          Object.assign(new Error(message), { name: 'RpcConfigurationError' })
+        )
+        const refresh = () => (kind === 'full' ? store.refresh() : store.refreshAffected([1]))
+        try {
+          await refresh()
+          expect(store.error).toBe(
+            'No configured RPC endpoint responded on the expected network. Your RPC list was preserved. Check internet access, DNS, firewall, and proxy/VPN settings, then retry; or change endpoints in RPC settings.'
+          )
+          expect(store.error).not.toMatch(
+            /RPC_UNAVAILABLE|RPC_NOT_VALIDATED|fixture-secret|rpc\.example/
+          )
+          expect(store.vmus).toEqual([vmu])
+          expect(store.syncedAt).toBe(123)
+          expect(store.loading).toBe(false)
+          expect(chainReader.readVmuCount).not.toHaveBeenCalled()
+          expect(snapshots.saveSnapshot).not.toHaveBeenCalled()
+
+          rpcHealth.ensureHealthyReadProvider.mockResolvedValue({})
+          chainReader.readVmuCount.mockResolvedValue(1)
+          chainReader.readGlobalRank.mockResolvedValue(100)
+          chainReader.readWalletVmus.mockResolvedValue([vmu])
+          chainReader.readVmuStates.mockResolvedValue([vmu])
+          await refresh()
+          expect(store.error).toBeNull()
+          expect(store.vmus).toEqual([vmu])
+          expect(snapshots.saveSnapshot).toHaveBeenCalledOnce()
+        } finally {
+          store.detach()
+        }
+      }
+    )
+
+    it(`preserves unrelated error text during a ${kind} refresh`, async () => {
+      const store = useVmuStore()
+      store.$patch({
+        chain: 'eth',
+        wallet: walletA,
+        vmuCount: 1,
+        vmus: [mintingVmu()],
+        syncedAt: 123
+      })
+      rpcHealth.ensureHealthyReadProvider.mockRejectedValueOnce(new Error('Unrelated read fixture'))
+      try {
+        await (kind === 'full' ? store.refresh() : store.refreshAffected([1]))
+        expect(store.error).toBe('Unrelated read fixture')
+      } finally {
+        store.detach()
+      }
+    })
+  }
+
   it('passes the same cancellation signal to all initial reads and the final clock read', async () => {
     chainReader.readVmuCount.mockResolvedValue(0)
     chainReader.readGlobalRank.mockResolvedValue(100)

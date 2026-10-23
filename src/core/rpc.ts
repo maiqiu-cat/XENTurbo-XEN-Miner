@@ -25,6 +25,10 @@ export function rpcConfigurationMessage(message: string): string {
   return `${message.replace(/^RPC_UNAVAILABLE:\s*/, '')}. Your RPC list was not changed. Open the RPC settings to correct the configuration or reset to defaults. Chain reads and transactions remain blocked until validation succeeds.`
 }
 
+export function rpcUnavailableMessage(): string {
+  return 'No configured RPC endpoint responded on the expected network. Your RPC list was preserved. Check internet access, DNS, firewall, and proxy/VPN settings, then retry; or change endpoints in RPC settings.'
+}
+
 export interface RpcHealthFailure {
   url: string
   message: string

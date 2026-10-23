@@ -18,7 +18,8 @@ import {
   ensureHealthyReadProvider,
   getReadProvider,
   RpcConfigurationError,
-  rpcConfigurationMessage
+  rpcConfigurationMessage,
+  rpcUnavailableMessage
 } from './rpc'
 import { releaseLock, newBatchId, pendingLocks, tryAcquireLock, clearSoftLocks } from './localLock'
 import { countUnresolvedPendingOps, recordPendingOp, removePendingOpRecord } from './pendingOps'
@@ -1171,7 +1172,7 @@ export function normalizeError(
     return 'The prepared transaction expired after 2 minutes. Estimate it again before signing.'
   if (/RPC_UNAVAILABLE|RPC_NOT_VALIDATED/i.test(msg)) {
     if (err instanceof RpcConfigurationError) return rpcConfigurationMessage(err.message)
-    return 'No configured RPC endpoint responded on the expected network. Your RPC list was preserved. Check internet access, DNS, firewall, and proxy/VPN settings, then retry; or change endpoints in RPC settings.'
+    return rpcUnavailableMessage()
   }
   if (/PENDING_STORAGE_(?:READ|WRITE)_FAILED|LOCK_STORAGE_INVALID/i.test(msg)) {
     const action =
