@@ -1,6 +1,16 @@
 # XENTurbo XEN Miner
 
-Current release: **v1.1.4**. The page header displays the same version as the source package and Git release tag.
+Current release: **v1.1.5**. The page header displays the same version as the source package and Git release tag.
+
+### v1.1.5 Transaction Recovery And RPC Hardening
+
+- Preserved configured RPC lists on failures, bounded configuration validation, and distinguished invalid settings from unavailable networks consistently across the interface.
+- Strengthened pending reconciliation, wallet-context invalidation and cross-tab transaction serialization. A failed check cannot revive an earlier signing intent.
+- Preserved timely and late transaction hashes when browser storage fails. Damaged transaction records can be exported and repaired only with matching wallet-authenticated mined receipts.
+- Damaged locks without a transaction hash remain preserved and block mining in that browser profile. There is no automatic deletion or in-app bypass; retain the backup for manual investigation.
+- Hardened read cancellation, pinned-block CREATE2 probes, CLI entry validation and rate-limit diagnostics. Updated compatible development dependencies without changing major versions.
+- P2-C remains **unproven**: historical destroy/count semantics lack a complete evidence match to both current deployments. Strict boundary checks, active witnesses and nonzero NOT_VERIFIED exits remain required.
+- Contracts, ABI, deployment addresses, default RPC lists, wallet-selected Gas and Cloudflare Analytics behavior are unchanged. Transaction tests use mock wallets and RPC; they do not establish real-wallet or historical contract semantics.
 
 ### v1.1.4 Read Recovery And Analytics
 
@@ -113,6 +123,81 @@ cp .env.example .env
 
 Custom RPC endpoints can also be added through the RPC control in the Miner.
 Only HTTPS endpoints that return the expected chain ID are accepted.
+Custom lists allow up to 16 distinct endpoints, with a 2,048-character limit per
+normalized URL. The raw input text is limited to 32,784 characters, including
+whitespace and line separators. Saving settings validates at most four endpoints
+concurrently; after failure it stops dispatching and waits for in-flight checks
+before allowing another save. Operation
+health checks probe the bounded list in parallel to preserve wallet read
+deadlines. Failed checks preserve the configured list; check the local network
+or edit RPC settings to recover. Legacy entries exceeding the new limits remain
+visible and are rejected explicitly until edited, rather than silently selecting
+defaults or deleting the saved configuration. Configuration errors are shown
+separately from network failures. Transaction controls remain blocked until the
+current wallet and chain have completed pending reconciliation successfully.
+Returning from a hidden tab requires a new reconciliation. An explicit Recheck
+also retains its stronger RPC and result-verification options when another
+check is already running.
+
+If browser transaction storage fails after the wallet returns a hash, the
+transaction remains submitted. The Miner keeps the hash in the current tab and
+attempts a separate recovery copy; the earlier pending record continues to block
+resubmission. Keep the page open, save the explorer link, and check wallet Activity.
+Do not clear site data or resend to resolve a storage error. When both durable
+writes fail, the hash cannot be guaranteed to survive a reload. Unreadable pending
+records block submission and are preserved for recovery.
+
+The **Transaction storage recovery** control inspects the journal and lock cache
+without clearing them. Export and retain the private JSON backup first. Repair
+requires the connected wallet to return a mined receipt matching the damaged
+record's account, network, transaction hash and Miner contract. The original
+snapshot is also archived in browser storage and read back before any repair.
+Valid records and unrelated accounts are preserved; changes from another tab
+invalidate the preview. A zero nonce gap, an expired lock, or a public RPC
+response cannot authorize deletion. Unreadable JSON, unidentified records and
+unconfirmed transactions remain blocked for manual investigation. This is not a
+reset-site-data control and does not guarantee recovery of lost transaction identity.
+
+The recovery panel distinguishes unreadable JSON, invalid containers and malformed
+records. Unidentified records, other wallet/network records, missing mined receipts
+and the 20-record verification limit are reported separately. A deferred record is
+not a settled record. Closing recovery or changing the wallet context cancels its
+read-only work; submitting again still requires successful pending reconciliation.
+
+Cancelling a prepared operation invalidates that preparation, including its shared
+UI references. A fresh preparation is required before sending. Once the request
+has been handed to the wallet, cancellation cannot remove its pending evidence or
+make the same prepared object reusable.
+
+### PR #7 Validation Scope
+
+The previously reported **147 tests / 6 failures** was an early, focused negative
+control: production source and scripts were at `ead7a18`; only
+`tests/concurrency.test.ts`, `tests/localLock.test.ts` and
+`tests/transactionSafety.integration.test.ts` contained the new regression tests.
+Eight files were run (those three plus `usePendingTx`, `checkRpcHealth`,
+`releaseProbe`, `rpc` and `verifyCreate2`): 141 passed and 6 failed. It was not the
+final test suite running against old code, nor old tests failing on new code.
+The six failures covered three lock-cache preservation cases, two timely-hash
+storage-failure states and one late-hash fallback. The later `194355b` candidate
+passed 548 unit/integration tests and 30 browser tests in isolated local validation.
+These historical counts are not a claim about subsequent revisions.
+
+P2-C remains **unproven**: the historical destroy/count semantics have not been
+matched to both current deployed implementations and historical chain evidence.
+CREATE2 verification still requires pinned-block boundary bytecode checks and
+an active on-chain witness. Exit code 2 means **not verified**, including a budget
+limit, no VMUs, no active witness, an out-of-range start, or a rate-limit delay
+that cannot fit the budget; none of these is a release pass. Exit code 3 denotes
+a proven boundary/derivation mismatch; other errors use exit code 1.
+
+RPC and transport failures require fixing the cause and starting a fresh full
+verification; only scan limits and scan deadlines advertise continuation. Rate-limit
+diagnostics distinguish a server `Retry-After` from fallback exponential backoff
+that cannot fit the budget. Both remain **not verified**. During a failed ethers
+network bootstrap, its outstanding one-second retry delay can briefly postpone
+process exit; provider and HTTP resources are still destroyed. Network detection
+and CREATE2 boundary checks are not disabled to hide that dependency behavior.
 
 ## Page and performance analytics
 
@@ -126,6 +211,11 @@ Miner does not attach wallet addresses, transaction hashes, nonces, RPC URLs,
 VMU IDs, form values or error messages to analytics. It does not send custom
 wallet, RPC or transaction-stage events. An unavailable or blocked beacon must
 not affect wallet connections or mining.
+
+The remote beacon is trusted third-party JavaScript and shares the page's
+privileges; `type="module"` is not a security sandbox. Local tests replace the
+beacon with a fixture to verify the loader and mining behavior. They do not
+verify the real remote script's data collection or its future changes.
 
 The loader checks the exact production hostname and avoids adding a second
 beacon when Cloudflare has already injected one. Analytics is disabled on
@@ -232,8 +322,34 @@ and estimates.
 
 `verify:create2` requires an explicit witness address for the selected chain: pass
 `--wallet 0x...`, or set `CREATE2_WITNESS_ETH` / `CREATE2_WITNESS_POLYGON`. It scans
-successive VMU batches until it finds an active derived proxy. Use `--rpc https://...`
-to override the script's default RPC for the selected chain.
+successive VMU batches until it finds an active derived proxy, with a default
+budget of 1,000 VMUs and 30 seconds for the whole check. Budget exhaustion returns
+`NOT_VERIFIED` (exit code 2), not a derivation mismatch. Resume with the reported
+`--from-id`, or adjust `--scan-limit` (up to 100,000) and `--deadline-ms` (up to
+300,000). Reads are pinned to one block. Before accepting an active witness, the
+gate checks exact proxy runtime code at the first and last allocated IDs and
+absence at the next ID (when representable), catching constant numbering shifts.
+This supplements fixed-address unit tests; it does not prove every intermediate ID.
+
+Exit codes are `0` for verified, `1` for arguments/RPC errors, `2` for unverified
+(including budget exhaustion, no VMUs, an out-of-range start, or no active witness),
+and `3` for a proxy boundary mismatch. Scan progress and continuation IDs are
+reported on interruption. The scan budget bounds verification, not an OS-level
+process kill deadline.
+Chain and proxy-boundary mismatches require investigating the configuration or
+RPC response; continuing at another page does not resolve those failures. A
+boundary mismatch alone does not establish a faulty derivation: historical proxy
+destruction or inconsistent RPC state requires separate investigation. The gate
+remains non-successful until a complete witness check passes.
+
+Use `--rpc https://...` to override the selected chain's default RPC. Plain HTTP
+is permitted only for explicit loopback test endpoints. Redirects are rejected;
+supply the final endpoint URL. HTTP 429 responses receive at most two retries,
+respecting Retry-After within the total verification budget. Release probes use
+strict JSON-RPC batch/ABI validation and reject redirects. Their chain IDs must
+use canonical hexadecimal quantities, so a noncanonical `0x01` is rejected.
+Remote diagnostic control characters are escaped to keep each CLI result on one
+line, and transport failures include their available underlying cause.
 
 Playwright uses a dedicated local production-preview server on port 4173. If that
 port is occupied by another application, keep that application running and set

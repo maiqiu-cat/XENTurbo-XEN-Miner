@@ -1,7 +1,7 @@
 export const CLOUDFLARE_BEACON_URL = 'https://static.cloudflareinsights.com/beacon.min.js'
 export const CLOUDFLARE_ANALYTICS_TOKEN = 'd47010c2cf564339b8ad6c17afef3e0c'
 
-/** Optional page/performance measurement, isolated from wallet and transaction state. */
+/** Loads trusted third-party measurement code with the same page privileges as the Miner. */
 export function loadCloudflareAnalytics(): void {
   if (
     typeof window === 'undefined' ||

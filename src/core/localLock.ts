@@ -32,7 +32,7 @@ const KEY = 'sm.vmuLocks'
 // block Claim forever after the user closes the modal / refreshes.
 const SOFT_LOCK_TTL_MS = 2 * 60 * 1000
 
-function isValidLock(l: unknown): l is LockRecord {
+export function isValidLock(l: unknown): l is LockRecord {
   if (!l || typeof l !== 'object') return false
   const r = l as Record<string, unknown>
   return (
@@ -40,8 +40,11 @@ function isValidLock(l: unknown): l is LockRecord {
     typeof r.wallet === 'string' &&
     typeof r.batch === 'string' &&
     typeof r.lockedAt === 'number' &&
+    Number.isFinite(r.lockedAt) &&
+    (r.txHash === undefined || (typeof r.txHash === 'string' &&
+      (r.txHash === '' || /^0x[0-9a-f]{64}$/i.test(r.txHash)))) &&
     Array.isArray(r.ids) &&
-    r.ids.every((id) => typeof id === 'number' && Number.isFinite(id))
+    r.ids.every((id) => typeof id === 'number' && Number.isSafeInteger(id) && id > 0)
   )
 }
 
@@ -52,18 +55,22 @@ function isAlive(l: LockRecord, now: number): boolean {
   return hasTx || now - l.lockedAt < SOFT_LOCK_TTL_MS
 }
 
-function readAll(): LockRecord[] {
+function readAll(strict = false): LockRecord[] {
   try {
     const raw = localStorage.getItem(KEY)
-    const list = raw ? (JSON.parse(raw) as unknown[]) : []
-    if (!Array.isArray(list)) return []
+    const list = raw === null ? [] : (JSON.parse(raw) as unknown[])
+    if (!Array.isArray(list)) throw new Error('Invalid VMU lock storage')
+    if (strict && !list.every(isValidLock)) throw new Error('Invalid VMU lock record')
     const now = Date.now()
-    const valid = list.filter(isValidLock).filter((l) => isAlive(l, now))
-    if (valid.length !== list.length) writeAll(valid)
-    return valid
-  } catch {
+    return list.filter(isValidLock).filter((l) => isAlive(l, now))
+  } catch (error) {
+    if (strict) throw new Error('LOCK_STORAGE_INVALID: Local lock records cannot be read. Open transaction storage recovery; do not clear site data or resend.', { cause: error })
     return []
   }
+}
+
+export function assertLockStorageReadable(): void {
+  readAll(true)
 }
 
 const lockRevision = shallowRef(0)
@@ -124,24 +131,50 @@ export function tryAcquireLock(params: {
   count?: number
   term?: number
 }): boolean {
-  const existing = lockedIds(params.chain, params.wallet)
+  const list = readAll(true)
+  const existing = new Set(list.filter(scope(params.chain, params.wallet)).flatMap((lock) => lock.ids))
   if (params.ids.some((id) => existing.has(id))) return false
-  const list = readAll()
   list.push({ ...params, lockedAt: Date.now() })
   writeAll(list)
   return true
 }
 
-export function attachTxHash(batch: string, txHash: string): void {
-  const list = readAll()
-  list.forEach((l) => {
-    if (l.batch === batch) l.txHash = txHash
-  })
+export function attachTxHash(
+  batch: string,
+  txHash: string,
+  metadata?: Omit<LockRecord, 'batch' | 'txHash' | 'lockedAt'> & { lockedAt?: number }
+): void {
+  // Lockless mint/create operations still need a recoverable hash if the journal is full.
+  const list = readAll(true)
+  const matching = list.filter((lock) => lock.batch === batch && (!metadata || scope(metadata.chain, metadata.wallet)(lock)))
+  if (matching.some((lock) => lock.txHash && lock.txHash.toLowerCase() !== txHash.toLowerCase())) {
+    throw new Error('LOCK_IDENTITY_CONFLICT: a broadcast lock cannot change transaction identity')
+  }
+  matching.forEach((lock) => { lock.txHash = txHash })
+  if (metadata && matching.length === 0) {
+    list.push({ ...metadata, ids: [...metadata.ids], batch, txHash, lockedAt: metadata.lockedAt ?? Date.now() })
+  }
   writeAll(list)
 }
 
-export function releaseLock(batch: string): void {
-  writeAll(readAll().filter((l) => l.batch !== batch))
+function removeLocks(matches: (lock: LockRecord) => boolean): void {
+  try {
+    const list = readAll(true)
+    const retained = list.filter((lock) => !matches(lock))
+    if (retained.length !== list.length) writeAll(retained)
+  } catch {
+    // Cleanup is best effort. An unreadable snapshot must never be overwritten as empty.
+  }
+}
+
+export function releaseLock(
+  batch: string,
+  context?: { chain: ChainKey; wallet: string; txHash: string }
+): void {
+  removeLocks((lock) => lock.batch === batch && (!context || (
+    scope(context.chain, context.wallet)(lock) &&
+    (!lock.txHash || lock.txHash.toLowerCase() === context.txHash.toLowerCase())
+  )))
 }
 
 export function releaseLocksByTxHash(
@@ -149,15 +182,8 @@ export function releaseLocksByTxHash(
   context?: { chain: ChainKey; wallet: string }
 ): void {
   const normalized = txHash.toLowerCase()
-  writeAll(
-    readAll().filter(
-      (l) =>
-        (context &&
-          (l.chain !== context.chain || l.wallet.toLowerCase() !== context.wallet.toLowerCase())) ||
-        typeof l.txHash !== 'string' ||
-        l.txHash.toLowerCase() !== normalized
-    )
-  )
+  removeLocks((lock) => (!context || scope(context.chain, context.wallet)(lock)) &&
+    typeof lock.txHash === 'string' && lock.txHash.toLowerCase() === normalized)
 }
 
 export function newBatchId(): string {
@@ -185,14 +211,5 @@ export function pendingLocks(chain: ChainKey, wallet: string): PendingLock[] {
 
 /** Drop soft locks (no txHash) for a wallet — used on page load / Cancel. */
 export function clearSoftLocks(chain: ChainKey, wallet: string): void {
-  writeAll(
-    readAll().filter(
-      (l) =>
-        !(
-          l.chain === chain &&
-          l.wallet.toLowerCase() === wallet.toLowerCase() &&
-          !(typeof l.txHash === 'string' && l.txHash.length > 0)
-        )
-    )
-  )
+  removeLocks((lock) => scope(chain, wallet)(lock) && !lock.txHash)
 }

@@ -11,7 +11,7 @@ import {
 const browserSettings = (window as unknown as HappyDomWindow).happyDOM.settings
 const originalDisabledLoading = browserSettings.handleDisabledFileLoadingAsSuccess
 beforeEach(() => {
-  // This DOM-only test never fetches the remote module; Playwright tests execution separately.
+  // Neither this DOM test nor the controlled Playwright beacon fixture verifies the live script.
   browserSettings.handleDisabledFileLoadingAsSuccess = true
 })
 

@@ -66,6 +66,7 @@ for (const path of trackedFiles) {
   try {
     text = readFileSync(path, 'utf8')
   } catch {
+    failures.push(`${path}: tracked file could not be read`)
     continue
   }
   if (/\/(?:Users|home)\/[A-Za-z0-9._-]+\//.test(text)) {

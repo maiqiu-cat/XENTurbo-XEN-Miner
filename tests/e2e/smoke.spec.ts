@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route } from '@playwright/test'
+import { expect, test, type Locator, type Page, type Route } from '@playwright/test'
 import { join } from 'node:path'
 import { Interface } from 'ethers'
 import { computeProxyAddress, minimalProxyRuntimeCode } from '../../src/core/create2'
@@ -33,6 +33,32 @@ async function captureQaScreenshot(page: Page, name: string): Promise<void> {
   if (directory) await page.screenshot({ path: join(directory, `${name}.png`), fullPage: true })
 }
 
+async function expectPendingNonceReads(page: Page, expected: number): Promise<void> {
+  // With the clock paused, advance only the short timers needed by wallet/RPC batching.
+  await expect
+    .poll(
+      async () => {
+        await page.clock.runFor(50)
+        return page.evaluate(() => window.__pendingCheckGate.reads)
+      },
+      { timeout: 15_000, intervals: [100] }
+    )
+    .toBe(expected)
+}
+
+async function expectEnabledWithClock(page: Page, button: Locator): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        await page.clock.runFor(50)
+        return button.isEnabled()
+      },
+      // Advance paused timers frequently without skipping the readiness gate or background polls.
+      { timeout: 15_000, intervals: [100] }
+    )
+    .toBe(true)
+}
+
 interface WalletMockStats {
   sendAttempts: number
   successfulBroadcasts: number
@@ -44,10 +70,17 @@ declare global {
       emitAccounts(accounts: string[]): void
       emitChain(chainId: string): void
       setStalled(method: string, stalled: boolean): void
+      setRejected(method: string, rejected: boolean): void
       setSendDelay(delayMs: number): void
+      setMinedReceipt(value: boolean): void
+      nonceReadCount(): number
       stats(): WalletMockStats
     }
     __confirmedWrites: Array<{ id: string; hasOutcome: boolean }>
+    __pendingCheckGate: { reads: number; reject(): void; release(): void }
+    __trackingReads: number
+    __recoveryRead: { reads: number; release(): void }
+    __restoreStorage?: () => void
   }
 }
 
@@ -304,7 +337,10 @@ async function installInjectedWallet(
       let sendAttempts = 0
       let successfulBroadcasts = 0
       let sendDelayMs = 0
+      let nonceReads = 0
+      let minedReceipt: boolean | null = null
       const stalledMethods = new Set<string>(initiallyStalled)
+      const rejectedMethods = new Set<string>()
 
       const emit = (event: string, value: unknown) => {
         for (const listener of listeners.get(event) ?? []) listener(value)
@@ -318,7 +354,9 @@ async function installInjectedWallet(
           method: string
           params?: unknown[]
         }): Promise<unknown> {
+          if (method === 'eth_getTransactionCount') nonceReads += 1
           if (stalledMethods.has(method)) return new Promise(() => {})
+          if (rejectedMethods.has(method)) throw new Error(`Offline fixture rejected ${method}`)
           switch (method) {
             case 'eth_accounts':
               return [...accounts]
@@ -336,7 +374,7 @@ async function installInjectedWallet(
             case 'eth_getTransactionByHash':
               return null
             case 'eth_getTransactionReceipt':
-              return successfulBroadcasts > 0
+              return (minedReceipt ?? successfulBroadcasts > 0)
                 ? {
                     transactionHash: txHash,
                     blockHash: `0x${'b'.repeat(64)}`,
@@ -397,8 +435,18 @@ async function installInjectedWallet(
           if (stalled) stalledMethods.add(method)
           else stalledMethods.delete(method)
         },
+        setRejected(method: string, rejected: boolean) {
+          if (rejected) rejectedMethods.add(method)
+          else rejectedMethods.delete(method)
+        },
         setSendDelay(delayMs: number) {
           sendDelayMs = delayMs
+        },
+        setMinedReceipt(value: boolean) {
+          minedReceipt = value
+        },
+        nonceReadCount() {
+          return nonceReads
         },
         stats() {
           return { sendAttempts, successfulBroadcasts }
@@ -487,6 +535,15 @@ test('all unavailable RPC endpoints block chain actions and can be rechecked', a
   await expect(page.getByRole('button', { name: 'RPC', exact: true })).toBeVisible()
   await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
   await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeDisabled()
+  const networkMessage =
+    'No configured RPC endpoint responded on the expected network. Your RPC list was preserved. Check internet access, DNS, firewall, and proxy/VPN settings, then retry; or change endpoints in RPC settings.'
+  await expect(page.locator('.err-banner')).toHaveText(networkMessage)
+  const pendingError = page.locator('p.dim[role="status"]').filter({
+    hasText: 'Blocked: pending transaction check failed'
+  })
+  await expect(pendingError).toContainText(networkMessage)
+  await expect(page.locator('body')).not.toContainText('RPC_UNAVAILABLE')
+  await captureQaScreenshot(page, 'rpc-network-unavailable')
   const requestsBeforeRecheck = rpc.requestCount()
 
   await page.getByRole('button', { name: 'Recheck RPC' }).click()
@@ -499,6 +556,9 @@ test('all unavailable RPC endpoints block chain actions and can be rechecked', a
 
   await expect(page.getByText(/No usable Ethereum RPC endpoints/)).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
+  await expect(page.locator('.err-banner')).toHaveCount(0)
+  await expect(pendingError).toHaveCount(0)
+  expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
 })
 
 test('mobile Chrome is blocked by the PC Chrome guard', async ({ browser, baseURL }) => {
@@ -554,6 +614,40 @@ test('wallet initialization, connect, account changes, and chain changes update 
   await expect(page.getByRole('combobox')).toHaveValue('polygon')
 })
 
+test('paused-clock readiness waits for delayed wallet nonce checks without bypassing the gate', async ({
+  page
+}) => {
+  await page.clock.install()
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page)
+  await page.goto('/')
+  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1_000))
+  await page.evaluate(() => {
+    const provider = (
+      window as unknown as {
+        ethereum: { request(args: { method: string; params?: unknown[] }): Promise<unknown> }
+      }
+    ).ethereum
+    const request = provider.request.bind(provider)
+    provider.request = async (args) => {
+      if (args.method === 'eth_getTransactionCount') {
+        await new Promise((resolve) => setTimeout(resolve, 600))
+      }
+      return request(args)
+    }
+  })
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
+  await expect(mint).toBeDisabled()
+  await expectEnabledWithClock(page, mint)
+  await expect(mint).toBeEnabled()
+  expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+    sendAttempts: 0,
+    successfulBroadcasts: 0
+  })
+})
+
 test('claim selection is cleared when the connected wallet changes', async ({ page }) => {
   await emulateDesktopGoogleChrome(page)
   await mockSameOriginRpc(page)
@@ -592,21 +686,22 @@ test('a stalled wallet nonce read times out without opening a transaction reques
   await expect(page.locator('.steps .step-icon.run')).toHaveText('...')
   await expect(page.getByText('Checking pending transactions through the wallet...')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Cancel' })).toBeVisible()
-  await expect(
-    page
-      .getByText(/READ_TIMEOUT: Wallet eth_getTransactionCount exceeded 15000 ms/, { exact: false })
-      .first()
-  ).toBeVisible({ timeout: 17_000 })
-  await expect(
-    page.getByText(
-      'Pending check failed: READ_TIMEOUT: Wallet eth_getTransactionCount exceeded 15000 ms'
-    )
-  ).toBeVisible()
+  const timeoutMessage =
+    'Wallet or network read timed out. Wallet eth_getTransactionCount exceeded 15000 ms. Check your connection and wallet, then recheck transaction records. Do not resend.'
+  await expect(page.locator('.modal-body .err-text')).toHaveText(timeoutMessage, {
+    timeout: 17_000
+  })
+  await expect(page.getByRole('region', { name: 'Transaction activity' })).toContainText(
+    `Pending check failed: ${timeoutMessage}`
+  )
+  await expect(page.getByText(/READ_TIMEOUT/)).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeDisabled()
   expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
     sendAttempts: 0,
     successfulBroadcasts: 0
   })
   await expect(page.getByRole('button', { name: 'Close' })).toBeVisible()
+  await captureQaScreenshot(page, 'nonce-timeout-detail')
 })
 
 test('an unsigned prepared operation is invalidated by an account change', async ({ page }) => {
@@ -625,6 +720,476 @@ test('an unsigned prepared operation is invalidated by an account change', async
   await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
   await expect(page.getByRole('button', { name: '0x2222...2222' }).first()).toBeVisible()
 })
+
+for (const { width, stableGutter } of [1280, 390].flatMap((width) =>
+  [false, true].map((stableGutter) => ({ width, stableGutter }))
+)) {
+  test(`manual hash tracking explains a real wallet read timeout and allows a safe retry (${width}px${stableGutter ? ', stable gutter' : ''})`, async ({
+    page
+  }) => {
+    await page.setViewportSize({ width, height: 900 })
+    await page.clock.install()
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await installInjectedWallet(page)
+    const errors: string[] = []
+    page.on('pageerror', (error) => errors.push(error.message))
+    await page.goto('/')
+    if (stableGutter) {
+      await page.addStyleTag({ content: 'html { overflow-y: scroll; scrollbar-gutter: stable; }' })
+    }
+    await expect(page.getByRole('heading', { name: 'XENTurbo XEN Miner' })).toBeVisible()
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
+    await expect(mint).toBeEnabled()
+    await expect(page.locator('tbody tr')).toHaveCount(1)
+    const layoutBefore = await page.evaluate(() => ({
+      viewportWidth: innerWidth,
+      documentWidth: document.documentElement.scrollWidth,
+      documentClientWidth: document.documentElement.clientWidth,
+      documentHeight: document.documentElement.scrollHeight,
+      documentClientHeight: document.documentElement.clientHeight,
+      scrollbarGutter: getComputedStyle(document.documentElement).scrollbarGutter
+    }))
+    if (stableGutter) expect(layoutBefore.scrollbarGutter).toBe('stable')
+    await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1_000))
+    await page.evaluate(() => {
+      const provider = (
+        window as unknown as {
+          ethereum: { request(args: { method: string; params?: unknown[] }): Promise<unknown> }
+        }
+      ).ethereum
+      const request = provider.request.bind(provider)
+      window.__trackingReads = 0
+      window.__walletMock.setStalled('eth_getTransactionByHash', true)
+      provider.request = async (args) => {
+        if (args.method === 'eth_getTransactionByHash') window.__trackingReads += 1
+        return request(args)
+      }
+    })
+    const storedRecords = () =>
+      page.evaluate(() =>
+        Object.fromEntries(
+          Object.keys(localStorage)
+            .filter((key) => key.startsWith('sm.pendingOps') || key === 'sm.vmuLocks')
+            .map((key) => [key, localStorage.getItem(key)])
+        )
+      )
+    const original = await storedRecords()
+    await page.locator('.paste-input').fill(TX_HASH)
+    await page.getByRole('button', { name: 'Track', exact: true }).click()
+    await expect
+      .poll(async () => {
+        await page.clock.runFor(50)
+        return page.evaluate(() => window.__trackingReads)
+      })
+      .toBe(1)
+    await page.clock.runFor(15_001)
+    const warning = page.locator('.warn-card')
+    await expect(warning).toContainText('Wallet or network read timed out.')
+    await expect(warning).toContainText('Wallet eth_getTransactionByHash exceeded 15000 ms.')
+    await expect(warning).toContainText('Do not resend.')
+    await expect(warning).not.toContainText('READ_TIMEOUT')
+    await warning.scrollIntoViewIfNeeded()
+    await expect(warning).toBeInViewport()
+    const layoutAfter = await warning.evaluate((element) => ({
+      viewportWidth: innerWidth,
+      documentWidth: document.documentElement.scrollWidth,
+      documentClientWidth: document.documentElement.clientWidth,
+      documentHeight: document.documentElement.scrollHeight,
+      documentClientHeight: document.documentElement.clientHeight,
+      left: element.getBoundingClientRect().left,
+      right: element.getBoundingClientRect().right,
+      scrollWidth: element.scrollWidth,
+      clientWidth: element.clientWidth
+    }))
+    await test.info().attach('manual-track-layout', {
+      body: JSON.stringify({ before: layoutBefore, after: layoutAfter }),
+      contentType: 'application/json'
+    })
+    // Verify this warning fits and adds no overflow; the rest of the narrow desktop layout is unchanged.
+    expect(layoutAfter.documentWidth).toBe(layoutBefore.documentWidth)
+    expect(layoutAfter.documentClientWidth).toBe(layoutBefore.documentClientWidth)
+    expect(layoutAfter.left).toBeGreaterThanOrEqual(0)
+    expect(layoutAfter.right).toBeLessThanOrEqual(layoutAfter.viewportWidth)
+    expect(layoutAfter.scrollWidth).toBeLessThanOrEqual(layoutAfter.clientWidth)
+    expect(await storedRecords()).toEqual(original)
+    await expect(mint).toBeEnabled()
+    await captureQaScreenshot(
+      page,
+      `manual-track-timeout-${width}${stableGutter ? '-stable-gutter' : ''}`
+    )
+
+    await page.evaluate(() => window.__walletMock.setStalled('eth_getTransactionByHash', false))
+    await page.locator('.paste-input').fill(TX_HASH)
+    await page.getByRole('button', { name: 'Track', exact: true }).click()
+    await expect
+      .poll(async () => {
+        await page.clock.runFor(50)
+        return (await warning.allTextContents()).join('')
+      })
+      .toBe('Transaction not found through the wallet. Check the hash / network.')
+    expect(await page.evaluate(() => window.__trackingReads)).toBe(2)
+    expect(await storedRecords()).toEqual(original)
+    await expect(mint).toBeEnabled()
+    expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+      sendAttempts: 0,
+      successfulBroadcasts: 0
+    })
+    expect(errors).toEqual([])
+  })
+}
+
+for (const width of [1280, 390]) {
+  for (const kind of ['count', 'length'] as const) {
+    test(`legacy RPC configuration ${kind} has actionable Track guidance and recovers after an explicit correction (${width}px)`, async ({
+      page
+    }) => {
+      await page.setViewportSize({ width, height: 900 })
+      await emulateDesktopGoogleChrome(page)
+      await mockSameOriginRpc(page)
+      await installInjectedWallet(page)
+      const urls =
+        kind === 'count'
+          ? Array.from({ length: 17 }, (_, index) => `https://legacy-rpc${index}.example/`)
+          : [`https://legacy-rpc.example/${'x'.repeat(2048)}`]
+      const stored = JSON.stringify({ eth: urls })
+      await page.addInitScript((value) => localStorage.setItem('sm.customRpc', value), stored)
+      let invalidEndpointRequests = 0
+      await page.route(/^https:\/\/legacy-rpc[0-9]*\.example\//, async (route) => {
+        invalidEndpointRequests += 1
+        await route.abort()
+      })
+      const errors: string[] = []
+      page.on('pageerror', (error) => errors.push(error.message))
+      await page.goto('/')
+      await expect(page.getByRole('heading', { name: 'XENTurbo XEN Miner' })).toBeVisible()
+      await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+      const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
+      await expect(mint).toBeDisabled()
+      const banner = page.locator('.rpc-health-banner')
+      const reason = kind === 'count' ? 'Use at most 16 RPC endpoints' : '2048 characters'
+      await expect(banner).toContainText(reason)
+      await page.locator('.paste-input').fill(TX_HASH)
+      await page.getByRole('button', { name: 'Track', exact: true }).click()
+      const warning = page.locator('.warn-card')
+      await expect(warning).toContainText(`RPC configuration is invalid:`)
+      await expect(warning).toContainText(reason)
+      await expect(warning).toContainText('Open the RPC settings')
+      await expect(warning).not.toContainText('Check internet access')
+      await expect(warning).not.toContainText('RPC_UNAVAILABLE')
+      await expect(warning).toHaveText(await banner.locator(':scope > span').innerText())
+      const listError = page.locator('.err-banner')
+      const pendingError = page.locator('p.dim[role="status"]').filter({
+        hasText: 'Blocked: pending transaction check failed'
+      })
+      await expect(listError).toHaveText(await banner.locator(':scope > span').innerText())
+      await expect(pendingError).toContainText(reason)
+      await expect(pendingError).toContainText('Open the RPC settings')
+      await expect(pendingError).not.toContainText('Check internet access')
+      await expect(page.locator('body')).not.toContainText('RPC_UNAVAILABLE')
+      expect(await page.evaluate(() => localStorage.getItem('sm.customRpc'))).toBe(stored)
+      expect(invalidEndpointRequests).toBe(0)
+      await expect(mint).toBeDisabled()
+      await warning.scrollIntoViewIfNeeded()
+      await expect(warning).toBeInViewport()
+      const layout = await warning.evaluate((element) => ({
+        left: element.getBoundingClientRect().left,
+        right: element.getBoundingClientRect().right,
+        viewport: innerWidth,
+        scrollWidth: element.scrollWidth,
+        clientWidth: element.clientWidth
+      }))
+      expect(layout.left).toBeGreaterThanOrEqual(0)
+      expect(layout.right).toBeLessThanOrEqual(layout.viewport)
+      expect(layout.scrollWidth).toBeLessThanOrEqual(layout.clientWidth)
+      await captureQaScreenshot(page, `rpc-config-${kind}-${width}`)
+
+      await page.getByRole('button', { name: 'RPC', exact: true }).click()
+      await page.locator('textarea').fill('https://ethereum.publicnode.com/')
+      await page.getByRole('button', { name: 'Save', exact: true }).click()
+      await expect(mint).toBeEnabled()
+      await expect(banner).toHaveCount(0)
+      await expect(listError).toHaveCount(0)
+      await expect(pendingError).toHaveCount(0)
+      expect(
+        await page.evaluate(() => JSON.parse(localStorage.getItem('sm.customRpc')!).eth)
+      ).toEqual(['https://ethereum.publicnode.com/'])
+      await page.locator('.paste-input').fill(TX_HASH)
+      await page.getByRole('button', { name: 'Track', exact: true }).click()
+      await expect(warning).toHaveText(
+        'Transaction not found through the wallet. Check the hash / network.'
+      )
+      await expect(mint).toBeEnabled()
+      expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+        sendAttempts: 0,
+        successfulBroadcasts: 0
+      })
+      expect(errors).toEqual([])
+    })
+  }
+}
+
+for (const width of [1280, 390]) {
+  test(`selected claim actions explain invalid RPC configuration and recover after correction (${width}px)`, async ({
+    page
+  }) => {
+    await page.setViewportSize({ width, height: 900 })
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await installInjectedWallet(page)
+    let invalidEndpointRequests = 0
+    await page.route(/^https:\/\/legacy-rpc[0-9]*\.example\//, async (route) => {
+      invalidEndpointRequests += 1
+      await route.abort()
+    })
+    const errors: string[] = []
+    page.on('pageerror', (error) => errors.push(error.message))
+    await page.goto('/')
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
+    await expect(mint).toBeEnabled()
+    const checkbox = page.locator('tbody input[type="checkbox"]').first()
+    await checkbox.click()
+    await expect(page.getByText('1 VMUs selected')).toBeVisible()
+    const stored = JSON.stringify({
+      eth: Array.from({ length: 17 }, (_, index) => `https://legacy-rpc${index}.example/`)
+    })
+    await page.evaluate((value) => localStorage.setItem('sm.customRpc', value), stored)
+    await page.locator('.paste-input').fill(TX_HASH)
+    await page.getByRole('button', { name: 'Track', exact: true }).click()
+    const reason = page.locator('.action-bar .blocked-reason')
+    await expect(reason).toHaveText(
+      'Blocked: invalid Ethereum RPC configuration. Open RPC settings to correct it.'
+    )
+    await expect(checkbox).toBeChecked()
+    const claim = page.getByRole('button', { name: 'Claim only', exact: true })
+    const remint = page.getByRole('button', { name: 'Claim & Re-Mint (100d)', exact: true })
+    await expect(claim).toBeDisabled()
+    await expect(remint).toBeDisabled()
+    await expect(mint).toBeDisabled()
+    expect(await page.evaluate(() => localStorage.getItem('sm.customRpc'))).toBe(stored)
+    expect(invalidEndpointRequests).toBe(0)
+    await captureQaScreenshot(page, `selected-rpc-config-${width}`)
+
+    await page.getByRole('button', { name: 'RPC', exact: true }).click()
+    await page.locator('textarea').fill('https://ethereum.publicnode.com/')
+    await page.getByRole('button', { name: 'Save', exact: true }).click()
+    await expect(mint).toBeEnabled()
+    await expect(checkbox).not.toBeChecked()
+    await checkbox.click()
+    await expect(claim).toBeEnabled()
+    await expect(remint).toBeEnabled()
+    await expect(reason).toHaveCount(0)
+    expect(invalidEndpointRequests).toBe(0)
+    expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+      sendAttempts: 0,
+      successfulBroadcasts: 0
+    })
+    expect(errors).toEqual([])
+  })
+}
+
+test('marking an unknown transaction dropped explains storage failure without clearing its gate', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page)
+  const errors: string[] = []
+  page.on('pageerror', (error) => errors.push(error.message))
+  await page.goto('/')
+  const original = await page.evaluate(
+    ({ wallet, hash }) => {
+      const record = {
+        id: 'manual-drop-fixture',
+        chain: 'eth',
+        wallet,
+        op: 'CLAIM',
+        ids: [1],
+        count: 1,
+        term: 0,
+        txHash: hash,
+        nonce: null,
+        phase: 'broadcast',
+        submittedAt: Date.now(),
+        updatedAt: Date.now(),
+        origin: 'local'
+      }
+      const raw = JSON.stringify({ recordId: record.id, updatedAt: record.updatedAt, record })
+      localStorage.setItem('sm.pendingOps.event.manual-drop-fixture', raw)
+      return raw
+    },
+    { wallet: ACCOUNT_A, hash: TX_HASH }
+  )
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  const drop = page.getByRole('button', { name: 'Mark dropped', exact: true })
+  const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
+  await expect(drop).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Recheck', exact: true })).toBeEnabled()
+  await expect(mint).toBeDisabled()
+  page.once('dialog', (dialog) => dialog.dismiss())
+  await drop.click()
+  expect(
+    await page.evaluate(() => localStorage.getItem('sm.pendingOps.event.manual-drop-fixture'))
+  ).toBe(original)
+  await expect(mint).toBeDisabled()
+
+  await page.evaluate(() => {
+    const set = Storage.prototype.setItem
+    Storage.prototype.setItem = function (key, value) {
+      if (this === localStorage && key.startsWith('sm.pendingOps.event.'))
+        throw new DOMException('Offline storage write fixture', 'QuotaExceededError')
+      return set.call(this, key, value)
+    }
+    window.__restoreStorage = () => {
+      Storage.prototype.setItem = set
+    }
+  })
+  page.once('dialog', (dialog) => dialog.accept())
+  await drop.click()
+  await expect(page.locator('.warn-card')).toContainText(
+    'Local transaction storage is unavailable or damaged.'
+  )
+  await expect(page.locator('.warn-card')).toContainText('Open transaction storage recovery.')
+  await expect(page.locator('.warn-card')).toContainText('Do not clear site data or resend')
+  await expect(page.locator('.warn-card')).not.toContainText('PENDING_STORAGE_WRITE_FAILED')
+  expect(
+    await page.evaluate(() => localStorage.getItem('sm.pendingOps.event.manual-drop-fixture'))
+  ).toBe(original)
+  await expect(mint).toBeDisabled()
+  await expect(drop).toBeVisible()
+  await captureQaScreenshot(page, 'manual-drop-storage-failure')
+
+  await page.evaluate(() => window.__restoreStorage?.())
+  page.once('dialog', (dialog) => dialog.accept())
+  await drop.click()
+  await expect(mint).toBeEnabled()
+  await expect(page.locator('.warn-card')).toHaveCount(0)
+  await expect(drop).toHaveCount(0)
+  const dropped = await page.evaluate(() =>
+    Object.keys(localStorage)
+      .filter((key) => key.startsWith('sm.pendingOps.event.'))
+      .map((key) => JSON.parse(localStorage.getItem(key)!).record)
+      .filter((record) => record?.id === 'manual-drop-fixture' && record.phase === 'dropped')
+  )
+  expect(dropped).toHaveLength(1)
+  expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+    sendAttempts: 0,
+    successfulBroadcasts: 0
+  })
+  expect(errors).toEqual([])
+})
+
+test('prepared signing stays blocked if a shared pending check fails during a trailing retry', async ({
+  page
+}) => {
+  await page.clock.install()
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page)
+  await page.goto('/')
+  // Freeze before wallet connection starts the idle poll; host delays cannot age its deadline.
+  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1_000))
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await expectEnabledWithClock(page, page.getByRole('button', { name: 'Confirm Mint' }))
+  await page.getByRole('button', { name: 'Confirm Mint' }).click()
+  await expect
+    .poll(async () => {
+      await page.clock.runFor(50)
+      return page.getByRole('button', { name: 'Open MetaMask & Sign' }).isVisible()
+    })
+    .toBe(true)
+  await page.evaluate(() => {
+    const provider = (
+      window as unknown as {
+        ethereum: { request(args: { method: string; params?: unknown[] }): Promise<unknown> }
+      }
+    ).ethereum
+    const original = provider.request.bind(provider)
+    let reject!: (error: Error) => void
+    let release!: () => void
+    const first = new Promise<unknown>((_resolve, fail) => {
+      reject = fail
+    })
+    const retry = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    window.__pendingCheckGate = {
+      reads: 0,
+      reject: () => reject(new Error('Pending check offline fixture')),
+      release: () => release()
+    }
+    provider.request = async (args) => {
+      if (args.method === 'eth_getTransactionCount') {
+        // Require the polling helper to handle delayed dispatch on the paused clock.
+        await new Promise((resolve) => setTimeout(resolve, 600))
+        window.__pendingCheckGate.reads += 1
+        if (window.__pendingCheckGate.reads <= 2) return first
+        await retry
+      }
+      return original(args)
+    }
+  })
+  await page.clock.runFor(30_001)
+  await expectPendingNonceReads(page, 2)
+  await page.getByRole('button', { name: 'Open MetaMask & Sign' }).click()
+  await page.evaluate(() => window.__pendingCheckGate.reject())
+  await expectPendingNonceReads(page, 4)
+  await expect(page.locator('.modal-body .err-text')).toContainText('Pending check offline fixture')
+  expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+    sendAttempts: 0,
+    successfulBroadcasts: 0
+  })
+  await page.evaluate(() => window.__pendingCheckGate.release())
+  await page.getByRole('button', { name: 'Close', exact: true }).click()
+  await expect
+    .poll(async () => {
+      await page.clock.runFor(50)
+      return page.getByRole('button', { name: 'Confirm Mint' }).isEnabled()
+    })
+    .toBe(true)
+  expect(await page.evaluate(() => window.__pendingCheckGate.reads)).toBe(4)
+  expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+    sendAttempts: 0,
+    successfulBroadcasts: 0
+  })
+})
+
+for (const kind of ['wallet', 'chain'] as const) {
+  test(`pending polling continues after a synchronous ${kind} round trip`, async ({ page }) => {
+    await page.clock.install()
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await installInjectedWallet(page)
+    await page.goto('/')
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
+    await page.evaluate(
+      ({ kind, account }) => {
+        if (kind === 'wallet') {
+          window.__walletMock.emitAccounts([])
+          window.__walletMock.emitAccounts([account])
+        } else {
+          window.__walletMock.emitChain('0x89')
+          window.__walletMock.emitChain('0x1')
+        }
+      },
+      { kind, account: ACCOUNT_A }
+    )
+    await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
+    const reads = await page.evaluate(() => window.__walletMock.nonceReadCount())
+    await page.clock.runFor(30_001)
+    await expect
+      .poll(() => page.evaluate(() => window.__walletMock.nonceReadCount()))
+      .toBeGreaterThan(reads)
+    const nextReads = await page.evaluate(() => window.__walletMock.nonceReadCount())
+    await page.clock.runFor(30_001)
+    await expect
+      .poll(() => page.evaluate(() => window.__walletMock.nonceReadCount()))
+      .toBeGreaterThan(nextReads)
+  })
+}
 
 test('an account change during the initial pending check cancels the requested operation', async ({
   page
@@ -779,11 +1344,18 @@ test('a stalled initial wallet read times out and Connect Wallet can recover', a
   await emulateDesktopGoogleChrome(page)
   await mockSameOriginRpc(page)
   await installInjectedWallet(page, { initiallyStalled: ['eth_accounts'] })
+  const errors: string[] = []
+  page.on('pageerror', (error) => errors.push(error.message))
   await page.clock.install()
   await page.goto('/')
   await expect(page.getByRole('heading', { name: 'XENTurbo XEN Miner' })).toBeVisible()
   await page.clock.runFor(15_100)
-  await expect(page.locator('.connect-err')).toContainText('READ_TIMEOUT')
+  await expect(page.locator('.connect-err')).toContainText('Wallet connection read timed out.')
+  await expect(page.locator('.connect-err')).toContainText(
+    'Initial wallet accounts exceeded 15000 ms.'
+  )
+  await expect(page.locator('.connect-err')).not.toContainText('READ_TIMEOUT')
+  await captureQaScreenshot(page, 'wallet-init-timeout-detail')
 
   await page.evaluate(() => window.__walletMock.setStalled('eth_accounts', false))
   await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
@@ -793,6 +1365,7 @@ test('a stalled initial wallet read times out and Connect Wallet can recover', a
     sendAttempts: 0,
     successfulBroadcasts: 0
   })
+  expect(errors).toEqual([])
   await captureQaScreenshot(page, 'wallet-init-recovered')
 })
 
@@ -1033,6 +1606,114 @@ for (const operation of [
   })
 }
 
+test('legacy RPC configuration errors explain limits and recover only after explicit reset', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await page.addInitScript(() =>
+    localStorage.setItem(
+      'sm.customRpc',
+      JSON.stringify({ eth: Array.from({ length: 17 }, (_, id) => `https://rpc${id}.example/`) })
+    )
+  )
+  await page.goto('/')
+  const banner = page.locator('.rpc-health-banner')
+  await expect(banner).toContainText('at most 16 RPC endpoints')
+  await expect(banner).not.toContainText('Check internet access')
+  expect(
+    await page.evaluate(() => JSON.parse(localStorage.getItem('sm.customRpc')!).eth.length)
+  ).toBe(17)
+  await captureQaScreenshot(page, 'rpc-config-explained')
+  await page.getByRole('button', { name: 'RPC', exact: true }).click()
+  await page.getByRole('button', { name: 'Reset to default', exact: true }).click()
+  await expect(banner).toHaveCount(0)
+  expect(
+    await page.evaluate(() => JSON.parse(localStorage.getItem('sm.customRpc')!).eth)
+  ).toBeUndefined()
+})
+
+test('a failed first pending check on a new wallet stays blocked until a successful recheck', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page)
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
+  await expect(mint).toBeEnabled()
+  await page.evaluate((account) => {
+    window.__walletMock.setRejected('eth_getTransactionCount', true)
+    window.__walletMock.emitAccounts([account])
+  }, ACCOUNT_B)
+  await expect(
+    page
+      .getByText('Blocked: pending transaction check failed. Recheck before submitting.', {
+        exact: false
+      })
+      .first()
+  ).toBeVisible()
+  await expect(mint).toBeDisabled()
+  expect((await page.evaluate(() => window.__walletMock.stats())).sendAttempts).toBe(0)
+  await captureQaScreenshot(page, 'pending-check-blocked')
+  await page.evaluate(() => window.__walletMock.setRejected('eth_getTransactionCount', false))
+  await page.getByRole('button', { name: 'Recheck', exact: true }).click()
+  await expect(mint).toBeEnabled()
+})
+
+test('a late wallet hash restores a broadcast lock after the UI timeout', async ({ page }) => {
+  await page.clock.install()
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page, { successfulSend: true })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
+  await page.locator('tbody input[type="checkbox"]').first().check()
+  await page.getByRole('button', { name: 'Claim only', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Open MetaMask & Sign' })).toBeVisible()
+  await page.evaluate(() => {
+    window.__walletMock.setSendDelay(130_000)
+    window.__walletMock.setRejected('eth_getTransactionReceipt', true)
+  })
+  await page.getByRole('button', { name: 'Open MetaMask & Sign' }).click()
+  await expect.poll(() => page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(1)
+  await page.clock.fastForward(120_100)
+  await expect(
+    page.getByText(/MetaMask did not return a result within 2 minutes/).first()
+  ).toBeVisible()
+  await page.clock.fastForward(10_000)
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          JSON.parse(localStorage.getItem('sm.vmuLocks') ?? '[]').filter(
+            (lock: { txHash?: string }) => !!lock.txHash
+          ).length
+      )
+    )
+    .toBe(1)
+  expect(
+    await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks') ?? '[]')[0])
+  ).toMatchObject({ ids: [1], txHash: TX_HASH })
+  await expect(page.getByText('No VMUs in this category.', { exact: true })).toBeVisible()
+  expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+    sendAttempts: 1,
+    successfulBroadcasts: 1
+  })
+  await captureQaScreenshot(page, 'late-hash-lock-restored')
+  await page.getByRole('button', { name: 'Close', exact: true }).click()
+  expect(
+    await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks') ?? '[]').length)
+  ).toBe(1)
+  await page.evaluate(() => window.__walletMock.setRejected('eth_getTransactionReceipt', false))
+  await page.getByRole('button', { name: 'Recheck', exact: true }).click()
+  await expect
+    .poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks') ?? '[]').length))
+    .toBe(0)
+})
+
 test('two tabs serialize wallet sends with a shared Web Lock', async ({ page, context }) => {
   const second = await context.newPage()
   for (const candidate of [page, second]) {
@@ -1055,5 +1736,509 @@ test('two tabs serialize wallet sends with a shared Web Lock', async ({ page, co
 
   await expect(page.getByText('Transaction rejected', { exact: true })).toBeVisible()
   await expect.poll(() => second.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(1)
+  await second.close()
+})
+
+test('a timely hash survives journal failure with a clear submitted state and recovery link', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page, { successfulSend: true })
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
+  await page.locator('tbody input[type="checkbox"]').first().check()
+  await page.getByRole('button', { name: 'Claim only', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Open MetaMask & Sign' })).toBeVisible()
+  await page.evaluate(() => {
+    const set = Storage.prototype.setItem
+    window.__restoreStorage = () => {
+      Storage.prototype.setItem = set
+    }
+    Storage.prototype.setItem = function (key, value) {
+      if (key.startsWith('sm.pendingOps.event.') && JSON.parse(value).record?.phase === 'broadcast')
+        throw new DOMException('Offline fixture journal full', 'QuotaExceededError')
+      return set.call(this, key, value)
+    }
+  })
+  await page.getByRole('button', { name: 'Open MetaMask & Sign' }).click()
+  const modal = page.locator('.modal-body').filter({ has: page.getByTestId('tx-log') })
+  await expect(modal.locator('.err-text')).toContainText('Transaction submitted')
+  for (const message of ['MetaMask request opened', 'Transaction submitted:']) {
+    await expect(
+      modal.getByTestId('tx-log-entry').filter({ hasText: message }).locator('.tx-log-marker')
+    ).toHaveText('OK')
+  }
+  await expect(modal.locator('.err-text')).toContainText('Do not resend')
+  await expect(modal.locator('.steps li').nth(1).locator('.step-icon')).toHaveText('OK')
+  await expect(modal.locator('.step-icon.run')).toHaveCount(0)
+  await expect(modal.getByRole('link', { name: 'View on explorer' })).toHaveAttribute(
+    'href',
+    `https://etherscan.io/tx/${TX_HASH}`
+  )
+  await expect(modal.getByRole('button', { name: 'Close', exact: true })).toBeVisible()
+  expect(
+    await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks') ?? '[]')[0])
+  ).toMatchObject({ txHash: TX_HASH })
+  expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+    sendAttempts: 1,
+    successfulBroadcasts: 1
+  })
+  await captureQaScreenshot(page, 'broadcast-storage-recovery')
+  await page.evaluate(() => {
+    window.__restoreStorage?.()
+    window.__walletMock.setMinedReceipt(false)
+  })
+  await modal.getByRole('button', { name: 'Close', exact: true }).click()
+  await page.getByRole('button', { name: 'Recheck', exact: true }).click()
+  await expect(page.getByText(/Blocked: 1 unresolved transaction/).first()).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeDisabled()
+  expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(1)
+})
+
+test('storage recovery exports original evidence and repairs only wallet-settled damage', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page)
+  await page.goto('/')
+  await page.evaluate(
+    ({ wallet, hash }) => {
+      localStorage.setItem(
+        'sm.vmuLocks',
+        JSON.stringify([
+          { chain: 'eth', wallet, txHash: hash, ids: ['1'], batch: 'corrupt', lockedAt: Date.now() }
+        ])
+      )
+      window.__walletMock.setMinedReceipt(true)
+    },
+    { wallet: ACCOUNT_A, hash: TX_HASH }
+  )
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await page.getByRole('button', { name: 'Transaction storage recovery', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Transaction storage recovery' })
+  await expect(dialog).toContainText('Damaged records: 1')
+  await expect(dialog.getByRole('button', { name: 'Verify and repair' })).toBeDisabled()
+  const download = page.waitForEvent('download')
+  await dialog.getByRole('button', { name: 'Export backup' }).click()
+  expect((await download).suggestedFilename()).toMatch(/^xenturbo-transaction-backup-/)
+  await dialog.getByRole('checkbox').check()
+  await captureQaScreenshot(page, 'storage-recovery-desktop')
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect(dialog).toBeVisible()
+  const bounds = await dialog.boundingBox()
+  expect(bounds!.width).toBeLessThanOrEqual(390)
+  expect(bounds!.x).toBeGreaterThanOrEqual(0)
+  await captureQaScreenshot(page, 'storage-recovery-narrow')
+  await dialog.getByRole('button', { name: 'Verify and repair' }).click()
+  await expect(dialog.getByRole('status')).toContainText(
+    '1 settled record(s) archived and repaired. 0 record(s) remain blocked.'
+  )
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks')!))).toEqual([])
+  expect(
+    await page.evaluate(
+      () =>
+        Object.keys(localStorage).filter((key) => key.startsWith('sm.storageRecovery.backup.'))
+          .length
+    )
+  ).toBe(1)
+  await dialog.getByRole('button', { name: 'Close recovery' }).click()
+  await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
+  expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+})
+
+test('storage recovery stops after a durable backup if transaction evidence changes', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page)
+  const errors: string[] = []
+  page.on('pageerror', (error) => errors.push(error.message))
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+  const original = await page.evaluate(
+    ({ wallet, hash }) => {
+      const raw = JSON.stringify([
+        { chain: 'eth', wallet, txHash: hash, batch: 'damaged', ids: ['1'] }
+      ])
+      localStorage.setItem('sm.vmuLocks', raw)
+      window.__walletMock.setMinedReceipt(true)
+      const set = Storage.prototype.setItem
+      Storage.prototype.setItem = function (key, value) {
+        set.call(this, key, value)
+        if (key.startsWith('sm.storageRecovery.backup.')) {
+          set.call(this, 'sm.pendingOps.event.concurrent', '{unreadable-concurrent-evidence')
+        }
+      }
+      return raw
+    },
+    { wallet: ACCOUNT_A, hash: TX_HASH }
+  )
+  await page.getByRole('button', { name: 'Transaction storage recovery', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Transaction storage recovery' })
+  const download = page.waitForEvent('download')
+  await dialog.getByRole('button', { name: 'Export backup' }).click()
+  await download
+  await dialog.getByRole('checkbox').check()
+  await dialog.getByRole('button', { name: 'Verify and repair' }).click()
+  await expect(dialog.getByRole('status')).toContainText('Transaction records changed')
+  await expect(dialog.getByRole('status')).not.toContainText('archived and repaired')
+  const stored = await page.evaluate(() => {
+    const keys = Object.keys(localStorage).filter((key) =>
+      key.startsWith('sm.storageRecovery.backup.')
+    )
+    return {
+      locks: localStorage.getItem('sm.vmuLocks'),
+      concurrent: localStorage.getItem('sm.pendingOps.event.concurrent'),
+      backups: keys.map((key) => JSON.parse(localStorage.getItem(key)!))
+    }
+  })
+  expect(stored.locks).toBe(original)
+  expect(stored.concurrent).toBe('{unreadable-concurrent-evidence')
+  expect(stored.backups).toHaveLength(1)
+  expect(stored.backups[0].entries).toContainEqual({ key: 'sm.vmuLocks', raw: original })
+  await captureQaScreenshot(page, 'recovery-post-backup-change')
+  await dialog.getByRole('button', { name: 'Close recovery' }).click()
+  await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeDisabled()
+  expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+  expect(errors).toEqual([])
+})
+
+test('closing a repaired dialog stays blocked until post-recovery wallet reconciliation succeeds', async ({
+  page
+}) => {
+  await page.clock.install()
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page)
+  const errors: string[] = []
+  page.on('pageerror', (error) => errors.push(error.message))
+  await page.goto('/')
+  // Start wallet reconciliation on a paused clock, before any idle poll can accumulate host time.
+  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1_000))
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
+  await expectEnabledWithClock(page, mint)
+  await page.evaluate(
+    ({ wallet, hash }) => {
+      localStorage.setItem(
+        'sm.vmuLocks',
+        JSON.stringify([{ chain: 'eth', wallet, txHash: hash, batch: 'damaged', ids: ['1'] }])
+      )
+      window.__walletMock.setMinedReceipt(true)
+      const provider = (
+        window as unknown as {
+          ethereum: { request: (args: { method: string }) => Promise<unknown> }
+        }
+      ).ethereum
+      const request = provider.request.bind(provider)
+      let reject!: (error: Error) => void
+      let release!: (value: string) => void
+      let blocked = true
+      const gate = new Promise<string>((resolve, fail) => {
+        release = resolve
+        reject = fail
+      })
+      window.__pendingCheckGate = {
+        reads: 0,
+        reject: () => reject(new Error('Recovery reconciliation offline fixture')),
+        release: () => {
+          blocked = false
+          release('0x0')
+        }
+      }
+      provider.request = async (args) => {
+        if (args.method === 'eth_getTransactionCount') {
+          window.__pendingCheckGate.reads += 1
+          if (blocked) return gate
+        }
+        return request(args)
+      }
+    },
+    { wallet: ACCOUNT_A, hash: TX_HASH }
+  )
+  await page.getByRole('button', { name: 'Transaction storage recovery', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Transaction storage recovery' })
+  const download = page.waitForEvent('download')
+  await dialog.getByRole('button', { name: 'Export backup' }).click()
+  await download
+  await dialog.getByRole('checkbox').check()
+  await dialog.getByRole('button', { name: 'Verify and repair' }).click()
+  await expect(dialog.getByRole('status')).toContainText(
+    '1 settled record(s) archived and repaired. 0 record(s) remain blocked.'
+  )
+  await expectPendingNonceReads(page, 2)
+  await dialog.getByRole('button', { name: 'Close recovery' }).click()
+  await expect(mint).toBeDisabled()
+  await expect(
+    page.getByText('Blocked: verifying pending transactions for this account and network.').first()
+  ).toBeVisible()
+  await page.evaluate(() => window.__pendingCheckGate.reject())
+  await expect(
+    page.getByText('Blocked: pending transaction check failed. Recheck before submitting.').first()
+  ).toBeVisible()
+  await expect(mint).toBeDisabled()
+  // Even an idle poll must keep failing until this fixture explicitly restores the wallet.
+  await page.clock.runFor(30_001)
+  await expectPendingNonceReads(page, 4)
+  await expect(mint).toBeDisabled()
+  await expect(
+    page.getByText('Blocked: pending transaction check failed. Recheck before submitting.').first()
+  ).toBeVisible()
+  await page.evaluate(() => window.__pendingCheckGate.release())
+  await page.getByRole('button', { name: 'Recheck', exact: true }).click()
+  await expect
+    .poll(async () => {
+      await page.clock.runFor(50)
+      return mint.isEnabled()
+    })
+    .toBe(true)
+  expect(await page.evaluate(() => window.__pendingCheckGate.reads)).toBe(6)
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks')!))).toEqual([])
+  expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+  expect(errors).toEqual([])
+})
+
+for (const kind of ['journal', 'lock without hash'] as const) {
+  test(`unidentifiable ${kind} corruption stays blocked after recovery and reload`, async ({
+    page
+  }) => {
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await installInjectedWallet(page)
+    const errors: string[] = []
+    page.on('pageerror', (error) => errors.push(error.message))
+    await page.goto('/')
+    const key = kind === 'journal' ? 'sm.pendingOps.event.broken' : 'sm.vmuLocks'
+    const original =
+      kind === 'journal'
+        ? '{'
+        : JSON.stringify([{ chain: 'eth', wallet: ACCOUNT_A, batch: 'damaged', ids: ['1'] }])
+    await page.evaluate(({ key, original }) => localStorage.setItem(key, original), {
+      key,
+      original
+    })
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    await page.getByRole('button', { name: 'Transaction storage recovery', exact: true }).click()
+    const dialog = page.getByRole('dialog', { name: 'Transaction storage recovery' })
+    await expect(dialog).toContainText('without a transaction hash cannot be verified here')
+    await expect(dialog).toContainText('mining stays blocked for this site in this browser profile')
+    const download = page.waitForEvent('download')
+    await dialog.getByRole('button', { name: 'Export backup' }).click()
+    await download
+    await dialog.getByRole('checkbox').check()
+    await dialog.getByRole('button', { name: 'Verify and repair' }).click()
+    await expect(dialog.getByRole('status')).toContainText(
+      '0 settled record(s) archived and repaired. 1 record(s) remain blocked.'
+    )
+    await captureQaScreenshot(
+      page,
+      kind === 'journal' ? 'storage-recovery-blocked' : 'storage-recovery-no-hash'
+    )
+    await dialog.getByRole('button', { name: 'Close recovery' }).click()
+    await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeDisabled()
+    await page.reload()
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeDisabled()
+    expect(await page.evaluate((key) => localStorage.getItem(key), key)).toBe(original)
+    expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+    expect(errors).toEqual([])
+  })
+}
+
+for (const change of ['disconnect', 'unsupported-chain', 'same-account'] as const) {
+  test(`recovery dialog releases its UI gate after ${change}`, async ({ page }) => {
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await installInjectedWallet(page)
+    const errors: string[] = []
+    page.on('pageerror', (error) => errors.push(error.message))
+    await page.goto('/')
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
+    await expect(mint).toBeEnabled()
+    await page.getByRole('button', { name: 'Transaction storage recovery', exact: true }).click()
+    await expect(mint).toBeDisabled()
+    await page.evaluate(
+      ({ kind, account }) => {
+        if (kind === 'disconnect') window.__walletMock.emitAccounts([])
+        else if (kind === 'same-account') window.__walletMock.emitAccounts([account])
+        else window.__walletMock.emitChain('0x3e7')
+      },
+      { kind: change, account: ACCOUNT_A }
+    )
+    await expect(page.getByRole('dialog', { name: 'Transaction storage recovery' })).toBeHidden()
+    await page.evaluate(
+      ({ kind, account }) => {
+        if (kind === 'disconnect') window.__walletMock.emitAccounts([account])
+        else if (kind === 'unsupported-chain') window.__walletMock.emitChain('0x1')
+      },
+      { kind: change, account: ACCOUNT_A }
+    )
+    await expect(mint).toBeEnabled()
+    expect(errors).toEqual([])
+    expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+    await captureQaScreenshot(page, `recovery-${change}-restored`)
+  })
+}
+
+test('recovery presents a friendly wallet timeout and retains damaged evidence', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page)
+  const errors: string[] = []
+  page.on('pageerror', (error) => errors.push(error.message))
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await page.evaluate(
+    ({ wallet, hash }) => {
+      localStorage.setItem(
+        'sm.vmuLocks',
+        JSON.stringify([
+          { chain: 'eth', wallet, txHash: hash, ids: ['1'], batch: 'damaged', lockedAt: Date.now() }
+        ])
+      )
+      window.__walletMock.setStalled('eth_getTransactionReceipt', true)
+    },
+    { wallet: ACCOUNT_A, hash: TX_HASH }
+  )
+  await page.getByRole('button', { name: 'Transaction storage recovery', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Transaction storage recovery' })
+  await expect(dialog).toContainText('Invalid record structure')
+  const download = page.waitForEvent('download')
+  await dialog.getByRole('button', { name: 'Export backup' }).click()
+  await download
+  await expect(dialog.getByRole('button', { name: 'Verify and repair' })).toBeDisabled()
+  await dialog.getByRole('checkbox').check()
+  await dialog.getByRole('button', { name: 'Verify and repair' }).click()
+  await expect(dialog.getByRole('status')).toContainText('Wallet or network read timed out', {
+    timeout: 17_000
+  })
+  await expect(dialog.getByRole('status')).toContainText(
+    'Wallet eth_getTransactionReceipt exceeded 15000 ms.'
+  )
+  await expect(dialog.getByRole('status')).not.toContainText('READ_TIMEOUT')
+  await captureQaScreenshot(page, 'recovery-error-desktop')
+  await page.setViewportSize({ width: 390, height: 844 })
+  const bounds = await dialog.boundingBox()
+  expect(bounds!.x).toBeGreaterThanOrEqual(0)
+  expect(bounds!.width).toBeLessThanOrEqual(390)
+  await captureQaScreenshot(page, 'recovery-error-narrow')
+  await dialog.getByRole('button', { name: 'Close recovery' }).click()
+  await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeDisabled()
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks')!).length)).toBe(1)
+  expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+  expect(errors).toEqual([])
+})
+
+for (const interaction of ['close button', 'backdrop'] as const) {
+  test(`in-flight recovery can close through the ${interaction} without clearing damaged evidence`, async ({
+    page
+  }) => {
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await installInjectedWallet(page)
+    const errors: string[] = []
+    page.on('pageerror', (error) => errors.push(error.message))
+    await page.goto('/')
+    const original = JSON.stringify([
+      { chain: 'eth', wallet: ACCOUNT_A, txHash: TX_HASH, batch: 'damaged', ids: ['1'] }
+    ])
+    await page.evaluate((original) => {
+      localStorage.setItem('sm.vmuLocks', original)
+      window.__walletMock.setMinedReceipt(true)
+      const provider = (
+        window as unknown as {
+          ethereum: { request: (args: { method: string }) => Promise<unknown> }
+        }
+      ).ethereum
+      const request = provider.request.bind(provider)
+      let release!: () => void
+      window.__recoveryRead = { reads: 0, release: () => release() }
+      provider.request = async (args) => {
+        if (args.method === 'eth_getTransactionReceipt') {
+          window.__recoveryRead.reads += 1
+          await new Promise<void>((resolve) => {
+            release = resolve
+          })
+        }
+        return request(args)
+      }
+    }, original)
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    await page.getByRole('button', { name: 'Transaction storage recovery', exact: true }).click()
+    const dialog = page.getByRole('dialog', { name: 'Transaction storage recovery' })
+    const download = page.waitForEvent('download')
+    await dialog.getByRole('button', { name: 'Export backup' }).click()
+    await download
+    await dialog.getByRole('checkbox').check()
+    await dialog.getByRole('button', { name: 'Verify and repair' }).click()
+    await expect.poll(() => page.evaluate(() => window.__recoveryRead.reads)).toBe(1)
+    await dialog.locator('#recovery-title').click()
+    await expect(dialog).toBeVisible()
+    if (interaction === 'close button')
+      await dialog.getByRole('button', { name: 'Close recovery' }).click()
+    else await page.locator('.recovery-mask').click({ position: { x: 2, y: 2 } })
+    await expect(dialog).toBeHidden()
+    await page.evaluate(() => window.__recoveryRead.release())
+    await page.getByRole('button', { name: 'Recheck', exact: true }).click()
+    await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeDisabled()
+    expect(await page.evaluate(() => localStorage.getItem('sm.vmuLocks'))).toBe(original)
+    expect(
+      await page.evaluate(() =>
+        Object.keys(localStorage).some((key) => key.startsWith('sm.storageRecovery.backup.'))
+      )
+    ).toBe(false)
+    expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+    expect(errors).toEqual([])
+  })
+}
+
+test('simultaneous tab submissions produce only one broadcast while reconciliation is unresolved', async ({
+  page,
+  context
+}) => {
+  const second = await context.newPage()
+  for (const candidate of [page, second]) {
+    await emulateDesktopGoogleChrome(candidate)
+    await mockSameOriginRpc(candidate)
+    await installInjectedWallet(candidate, { successfulSend: true })
+    await candidate.goto('/')
+    await candidate.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    await candidate.getByRole('button', { name: 'Confirm Mint' }).click()
+    await expect(candidate.getByRole('button', { name: 'Open MetaMask & Sign' })).toBeVisible()
+    await candidate.evaluate(() => {
+      window.__walletMock.setSendDelay(500)
+      window.__walletMock.setRejected('eth_getTransactionReceipt', true)
+    })
+  }
+  await Promise.all(
+    [page, second].map((candidate) =>
+      candidate.getByRole('button', { name: 'Open MetaMask & Sign' }).click()
+    )
+  )
+  await expect
+    .poll(async () => {
+      const errors = await Promise.all(
+        [page, second].map((candidate) =>
+          candidate.locator('.modal-body .err-text').allTextContents()
+        )
+      )
+      return errors
+        .flat()
+        .some((error) => error.includes('previous local transaction record is unresolved'))
+    })
+    .toBe(true)
+  const counts = await Promise.all(
+    [page, second].map((candidate) => candidate.evaluate(() => window.__walletMock.stats()))
+  )
+  expect(counts.reduce((total, stats) => total + stats.sendAttempts, 0)).toBe(1)
+  expect(counts.reduce((total, stats) => total + stats.successfulBroadcasts, 0)).toBe(1)
   await second.close()
 })

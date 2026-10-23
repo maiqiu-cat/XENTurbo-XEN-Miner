@@ -10,6 +10,7 @@ import {
   abortPrepared,
   resumePendingLocks,
   clearAbandonedSoftLocks,
+  normalizeError,
   type OpType,
   type TxStepState,
   type PreparedOp
@@ -22,8 +23,10 @@ import RpcSettings from '@/components/RpcSettings.vue'
 import TxModal from '@/components/TxModal.vue'
 import MintList from '@/components/MintList.vue'
 import PendingOpsPanel from '@/components/PendingOpsPanel.vue'
+import StorageRecovery from '@/components/StorageRecovery.vue'
 import { CONTRACTS } from '@/config/contracts'
 import { APP_VERSION } from '@/config/version'
+import { rpcConfigurationMessage } from '@/core/rpc'
 
 const wallet = useWalletStore()
 const store = useVmuStore()
@@ -39,6 +42,9 @@ const { state: rpcHealth, unavailable: rpcUnavailable } = useRpcHealth(() => rea
 
 const rpcHealthMessage = computed(() => {
   const state = rpcHealth.value
+  if (state.error && state.errorKind === 'configuration') {
+    return rpcConfigurationMessage(state.error)
+  }
   if (state.error || (state.checkedAt !== null && state.healthyUrls.length === 0)) {
     return `No usable ${CHAINS[state.chain].name} RPC endpoints (${state.healthyUrls.length}/${state.totalUrls}). Your RPC list was not changed. Check internet access, DNS, firewall, and proxy/VPN settings, then recheck; or use the RPC button to change endpoints. Chain reads and transactions are blocked until a recheck succeeds.`
   }
@@ -79,10 +85,12 @@ async function onChainSelect(ev: Event) {
 }
 const {
   hasPending,
+  ready: pendingReady,
   pendingCount,
   localUnresolvedCount,
   ops: pendingOps,
   checking: pendingChecking,
+  queued: pendingQueued,
   error: pendingError,
   check: checkPending,
   trackHash: trackPendingHash,
@@ -123,6 +131,13 @@ const {
 )
 
 const pendingBlockedReason = computed(() => {
+  if (recoveryOpen.value)
+    return 'Blocked: Transaction storage recovery is open. Close it before starting another operation.'
+  if (!pendingReady.value) {
+    return pendingError.value
+      ? 'Blocked: pending transaction check failed. Recheck before submitting.'
+      : 'Blocked: verifying pending transactions for this account and network.'
+  }
   if (!hasPending.value) return null
   if (pendingCount.value > 0) {
     return `Blocked: ${pendingCount.value} pending tx on-chain`
@@ -136,7 +151,7 @@ async function onTrackHash(payload: { hash: string; seenText?: string }) {
   try {
     await trackPendingHash(payload.hash, payload.seenText)
   } catch (err: any) {
-    trackError.value = err?.message || String(err)
+    trackError.value = normalizeError(err)
   }
 }
 
@@ -150,7 +165,7 @@ async function onMarkPendingDropped(id: string) {
   try {
     await markPendingDropped(id)
   } catch (err: any) {
-    trackError.value = err?.message || String(err)
+    trackError.value = normalizeError(err)
   }
 }
 
@@ -194,6 +209,7 @@ const txVisible = ref(false)
 const txState = ref<TxStepState | null>(null)
 const txTitle = ref('')
 const busy = ref(false)
+const recoveryOpen = ref(false)
 const waitingWallet = computed(
   () =>
     txState.value?.walletPrompted === true &&
@@ -209,6 +225,8 @@ const canOperate = computed(
     wallet.contractWalletChecked &&
     !rpcUnavailable.value &&
     !busy.value &&
+    !recoveryOpen.value &&
+    pendingReady.value &&
     !hasPending.value
 )
 
@@ -216,6 +234,7 @@ let opSeq = 0
 const prepared = ref<PreparedOp | null>(null)
 // Detach the old UI context, but preserve records for non-cancellable wallet sends.
 watch([() => wallet.address, () => wallet.chainKey, () => wallet.contextGen], () => {
+  recoveryOpen.value = false
   const walletRequestOpen = txState.value?.walletPrompted === true
   const broadcasted =
     Boolean(txState.value?.txHash) ||
@@ -258,7 +277,7 @@ async function operate(
     ]
   }
   // Fresh check right before starting — polling may be a few seconds stale.
-  const n = await checkPending()
+  const { count: n, error: checkError } = await checkPendingForSubmit()
   if (
     seq !== opSeq ||
     wallet.contextGen !== requestedContextGen ||
@@ -267,16 +286,18 @@ async function operate(
   ) {
     return
   }
-  if (pendingError?.value) {
+  if (checkError || !pendingReady.value || pendingError.value) {
     busy.value = false
+    const error =
+      checkError ??
+      pendingError.value ??
+      'Pending transaction check has not completed. Recheck before submitting.'
     txState.value = {
       estimate: 'error',
       send: 'wait',
       confirm: 'wait',
-      error: pendingError.value,
-      logs: [
-        { at: Date.now(), status: 'error', message: `Pending check failed: ${pendingError.value}` }
-      ]
+      error,
+      logs: [{ at: Date.now(), status: 'error', message: `Pending check failed: ${error}` }]
     }
     return
   }
@@ -286,7 +307,9 @@ async function operate(
       estimate: 'error',
       send: 'wait',
       confirm: 'wait',
-      error: `Blocked: ${n} pending tx on-chain. Wait, Speed up, or Cancel in MetaMask first.`
+      error:
+        pendingBlockedReason.value ??
+        `Blocked: ${n} pending tx on-chain. Wait, Speed up, or Cancel in MetaMask first.`
     }
     txVisible.value = true
     busy.value = false
@@ -321,15 +344,40 @@ async function operate(
   }
 }
 
+async function checkPendingForSubmit(): Promise<{ count: number; error: string | null }> {
+  let failure: string | null = null
+  let fail!: (count: number) => void
+  const failed = new Promise<number>((resolve) => {
+    fail = resolve
+  })
+  // A queued recheck may recover, but must not revive a click whose check already failed.
+  const stop = watch(
+    pendingError,
+    (message) => {
+      if (message) {
+        failure = message
+        fail(0)
+      }
+    },
+    { flush: 'sync' }
+  )
+  try {
+    const count = await Promise.race([checkPending(), failed])
+    return { count, error: failure }
+  } finally {
+    stop()
+  }
+}
+
 /** Phase 2: must run from a click so MetaMask gets a fresh user gesture. */
 async function signPrepared() {
   const prep = prepared.value
   if (!prep) return
   const seq = opSeq
   const requestedContextGen = wallet.contextGen
-  const n = await checkPending()
+  const { count: n, error: checkError } = await checkPendingForSubmit()
   if (seq !== opSeq || wallet.contextGen !== requestedContextGen || prepared.value !== prep) return
-  if (n > 0 || pendingError?.value) {
+  if (checkError || !pendingReady.value || n > 0 || pendingError.value) {
     abortPrepared(prep)
     prepared.value = null
     busy.value = false
@@ -339,7 +387,9 @@ async function signPrepared() {
       confirm: 'wait',
       readyToSign: false,
       error:
-        pendingError?.value ??
+        checkError ??
+        pendingError.value ??
+        pendingBlockedReason.value ??
         `A previous transaction is still pending (${n}). Wait for it in MetaMask, then retry.`
     }
     return
@@ -533,6 +583,21 @@ const explorerAddrUrl = computed(() => {
         @track="onTrackHash"
         @mark-dropped="onMarkPendingDropped"
       />
+      <p v-if="pendingBlockedReason" class="dim" role="status">
+        {{ pendingBlockedReason }} <span v-if="pendingError">{{ pendingError }}</span>
+      </p>
+      <p v-if="pendingQueued" class="dim" role="status">
+        A fresh pending check is queued behind the current check. Waiting for both checks to finish.
+      </p>
+      <StorageRecovery
+        v-if="activeChain && wallet.address"
+        :key="wallet.contextGen"
+        :chain="activeChain"
+        :wallet="wallet.address"
+        :disabled="busy"
+        @open="recoveryOpen = $event"
+        @changed="checkPending({ reverifyResults: true })"
+      />
       <p v-if="trackError" class="card warn-card">{{ trackError }}</p>
 
       <!-- operation tabs -->
@@ -661,10 +726,19 @@ const explorerAddrUrl = computed(() => {
 
       <!-- mint list -->
       <MintList
-        :busy="busy || hasPending || rpcUnavailable || !wallet.contractWalletChecked"
+        :busy="
+          busy ||
+          recoveryOpen ||
+          !pendingReady ||
+          hasPending ||
+          rpcUnavailable ||
+          !wallet.contractWalletChecked
+        "
         :blocked-reason="
           rpcUnavailable
-            ? `Blocked: no healthy ${CHAINS[readChain].name} RPC endpoint`
+            ? rpcHealth.errorKind === 'configuration'
+              ? `Blocked: invalid ${CHAINS[readChain].name} RPC configuration. Open RPC settings to correct it.`
+              : `Blocked: no healthy ${CHAINS[readChain].name} RPC endpoint`
             : !wallet.contractWalletChecked
               ? 'Blocked: wallet type is not verified'
               : pendingBlockedReason

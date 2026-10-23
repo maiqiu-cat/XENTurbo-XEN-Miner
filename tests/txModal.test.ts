@@ -1,8 +1,60 @@
 // @vitest-environment happy-dom
 
-import { mount } from '@vue/test-utils'
-import { describe, expect, it } from 'vitest'
+import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import PendingOpsPanel from '@/components/PendingOpsPanel.vue'
+import RpcSettings from '@/components/RpcSettings.vue'
 import TxModal from '@/components/TxModal.vue'
+import type { PendingOpView } from '@/core/pendingOps'
+import * as rpc from '@/core/rpc'
+
+enableAutoUnmount(afterEach)
+const restoreWindowFunctions: Array<() => void> = []
+
+afterEach(() => {
+  for (const restore of restoreWindowFunctions.splice(0)) restore()
+  vi.restoreAllMocks()
+})
+
+const dangerousDisplayTexts = [
+  ['script tag', '<script>window.alert("h07")</script>'],
+  [
+    'event handlers and navigation',
+    '<img src="data:," onerror="window.alert(\'h07\')"><a href="javascript:alert(1)">go</a>'
+  ],
+  [
+    'attribute breakout',
+    '"><svg onload="open(\'#h07\')"></svg><meta http-equiv="refresh" content="0;url=#h07">'
+  ],
+  ['prototype-like text', '__proto__']
+] as const
+
+function expectTextOnly(element: Element, text: string): void {
+  expect(element.textContent).toBe(text)
+  expect(element.childElementCount).toBe(0)
+}
+
+function observeDisplaySideEffects(): () => void {
+  const alert = vi.fn()
+  const open = vi.fn(() => null)
+  for (const [name, value] of [
+    ['alert', alert],
+    ['open', open]
+  ] as const) {
+    const original = Object.getOwnPropertyDescriptor(window, name)
+    Object.defineProperty(window, name, { configurable: true, value })
+    restoreWindowFunctions.push(() => {
+      if (original) Object.defineProperty(window, name, original)
+      else Reflect.deleteProperty(window, name)
+    })
+  }
+  const location = window.location.href
+  return () => {
+    expect(alert).not.toHaveBeenCalled()
+    expect(open).not.toHaveBeenCalled()
+    expect(window.location.href).toBe(location)
+  }
+}
 
 describe('transaction modal cancellation', () => {
   it('permits cancelling final send preflight before the wallet request opens', async () => {
@@ -95,5 +147,84 @@ describe('transaction activity log', () => {
     expect(entries[1].text()).toContain('Checking wallet network and pending transactions...')
     expect(entries[1].classes()).toContain('process')
     expect(wrapper.get('[data-testid="tx-log"]').attributes('aria-live')).toBe('polite')
+  })
+})
+
+describe('untrusted display text (H-07)', () => {
+  it.each(dangerousDisplayTexts)('renders %s literally in transaction text', (_label, text) => {
+    const expectNoSideEffects = observeDisplaySideEffects()
+    const wrapper = mount(TxModal, {
+      attachTo: document.body,
+      props: {
+        visible: true,
+        chain: 'eth',
+        title: text,
+        state: {
+          estimate: 'done',
+          send: 'error',
+          confirm: 'wait',
+          error: text,
+          logs: [{ at: Date.UTC(2026, 9, 22), status: 'error', message: text }]
+        }
+      }
+    })
+
+    expectTextOnly(wrapper.get('strong').element, text)
+    expectTextOnly(wrapper.get('.err-text').element, text)
+    expectTextOnly(wrapper.get('[data-testid="tx-log-entry"] span:last-child').element, text)
+    expect(wrapper.find('script, img, svg, meta, iframe, a').exists()).toBe(false)
+    expect(wrapper.emitted()).toEqual({})
+    expectNoSideEffects()
+  })
+
+  it.each(dangerousDisplayTexts)('renders %s literally in pending text', (_label, text) => {
+    const expectNoSideEffects = observeDisplaySideEffects()
+    const operation: PendingOpView = {
+      id: '__proto__',
+      chain: 'eth',
+      wallet: '0x0000000000000000000000000000000000000001',
+      op: 'CLAIM',
+      ids: [1],
+      count: 0,
+      term: 0,
+      txHash: '',
+      nonce: null,
+      phase: 'awaiting-wallet',
+      submittedAt: Date.UTC(2026, 9, 22),
+      updatedAt: Date.UTC(2026, 9, 22),
+      label: text,
+      detail: text,
+      explorerUrl: '#offline-fixture',
+      status: 'pending'
+    }
+    const wrapper = mount(PendingOpsPanel, {
+      attachTo: document.body,
+      props: { ops: [operation], pendingCount: 1, checking: false }
+    })
+
+    expectTextOnly(wrapper.get('.tag-warn').element, text)
+    expectTextOnly(wrapper.get('.detail').element, text)
+    expect(wrapper.find('script, img, svg, meta, iframe').exists()).toBe(false)
+    expect(wrapper.findAll('a')).toHaveLength(1)
+    expect(wrapper.get('a').attributes('href')).toBe('#offline-fixture')
+    expect(wrapper.emitted()).toEqual({})
+    expectNoSideEffects()
+  })
+
+  it.each(dangerousDisplayTexts)('renders %s literally in RPC errors', async (_label, text) => {
+    const expectNoSideEffects = observeDisplaySideEffects()
+    const validate = vi.spyOn(rpc, 'validateRpcEndpoint').mockRejectedValueOnce(new Error(text))
+    const wrapper = mount(RpcSettings, { attachTo: document.body, props: { chain: 'eth' } })
+
+    await wrapper.get('button').trigger('click')
+    await wrapper.get('textarea').setValue('https://offline.invalid/')
+    await wrapper.get('.btn-primary').trigger('click')
+    await flushPromises()
+
+    expect(validate).toHaveBeenCalledExactlyOnceWith('https://offline.invalid/', 1)
+    expectTextOnly(wrapper.get('.rpc-error').element, text)
+    expect(wrapper.find('script, img, svg, meta, iframe, a').exists()).toBe(false)
+    expect(wrapper.emitted('saved')).toBeUndefined()
+    expectNoSideEffects()
   })
 })

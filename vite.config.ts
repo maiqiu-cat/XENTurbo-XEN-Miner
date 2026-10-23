@@ -45,9 +45,8 @@ export default defineConfig({
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
       include: ['src/**/*.{ts,vue}', 'scripts/*.mjs'],
-      // verify-create2 is exercised as a child-process release gate, whose V8
-      // counters cannot be merged into the parent Vitest process.
-      exclude: ['src/abis/**', 'src/env.d.ts', 'scripts/verify-create2.mjs'],
+      // CLI subprocess tests complement the in-process utility and scan coverage.
+      exclude: ['src/abis/**', 'src/env.d.ts'],
       thresholds: {
         lines: 53,
         functions: 47,

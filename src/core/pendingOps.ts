@@ -3,7 +3,13 @@ import type { ChainKey } from '@/config/chains'
 import { CHAINS } from '@/config/chains'
 import { CONTRACTS } from '@/config/contracts'
 import { ensureHealthyReadProvider, ensureRecentReadProvider, getReadProvider } from './rpc'
-import { attachTxHash, pendingLocks, releaseLock, releaseLocksByTxHash } from './localLock'
+import {
+  assertLockStorageReadable,
+  attachTxHash,
+  pendingLocks,
+  releaseLock,
+  releaseLocksByTxHash
+} from './localLock'
 import type { OpType } from './txManager'
 import { mapWithConcurrency } from '@/utils/concurrency'
 import { assertReadActive, withReadDeadline } from './readDeadline'
@@ -70,6 +76,37 @@ interface StoredPendingEvent {
   value: PendingStorageEvent
 }
 
+// Retain a wallet-returned hash in this tab even if both durable copies fail.
+// The prior awaiting-wallet event remains the reload-safe submission gate.
+const unpersistedBroadcasts = new Map<string, PendingOpRecord>()
+// Read failures cannot safely resolve an operation identity yet. Retry the original input.
+const unreadBroadcasts = new Map<string, Parameters<typeof recordPendingOp>[0]>()
+
+function broadcastKey(record: { chain: ChainKey; wallet: string; txHash: string }): string {
+  return `${record.chain}:${record.wallet.toLowerCase()}:${record.txHash.toLowerCase()}`
+}
+
+function cacheBroadcast(
+  record: Pick<
+    PendingOpRecord,
+    'id' | 'chain' | 'wallet' | 'txHash' | 'ids' | 'op' | 'count' | 'term' | 'submittedAt'
+  >
+): void {
+  try {
+    attachTxHash(record.id, record.txHash, {
+      chain: record.chain,
+      wallet: record.wallet,
+      ids: record.ids,
+      op: record.op,
+      count: record.count,
+      term: record.term,
+      lockedAt: record.submittedAt
+    })
+  } catch {
+    // Either durable copy may fail independently; retain the in-memory recovery input.
+  }
+}
+
 const OP_LABELS: Record<OpType, string> = {
   GENERAL_MINT: 'General Mint',
   CREATE_EMPTY_SLOT: 'Create Empty Slots',
@@ -86,7 +123,7 @@ const factoryIface = new Interface([
   'function bulkClaimMintRewardAndClaimRank(uint256[] ids, uint256 term)'
 ])
 
-function normalizeRecord(r: unknown): PendingOpRecord | null {
+export function normalizeRecord(r: unknown): PendingOpRecord | null {
   if (!r || typeof r !== 'object') return null
   const o = r as Record<string, unknown>
   const valid =
@@ -153,13 +190,15 @@ function appendStorageEvent(value: PendingStorageEvent): void {
     localStorage.setItem(eventKey(), JSON.stringify(value))
   } catch {
     throw new Error(
-      'PENDING_STORAGE_WRITE_FAILED: Browser storage is full or unavailable. Clear old site data before sending another transaction.'
+      'PENDING_STORAGE_WRITE_FAILED: Browser storage is full or unavailable. Do not clear site data or resend. Check wallet Activity and reconcile pending transactions first.'
     )
   }
 }
 
 function appendRecord(record: PendingOpRecord): void {
   appendStorageEvent({ recordId: record.id, updatedAt: record.updatedAt, record })
+  if ((unpersistedBroadcasts.get(record.id)?.updatedAt ?? Infinity) <= record.updatedAt)
+    unpersistedBroadcasts.delete(record.id)
 }
 
 function appendTombstone(record: PendingOpRecord): void {
@@ -191,58 +230,49 @@ function newerStorageEvent(
   return candidate.key > current.key ? candidate : current
 }
 
+export function parsePendingStorageEvent(raw: string): PendingStorageEvent {
+  const parsed = JSON.parse(raw) as Partial<PendingStorageEvent> | null
+  const record = parsed?.record === null ? null : normalizeRecord(parsed?.record)
+  if (
+    !parsed ||
+    typeof parsed.recordId !== 'string' ||
+    typeof parsed.updatedAt !== 'number' ||
+    !Number.isFinite(parsed.updatedAt) ||
+    (parsed.record !== null && (!record || record.id !== parsed.recordId))
+  )
+    throw new Error('Invalid pending transaction event')
+  return { recordId: parsed.recordId, updatedAt: parsed.updatedAt, record }
+}
+
 function readStoredEvents(): StoredPendingEvent[] {
   const keys = Array.from({ length: localStorage.length }, (_, index) =>
     localStorage.key(index)
   ).filter((key): key is string => Boolean(key?.startsWith(EVENT_KEY_PREFIX)))
   const events: StoredPendingEvent[] = []
   for (const key of keys) {
-    try {
-      const raw = localStorage.getItem(key)
-      if (!raw) continue
-      const parsed = JSON.parse(raw) as Partial<PendingStorageEvent>
-      const record = parsed.record === null ? null : normalizeRecord(parsed.record)
-      if (
-        typeof parsed.recordId !== 'string' ||
-        typeof parsed.updatedAt !== 'number' ||
-        !Number.isFinite(parsed.updatedAt) ||
-        (parsed.record !== null && (!record || record.id !== parsed.recordId))
-      ) {
-        localStorage.removeItem(key)
-        continue
-      }
-      events.push({
-        key,
-        value: { recordId: parsed.recordId, updatedAt: parsed.updatedAt, record }
-      })
-    } catch {
-      localStorage.removeItem(key)
-    }
+    const raw = localStorage.getItem(key)
+    if (raw === null) continue
+    events.push({ key, value: parsePendingStorageEvent(raw) })
   }
   return events
 }
 
 function migrateLegacyRecords(): void {
   const raw = localStorage.getItem(LEGACY_KEY)
-  if (!raw) return
-  try {
-    const parsed = JSON.parse(raw) as unknown
-    if (Array.isArray(parsed)) {
-      for (const value of parsed) {
-        const record = normalizeRecord(value)
-        if (record) appendRecord(record)
-      }
-    }
-    localStorage.removeItem(LEGACY_KEY)
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('PENDING_STORAGE_WRITE_FAILED')) {
-      throw error
-    }
-    localStorage.removeItem(LEGACY_KEY)
+  if (raw === null) return
+  const parsed = JSON.parse(raw) as unknown
+  if (!Array.isArray(parsed)) throw new Error('Invalid legacy pending transaction list')
+  const records = parsed.map(normalizeRecord)
+  if (records.some((record) => !record))
+    throw new Error('Invalid legacy pending transaction record')
+  for (const record of records) {
+    if (record) appendRecord(record)
   }
+  localStorage.removeItem(LEGACY_KEY)
 }
 
 function readAll(): PendingOpRecord[] {
+  assertLockStorageReadable()
   try {
     migrateLegacyRecords()
     const events = readStoredEvents()
@@ -254,7 +284,12 @@ function readAll(): PendingOpRecord[] {
     const records = [...winners.values()].flatMap((event) =>
       event.value.record ? [event.value.record] : []
     )
-    const pruned = prunePendingRecords(records)
+    const combined = new Map(records.map((record) => [record.id, record]))
+    for (const record of unpersistedBroadcasts.values()) {
+      const stored = winners.get(record.id)?.value
+      if (!stored || stored.updatedAt < record.updatedAt) combined.set(record.id, record)
+    }
+    const pruned = prunePendingRecords([...combined.values()])
     const retainedIds = new Set(pruned.map((record) => record.id))
 
     // Compact only keys observed in this snapshot. A concurrent writer uses a
@@ -262,12 +297,19 @@ function readAll(): PendingOpRecord[] {
     for (const event of events) {
       const winner = winners.get(event.value.recordId)
       if (winner?.key !== event.key || !retainedIds.has(event.value.recordId)) {
-        localStorage.removeItem(event.key)
+        try {
+          localStorage.removeItem(event.key)
+        } catch {
+          /* Retaining old events is safe. */
+        }
       }
     }
     return pruned
-  } catch {
-    return []
+  } catch (cause) {
+    throw new Error(
+      'PENDING_STORAGE_READ_FAILED: Local transaction records could not be read. Do not clear site data or resend. Check wallet Activity and restore storage access before rechecking.',
+      { cause }
+    )
   }
 }
 
@@ -351,8 +393,7 @@ function toView(
 }
 
 function releaseRecordLocks(record: PendingOpRecord): void {
-  const bound = pendingLocks(record.chain, record.wallet).find((lock) => lock.batch === record.id)
-  if (!bound || bound.txHash.toLowerCase() === record.txHash.toLowerCase()) releaseLock(record.id)
+  releaseLock(record.id, record)
   if (record.txHash)
     releaseLocksByTxHash(record.txHash, { chain: record.chain, wallet: record.wallet })
 }
@@ -388,7 +429,24 @@ export function recordPendingOp(params: {
       )
     }
   }
-  const all = readAll()
+  let all: PendingOpRecord[]
+  try {
+    all = readAll()
+  } catch (error) {
+    if (
+      /^0x[0-9a-f]{64}$/i.test(params.txHash) &&
+      isUnresolvedPending({ phase: params.phase ?? 'broadcast' })
+    ) {
+      const key = broadcastKey(params)
+      unreadBroadcasts.set(key, { ...params, ids: [...params.ids] })
+      cacheBroadcast({
+        ...params,
+        id: params.id ?? key,
+        submittedAt: params.submittedAt ?? Date.now()
+      })
+    }
+    throw error
+  }
   const validatedSettlement = isWalletSettlement(params.settlement, params)
     ? params.settlement
     : undefined
@@ -451,6 +509,16 @@ export function recordPendingOp(params: {
     submittedAt: Number.isFinite(submittedAt) ? submittedAt : Date.now(),
     updatedAt: nextUpdatedAt(existing?.updatedAt)
   }
+  try {
+    appendRecord(rec)
+    unreadBroadcasts.delete(broadcastKey(rec))
+  } catch (error) {
+    if (rec.txHash && isUnresolvedPending(rec)) unpersistedBroadcasts.set(rec.id, rec)
+    throw error
+  } finally {
+    if (rec.txHash && isUnresolvedPending(rec)) cacheBroadcast(rec)
+  }
+  // Publish the replacement before removing any duplicate evidence.
   for (const duplicate of all) {
     if (
       duplicate.id !== rec.id &&
@@ -459,13 +527,14 @@ export function recordPendingOp(params: {
       normalizedHash.length > 0 &&
       duplicate.txHash.toLowerCase() === normalizedHash
     ) {
-      appendTombstone(duplicate)
+      try {
+        appendTombstone(duplicate)
+      } catch {
+        /* Reconciliation can retry deduplication. */
+      }
     }
   }
-  appendRecord(rec)
-  if (rec.txHash && isUnresolvedPending(rec)) {
-    attachTxHash(rec.id, rec.txHash)
-  } else if (!isUnresolvedPending(rec)) {
+  if (!isUnresolvedPending(rec)) {
     releaseRecordLocks(rec)
   }
   return rec
@@ -834,14 +903,26 @@ async function discoverPendingFactoryTxs(
  * (covers older sessions that predate sm.pendingOps).
  */
 function hydrateFromLocks(chain: ChainKey, wallet: string): void {
+  for (const params of unreadBroadcasts.values()) {
+    if (params.chain === chain && params.wallet.toLowerCase() === wallet.toLowerCase())
+      recordPendingOp(params)
+  }
+  for (const record of unpersistedBroadcasts.values()) {
+    if (record.chain === chain && record.wallet.toLowerCase() === wallet.toLowerCase())
+      appendRecord(record)
+  }
   const locks = pendingLocks(chain, wallet)
   for (const lock of locks) {
     const existing = listPendingOps(chain, wallet).find(
       (r) => r.txHash.toLowerCase() === lock.txHash.toLowerCase()
     )
-    if (existing) continue
+    if (existing) {
+      if (!isUnresolvedPending(existing)) releaseRecordLocks(existing)
+      continue
+    }
     // Prefer lock metadata; if missing, still store the hash so we can decode calldata next.
     recordPendingOp({
+      id: lock.batch,
       chain,
       wallet,
       op: (lock.op as OpType) || 'GENERAL_MINT',

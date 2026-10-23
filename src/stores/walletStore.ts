@@ -8,7 +8,7 @@ import {
   chainIdToKey
 } from '@/core/wallet'
 import { ensureHealthyReadProvider, getRpcGeneration, withRetry } from '@/core/rpc'
-import { assertReadActive, withReadDeadline } from '@/core/readDeadline'
+import { assertReadActive, ReadTimeoutError, withReadDeadline } from '@/core/readDeadline'
 
 interface State {
   address: string | null
@@ -60,6 +60,12 @@ function isContractCode(code: string | null | undefined): boolean {
   return true
 }
 
+function connectionReadTimeout(error: unknown, message: string): string | null {
+  if (!/READ_TIMEOUT/i.test(message)) return null
+  const detail = error instanceof ReadTimeoutError ? ` ${error.diagnostic}` : ''
+  return `Wallet connection read timed out.${detail} Open your wallet extension, check network access, then retry Connect Wallet.`
+}
+
 export const useWalletStore = defineStore('wallet', {
   state: (): State => ({
     address: null,
@@ -98,9 +104,7 @@ export const useWalletStore = defineStore('wallet', {
           await initWallet()
         } catch (err: any) {
           const message = err?.message || String(err)
-          this.connectError = /READ_TIMEOUT/.test(message)
-            ? `${message}. Open your wallet extension, check network access, then retry Connect Wallet.`
-            : message
+          this.connectError = connectionReadTimeout(err, message) ?? message
         } finally {
           this.ready = true
         }
@@ -223,7 +227,9 @@ export const useWalletStore = defineStore('wallet', {
         }
       } catch (err: any) {
         const msg: string = err?.shortMessage || err?.message || String(err)
-        this.connectError = /rejected|denied/i.test(msg) ? 'Connection request rejected.' : msg
+        this.connectError =
+          connectionReadTimeout(err, msg) ??
+          (/rejected|denied/i.test(msg) ? 'Connection request rejected.' : msg)
       }
     },
 

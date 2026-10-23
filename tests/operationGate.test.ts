@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Interface } from 'ethers'
 import {
   createInMemoryExclusiveGate,
@@ -6,7 +6,12 @@ import {
   runWalletExclusive
 } from '../src/core/operationGate'
 
+beforeEach(() => {
+  expect(vi.isFakeTimers()).toBe(false)
+})
+
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
 })
 
@@ -20,6 +25,18 @@ function preparedContext() {
     preparedAt,
     expiresAt: preparedAt + 120_000
   }
+}
+
+async function expectRpcErrorMapping(): Promise<void> {
+  const { RpcConfigurationError } =
+    await vi.importActual<typeof import('../src/core/rpc')>('../src/core/rpc')
+  const { normalizeError } = await import('../src/core/txManager')
+  expect(
+    normalizeError(new RpcConfigurationError('eth', 'Use at most 16 RPC endpoints'))
+  ).toContain('Open the RPC settings')
+  expect(normalizeError(new Error('RPC_UNAVAILABLE: offline fixture'))).toContain(
+    'Check internet access'
+  )
 }
 
 describe('operation gate', () => {
@@ -124,7 +141,8 @@ describe('operation gate', () => {
         return `0x${'a'.repeat(64)}`
       })
     }))
-    vi.doMock('../src/core/rpc', () => ({
+    vi.doMock('../src/core/rpc', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('../src/core/rpc')>()),
       ensureHealthyReadProvider: vi.fn(async () => provider),
       getReadProvider: () => provider
     }))
@@ -188,6 +206,7 @@ describe('operation gate', () => {
     })
 
     const { sendPreparedOperation } = await import('../src/core/txManager')
+    await expectRpcErrorMapping()
     await sendPreparedOperation({
       chain: 'eth',
       wallet: walletAddress,
@@ -203,6 +222,7 @@ describe('operation gate', () => {
       args: [100n, 1n],
       batch: 'batch-1',
       lockIds: [],
+      lifecycle: { phase: 'prepared' },
       state: { estimate: 'done', send: 'wait', confirm: 'wait' }
     })
 
@@ -242,7 +262,8 @@ describe('operation gate', () => {
       warmUpInjected: vi.fn(),
       writeFactory
     }))
-    vi.doMock('../src/core/rpc', () => ({
+    vi.doMock('../src/core/rpc', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('../src/core/rpc')>()),
       ensureHealthyReadProvider: vi.fn(async () => provider),
       getReadProvider: () => provider
     }))
@@ -280,6 +301,7 @@ describe('operation gate', () => {
     })
 
     const { sendPreparedOperation } = await import('../src/core/txManager')
+    await expectRpcErrorMapping()
     const prepared = {
       chain: 'eth' as const,
       wallet: '0xAbC',
@@ -295,6 +317,7 @@ describe('operation gate', () => {
       args: [100n, 1n],
       batch: 'batch-1',
       lockIds: [],
+      lifecycle: { phase: 'prepared' as const },
       state: { estimate: 'done' as const, send: 'wait' as const, confirm: 'wait' as const }
     }
 
@@ -327,7 +350,8 @@ describe('operation gate', () => {
       warmUpInjected: vi.fn(),
       writeFactory
     }))
-    vi.doMock('../src/core/rpc', () => ({
+    vi.doMock('../src/core/rpc', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('../src/core/rpc')>()),
       ensureHealthyReadProvider: vi.fn(async () => provider),
       getReadProvider: () => provider
     }))
@@ -380,6 +404,7 @@ describe('operation gate', () => {
     })
 
     const { sendPreparedOperation } = await import('../src/core/txManager')
+    await expectRpcErrorMapping()
     await expect(
       sendPreparedOperation({
         chain: 'eth',
@@ -396,6 +421,7 @@ describe('operation gate', () => {
         args: [[4n], 100n],
         batch: 'batch-1',
         lockIds: [4],
+        lifecycle: { phase: 'prepared' },
         state: { estimate: 'done', send: 'wait', confirm: 'wait' }
       })
     ).rejects.toThrow('VMU state changed on-chain')

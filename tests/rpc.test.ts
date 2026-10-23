@@ -1,5 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { CHAINS, getRpcUrls, readCustomRpc, writeCustomRpc } from '@/config/chains'
+import {
+  CHAINS,
+  getRpcUrls,
+  readCustomRpc,
+  writeCustomRpc,
+  parseRpcInput,
+  MAX_RPC_ENDPOINTS,
+  MAX_RPC_INPUT_LENGTH,
+  MAX_RPC_URL_LENGTH
+} from '@/config/chains'
+import { ReadTimeoutError, withReadDeadline } from '@/core/readDeadline'
+import { normalizeError } from '@/core/txManager'
 import {
   ensureRecentReadProvider,
   ensureHealthyReadProvider,
@@ -31,6 +42,41 @@ beforeEach(() => {
 })
 
 describe('RPC retry policy', () => {
+  it('preserves the production read timeout type and label through UI normalization', async () => {
+    vi.useFakeTimers()
+    const operation = vi.fn(() => new Promise<string>(() => {}))
+    const result = withRetry(operation, { retries: 0, timeoutMs: 50 }).catch(
+      (error: unknown) => error
+    )
+    await vi.advanceTimersByTimeAsync(50)
+    const error = await result
+    expect(error).toBeInstanceOf(ReadTimeoutError)
+    expect(error).toMatchObject({ label: 'RPC read', timeoutMs: 50 })
+    expect(normalizeError(error)).toContain('RPC read exceeded 50 ms.')
+    expect(normalizeError(error)).not.toContain('READ_TIMEOUT')
+    expect(operation).toHaveBeenCalledOnce()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('stops before another RPC call when backoff consumes the total retry budget', async () => {
+    vi.useFakeTimers()
+    const operation = vi.fn(async () => {
+      throw Object.assign(new Error('rate limit'), { status: 429, retryAfterMs: 100 })
+    })
+    const result = withRetry(operation, {
+      totalTimeoutMs: 100,
+      jitterRatio: 0
+    }).catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(100)
+    const error = await result
+    expect(error).toBeInstanceOf(ReadTimeoutError)
+    expect(error).toMatchObject({ label: 'RPC retry deadline', timeoutMs: 100 })
+    expect(normalizeError(error)).toContain('RPC retry deadline exceeded 100 ms.')
+    expect(normalizeError(error)).toContain('Do not resend.')
+    expect(operation).toHaveBeenCalledOnce()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it('does not retry semantic contract failures', async () => {
     const operation = vi.fn(async () => {
       throw Object.assign(new Error('execution reverted'), { code: 'CALL_EXCEPTION' })
@@ -84,10 +130,43 @@ describe('RPC retry policy', () => {
 
 afterEach(() => {
   resetProviders()
+  vi.useRealTimers()
   vi.unstubAllGlobals()
 })
 
 describe('custom RPC validation', () => {
+  it('accepts exact input boundaries and normalizes duplicate endpoints', () => {
+    const prefix = 'https://rpc.example/'
+    const longest = prefix + 'x'.repeat(MAX_RPC_URL_LENGTH - prefix.length)
+    expect(parseRpcInput(longest)).toEqual([longest])
+    expect(parseRpcInput(prefix.padEnd(MAX_RPC_INPUT_LENGTH, ' '))).toEqual([prefix])
+    expect(parseRpcInput(' https://rpc.example\nhttps://rpc.example/ ')).toEqual([prefix])
+  })
+
+  it('does not overwrite a saved list when replacement configuration exceeds its limit', () => {
+    writeCustomRpc('eth', ['https://preserved.example'])
+    expect(() =>
+      writeCustomRpc(
+        'eth',
+        Array.from({ length: MAX_RPC_ENDPOINTS + 1 }, (_, i) => `https://rpc${i}.example`)
+      )
+    ).toThrow('at most')
+    expect(readCustomRpc('eth')).toEqual(['https://preserved.example/'])
+  })
+
+  it('keeps an overlong legacy endpoint visible instead of silently choosing defaults', async () => {
+    const url = `https://legacy.example/${'x'.repeat(MAX_RPC_URL_LENGTH)}`
+    const stored = JSON.stringify({ eth: [url] })
+    localStorage.setItem('sm.customRpc', stored)
+    expect(readCustomRpc('eth')).toEqual([url])
+    expect(getRpcUrls('eth')).toEqual([url])
+    const request = vi.fn(async () => '0x1')
+    await expect(ensureHealthyReadProvider('eth', request)).rejects.toThrow(
+      'RPC URL must not exceed'
+    )
+    expect(request).not.toHaveBeenCalled()
+    expect(localStorage.getItem('sm.customRpc')).toBe(stored)
+  })
   it('keeps the diversified Ethereum defaults in the intended failover order', () => {
     expect(CHAINS.eth.defaultRpcUrls).toEqual([
       'https://ethereum.publicnode.com',
@@ -133,6 +212,113 @@ describe('custom RPC validation', () => {
 })
 
 describe('runtime RPC health selection', () => {
+  it('does not dispatch remaining old probes after a synchronous configuration change', async () => {
+    writeCustomRpc('eth', ['https://old-a.example/', 'https://old-b.example/'])
+    const request = vi.fn(async (url: string) => {
+      if (url === 'https://old-a.example/') {
+        writeCustomRpc('eth', ['https://new.example/'])
+        resetProviders('eth')
+      }
+      return '0x1'
+    })
+    await ensureHealthyReadProvider('eth', request)
+    expect(request.mock.calls.map(([url]) => url)).toEqual([
+      'https://old-a.example/',
+      'https://new.example/'
+    ])
+    expect(getRpcHealthState('eth').healthyUrls).toEqual(['https://new.example/'])
+  })
+  it('discards an old in-flight health result after configuration changes', async () => {
+    writeCustomRpc('eth', ['https://old.example/'])
+    let finishOld!: (value: string) => void
+    const old = new Promise<string>((resolve) => {
+      finishOld = resolve
+    })
+    const request = vi.fn((url: string) =>
+      url === 'https://old.example/' ? old : Promise.resolve('0x1')
+    )
+    const publications: string[][] = []
+    const unsubscribe = onRpcHealthChange((_chain, state) => {
+      if (!state.checking) publications.push(state.healthyUrls)
+    })
+    try {
+      const first = ensureHealthyReadProvider('eth', request)
+      expect(request).toHaveBeenCalledWith('https://old.example/')
+      writeCustomRpc('eth', ['https://new.example/'])
+      resetProviders('eth')
+      const current = await ensureHealthyReadProvider('eth', request)
+      finishOld('0x1')
+      await expect(first).resolves.toBe(current)
+      expect(getReadProvider('eth')).toBe(current)
+      expect(getRpcHealthState('eth').healthyUrls).toEqual(['https://new.example/'])
+      expect(publications.flat()).not.toContain('https://old.example/')
+      expect(readCustomRpc('eth')).toEqual(['https://new.example/'])
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  it('bounds background probe concurrency without dropping configured nodes', async () => {
+    const urls = Array.from({ length: MAX_RPC_ENDPOINTS }, (_, i) => `https://rpc${i}.example/`)
+    writeCustomRpc('eth', urls)
+    let release!: () => void
+    const gate = new Promise<void>((done) => {
+      release = done
+    })
+    let active = 0
+    let peak = 0
+    const request = vi.fn(async () => {
+      active += 1
+      peak = Math.max(peak, active)
+      await gate
+      active -= 1
+      return '0x1'
+    })
+    const health = ensureHealthyReadProvider('eth', request)
+    expect(request).toHaveBeenCalledTimes(MAX_RPC_ENDPOINTS)
+    release()
+    await health
+    expect(peak).toBe(MAX_RPC_ENDPOINTS)
+    expect(request).toHaveBeenCalledTimes(MAX_RPC_ENDPOINTS)
+    expect(getRpcHealthState('eth').healthyUrls).toEqual(urls)
+    expect(readCustomRpc('eth')).toEqual(urls)
+  })
+
+  it('finishes a full slow healthy list within the existing wallet read deadline', async () => {
+    vi.useFakeTimers()
+    try {
+      writeCustomRpc(
+        'eth',
+        Array.from({ length: MAX_RPC_ENDPOINTS }, (_, i) => `https://rpc${i}.example/`)
+      )
+      const request = vi.fn(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 2_400))
+        await new Promise((resolve) => setTimeout(resolve, 2_400))
+        return '0x1'
+      })
+      const checked = withReadDeadline(
+        () => ensureHealthyReadProvider('eth', request),
+        'Wallet RPC validation'
+      )
+      const assertion = expect(checked).resolves.toBeDefined()
+      await vi.advanceTimersByTimeAsync(4_800)
+      await assertion
+      expect(request).toHaveBeenCalledTimes(MAX_RPC_ENDPOINTS)
+      expect(getRpcHealthState('eth').healthyUrls).toHaveLength(MAX_RPC_ENDPOINTS)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('preserves but rejects an oversized legacy configuration before network requests', async () => {
+    const urls = Array.from({ length: MAX_RPC_ENDPOINTS + 1 }, (_, i) => `https://rpc${i}.example/`)
+    const stored = JSON.stringify({ eth: urls })
+    localStorage.setItem('sm.customRpc', stored)
+    const request = vi.fn(async () => '0x1')
+    await expect(ensureHealthyReadProvider('eth', request)).rejects.toThrow('at most')
+    expect(request).not.toHaveBeenCalled()
+    expect(localStorage.getItem('sm.customRpc')).toBe(stored)
+  })
   it('reuses a recently validated provider until the caller freshness window expires', async () => {
     writeCustomRpc('eth', ['https://rpc.example'])
     const now = vi.spyOn(Date, 'now').mockReturnValue(10_000)

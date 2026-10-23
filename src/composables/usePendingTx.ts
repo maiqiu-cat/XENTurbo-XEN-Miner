@@ -1,5 +1,6 @@
 import { computed, onScopeDispose, ref, watch, type Ref } from 'vue'
 import type { ChainKey } from '@/config/chains'
+import { normalizeError } from '@/core/txManager'
 import {
   canMarkPendingOpDropped,
   markPendingOpDropped,
@@ -24,12 +25,19 @@ export function usePendingTx(
   const checking = ref(false)
   const lastCheckedAt = ref<number | null>(null)
   const error = ref<string | null>(null)
+  const ready = ref(false)
+  const queued = ref(false)
 
   let timer: ReturnType<typeof setTimeout> | null = null
   let gen = 0
   let active: { generation: number; promise: Promise<number>; controller: AbortController } | null =
     null
-  let trailing = false
+  type CheckOptions = { freshRpc?: boolean; reverifyResults?: boolean }
+  let trailing: {
+    options: CheckOptions
+    promise: Promise<number>
+    resolve: (value: number) => void
+  } | null = null
   const activePollMs = 8_000
   const idlePollMs = 30_000
 
@@ -40,9 +48,13 @@ export function usePendingTx(
     pendingCount.value = 0
     localUnresolvedCount.value = 0
     ops.value = []
+    lastCheckedAt.value = null
+    error.value = null
+    ready.value = false
+    queued.value = false
   }
 
-  function check(options: { freshRpc?: boolean; reverifyResults?: boolean } = {}): Promise<number> {
+  function check(options: CheckOptions = {}): Promise<number> {
     const addr = address()
     const key = chain()
     if (!addr || !key) {
@@ -50,9 +62,22 @@ export function usePendingTx(
       return Promise.resolve(0)
     }
     const myGen = gen
+    // Recovery/manual verification must not reuse readiness from before storage changed.
+    if (options.reverifyResults) ready.value = false
     if (active?.generation === myGen) {
-      trailing = true
-      return active.promise
+      queued.value = true
+      if (!trailing) {
+        let resolve!: (value: number) => void
+        const promise = new Promise<number>((done) => {
+          resolve = done
+        })
+        trailing = { options: { ...options }, promise, resolve }
+      } else {
+        trailing.options.freshRpc =
+          trailing.options.freshRpc !== false || options.freshRpc !== false
+        trailing.options.reverifyResults ||= options.reverifyResults === true
+      }
+      return trailing.promise
     }
 
     checking.value = true
@@ -65,12 +90,14 @@ export function usePendingTx(
         localUnresolvedCount.value = unresolvedCount
         ops.value = views
         lastCheckedAt.value = Date.now()
+        ready.value = pageVisible() && trailing?.options.reverifyResults !== true
         if (confirmedOps?.length) onConfirmed?.(confirmedOps)
         return pendingNonceGap
       })
       .catch((err: any) => {
         if (myGen !== gen) return pendingCount.value
-        error.value = err?.shortMessage || err?.message || 'Failed to check pending txs'
+        ready.value = false
+        error.value = normalizeError(err)
         return pendingCount.value
       })
       .finally(() => {
@@ -78,8 +105,10 @@ export function usePendingTx(
         if (myGen !== gen) return
         checking.value = false
         if (trailing) {
-          trailing = false
-          void check()
+          const next = trailing
+          trailing = null
+          queued.value = false
+          void check(next.options).then(next.resolve)
         }
       })
     active = { generation: myGen, promise, controller }
@@ -103,8 +132,11 @@ export function usePendingTx(
   function stopPolling() {
     active?.controller.abort()
     gen += 1
-    trailing = false
+    trailing?.resolve(pendingCount.value)
+    trailing = null
+    queued.value = false
     checking.value = false
+    ready.value = false
     if (timer) {
       clearTimeout(timer)
       timer = null
@@ -121,14 +153,22 @@ export function usePendingTx(
     document.addEventListener('visibilitychange', onVisibilityChange)
   }
 
+  const contextVersion = ref(0)
   watch(
     [() => address(), () => chain()],
-    ([addr, key]) => {
-      if (addr && key) startPolling()
-      else {
-        stopPolling()
-        resetState()
-      }
+    () => {
+      stopPolling()
+      resetState()
+      contextVersion.value += 1
+    },
+    { flush: 'sync' }
+  )
+  // An A -> null -> A round trip must also restart polling after invalidation.
+  watch(
+    contextVersion,
+    () => {
+      resetState()
+      if (address() && chain()) startPolling()
     },
     { immediate: true }
   )
@@ -169,7 +209,9 @@ export function usePendingTx(
     localUnresolvedCount: localUnresolvedCount as Ref<number>,
     ops: ops as Ref<PendingOpView[]>,
     hasPending,
+    ready,
     checking,
+    queued,
     lastCheckedAt,
     error,
     check,

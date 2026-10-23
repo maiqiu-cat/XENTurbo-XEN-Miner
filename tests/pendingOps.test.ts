@@ -140,12 +140,14 @@ async function installPendingHarness(options: {
   })
 
   const ensureHealthyReadProvider = vi.fn(async () => provider)
-  vi.doMock('../src/core/rpc', () => ({
+  vi.doMock('../src/core/rpc', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../src/core/rpc')>()),
     ensureHealthyReadProvider,
     ensureRecentReadProvider: ensureHealthyReadProvider,
     getReadProvider: () => provider
   }))
-  vi.doMock('../src/core/localLock', () => ({
+  vi.doMock('../src/core/localLock', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../src/core/localLock')>()),
     attachTxHash,
     pendingLocks: vi.fn(() => []),
     releaseLock,
@@ -188,16 +190,54 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
   vi.resetModules()
   vi.clearAllMocks()
 })
 
 describe('pending operation reconciliation', () => {
+  it.each([true, false])(
+    'bounds the production RPC health read and permits reconciliation retry (freshRpc=%s)',
+    async (freshRpc) => {
+      const { pending, provider, ensureHealthyReadProvider, releaseLock, releaseLocksByTxHash } =
+        await installPendingHarness({ latestNonce: 7, pendingNonce: 7 })
+      const { ReadTimeoutError, READ_TIMEOUT_MS } = await import('../src/core/readDeadline')
+      const { normalizeError } = await import('../src/core/txManager')
+      const gate = deferred<typeof provider>()
+      ensureHealthyReadProvider.mockReturnValueOnce(gate.promise)
+      recordBroadcast(pending)
+      const before = JSON.stringify(pending.listPendingOps('eth', WALLET))
+      vi.useFakeTimers()
+      const result = pending
+        .refreshPendingOps('eth', WALLET, { freshRpc })
+        .catch((error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(READ_TIMEOUT_MS)
+      const error = await result
+      expect(error).toBeInstanceOf(ReadTimeoutError)
+      expect(error).toMatchObject({ label: 'RPC health check', timeoutMs: READ_TIMEOUT_MS })
+      expect(normalizeError(error)).toContain('RPC health check exceeded 15000 ms.')
+      expect(normalizeError(error)).not.toContain('READ_TIMEOUT')
+      expect(provider.getTransactionReceipt).not.toHaveBeenCalled()
+      expect(releaseLock).not.toHaveBeenCalled()
+      expect(releaseLocksByTxHash).not.toHaveBeenCalled()
+      expect(JSON.stringify(pending.listPendingOps('eth', WALLET))).toBe(before)
+      expect(vi.getTimerCount()).toBe(0)
+      gate.resolve(provider)
+      await Promise.resolve()
+      expect(JSON.stringify(pending.listPendingOps('eth', WALLET))).toBe(before)
+      await expect(pending.refreshPendingOps('eth', WALLET, { freshRpc })).resolves.toMatchObject({
+        unresolvedCount: 1
+      })
+      expect(ensureHealthyReadProvider).toHaveBeenCalledTimes(2)
+      expect(vi.getTimerCount()).toBe(0)
+    }
+  )
+
   it.each([null, { status: 1 }])(
     'legacy lock recovery requires wallet receipt evidence',
     async (walletReceipt) => {
-      const { releaseLock } = await installPendingHarness({
+      const { pending, releaseLock } = await installPendingHarness({
         latestNonce: 7,
         pendingNonce: 8,
         receipt: { status: 1 },
@@ -216,8 +256,23 @@ describe('pending operation reconciliation', () => {
       ])
       const { resumePendingLocks } = await import('../src/core/txManager')
       expect(await resumePendingLocks('eth', WALLET)).toBe(walletReceipt !== null)
-      if (walletReceipt) expect(releaseLock).toHaveBeenCalledWith('old-lock')
-      else expect(releaseLock).not.toHaveBeenCalled()
+      if (walletReceipt) {
+        expect(releaseLock).toHaveBeenCalledWith(
+          'old-lock',
+          expect.objectContaining({
+            chain: 'eth',
+            wallet: WALLET,
+            txHash: HASH,
+            phase: 'confirmed'
+          })
+        )
+        expect(pending.listPendingOps('eth', WALLET)[0]).toMatchObject({
+          id: 'old-lock',
+          txHash: HASH,
+          phase: 'confirmed',
+          origin: 'wallet-verified'
+        })
+      } else expect(releaseLock).not.toHaveBeenCalled()
     }
   )
 
@@ -451,7 +506,11 @@ describe('pending operation reconciliation', () => {
       txHash: '',
       phase: 'awaiting-wallet'
     })
-    expect(attachTxHash).toHaveBeenCalledWith(tracked.id, HASH)
+    expect(attachTxHash).toHaveBeenCalledWith(
+      tracked.id,
+      HASH,
+      expect.objectContaining({ chain: 'eth', wallet: WALLET, ids: [7] })
+    )
     pending.recordPendingOp({
       ...stored.find((record) => record.id === 'batch-1')!,
       phase: 'dropped'
@@ -586,24 +645,32 @@ describe('pending operation reconciliation', () => {
       pendingNonce: 8,
       walletReceipt: { status: 1 }
     })
-    const locks = await import('../src/core/localLock')
-    vi.mocked(locks.pendingLocks).mockReturnValue([
-      {
-        chain: 'eth',
-        wallet: WALLET,
-        ids: [8],
-        txHash: `0x${'2'.repeat(64)}`,
-        batch: 'batch-1',
-        lockedAt: Date.now()
-      }
-    ])
+    const locks =
+      await vi.importActual<typeof import('../src/core/localLock')>('../src/core/localLock')
+    releaseLock.mockImplementation(locks.releaseLock)
+    releaseLocksByTxHash.mockImplementation(locks.releaseLocksByTxHash)
+    localStorage.setItem(
+      'sm.vmuLocks',
+      JSON.stringify([
+        {
+          chain: 'eth',
+          wallet: WALLET,
+          ids: [8],
+          txHash: `0x${'2'.repeat(64)}`,
+          batch: 'batch-1',
+          lockedAt: Date.now()
+        }
+      ])
+    )
     const { settlement } = await (
       await import('../src/core/walletEvidence')
     ).readWalletEvidence('eth', WALLET, HASH)
 
     recordBroadcast(pending, { id: 'batch-1', phase: 'confirmed', settlement })
 
-    expect(releaseLock).not.toHaveBeenCalled()
+    expect(locks.pendingLocks('eth', WALLET)).toEqual([
+      expect.objectContaining({ batch: 'batch-1', ids: [8], txHash: `0x${'2'.repeat(64)}` })
+    ])
     expect(releaseLocksByTxHash).toHaveBeenCalledWith(HASH, { chain: 'eth', wallet: WALLET })
   })
 
@@ -923,6 +990,42 @@ describe('pending operation reconciliation', () => {
     expect(stored.some((record) => record.id === 'expired-terminal')).toBe(false)
   })
 
+  it('keeps the real journal unresolved and does not release locks when a dropped event cannot be written', async () => {
+    const { pending, releaseLock, releaseLocksByTxHash } = await installPendingHarness({
+      latestNonce: 7,
+      pendingNonce: 7
+    })
+    recordBroadcast(pending, { id: 'batch-1' })
+    const snapshot = () =>
+      Object.fromEntries(
+        Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index)!).map(
+          (key) => [key, localStorage.getItem(key)]
+        )
+      )
+    const original = snapshot()
+    const records = pending.listPendingOps('eth', WALLET)
+    const write = localStorage.setItem.bind(localStorage)
+    const failure = vi.spyOn(localStorage, 'setItem').mockImplementation((key, value) => {
+      if (key.startsWith('sm.pendingOps.event.')) throw new Error('QuotaExceededError fixture')
+      write(key, value)
+    })
+    expect(() => pending.markPendingOpDropped('batch-1')).toThrow('PENDING_STORAGE_WRITE_FAILED')
+    expect(snapshot()).toEqual(original)
+    expect(pending.listPendingOps('eth', WALLET)).toEqual(records)
+    expect(pending.countUnresolvedPendingOps('eth', WALLET)).toBe(1)
+    expect(releaseLock).not.toHaveBeenCalled()
+    expect(releaseLocksByTxHash).not.toHaveBeenCalled()
+
+    failure.mockRestore()
+    expect(pending.markPendingOpDropped('batch-1')?.phase).toBe('dropped')
+    const events = snapshot()
+    for (const [key, value] of Object.entries(original)) expect(events[key]).toBe(value)
+    expect(Object.keys(events)).toHaveLength(Object.keys(original).length + 1)
+    expect(pending.countUnresolvedPendingOps('eth', WALLET)).toBe(0)
+    expect(releaseLock).toHaveBeenCalledOnce()
+    expect(releaseLocksByTxHash).toHaveBeenCalledOnce()
+  })
+
   it('supports an explicit dropped transition and only then releases the lock', async () => {
     const { pending, releaseLock, releaseLocksByTxHash } = await installPendingHarness({
       latestNonce: 7,
@@ -933,7 +1036,14 @@ describe('pending operation reconciliation', () => {
     const dropped = pending.markPendingOpDropped('batch-1')
 
     expect(dropped?.phase).toBe('dropped')
-    expect(releaseLock).toHaveBeenCalledWith('batch-1')
+    expect(releaseLock).toHaveBeenCalledWith(
+      'batch-1',
+      expect.objectContaining({
+        chain: 'eth',
+        wallet: WALLET,
+        txHash: HASH
+      })
+    )
     expect(releaseLocksByTxHash).toHaveBeenCalledWith(HASH, { chain: 'eth', wallet: WALLET })
   })
 
@@ -1059,7 +1169,8 @@ describe('transaction lock lifecycle', () => {
         return HASH
       })
     }))
-    vi.doMock('../src/core/rpc', () => ({
+    vi.doMock('../src/core/rpc', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('../src/core/rpc')>()),
       ensureHealthyReadProvider: vi.fn(async () => provider),
       getReadProvider: () => provider
     }))
@@ -1099,11 +1210,12 @@ describe('transaction lock lifecycle', () => {
       args: [[7n]],
       batch: 'batch-1',
       lockIds: [7],
+      lifecycle: { phase: 'prepared' },
       state: { estimate: 'done', send: 'wait', confirm: 'wait' }
     })
 
     await expect(send).rejects.toThrow('Transaction receipt missing')
-    expect(attachTxHash).toHaveBeenCalledWith('batch-1', HASH)
+    expect(attachTxHash).not.toHaveBeenCalled()
     expect(recordPendingOp).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({

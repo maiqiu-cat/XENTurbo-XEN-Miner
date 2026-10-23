@@ -139,7 +139,12 @@ describe('wallet store injected state synchronization', () => {
 
       await vi.advanceTimersByTimeAsync(READ_TIMEOUT_MS + 1)
       expect(store.ready).toBe(true)
-      expect(store.connectError).toContain('READ_TIMEOUT')
+      expect(store.connectError).toContain('Wallet connection read timed out.')
+      expect(store.connectError).toContain(
+        `${method === 'eth_accounts' ? 'Initial wallet accounts' : 'Initial wallet network'} exceeded 15000 ms.`
+      )
+      expect(store.connectError).toContain('retry Connect Wallet')
+      expect(store.connectError).not.toContain('READ_TIMEOUT')
       await initialization
 
       stalled = false
@@ -182,5 +187,77 @@ describe('wallet store injected state synchronization', () => {
     expect(store.contractWalletChecked).toBe(true)
     expect(store.isContractWallet).toBe(false)
     expect(store.contractWalletError).toBeNull()
+  })
+
+  it('shows the connected-network timeout and recovers without applying the late network', async () => {
+    vi.useFakeTimers()
+    const provider = new SilentInjectedProvider()
+    provider.accounts = []
+    installProvider(provider)
+    const store = await loadStore()
+    await store.init()
+    const request = provider.request.getMockImplementation()!
+    let resolveLate!: (value: unknown) => void
+    provider.request.mockImplementation((params) =>
+      params.method === 'eth_chainId'
+        ? new Promise((resolve) => {
+            resolveLate = resolve
+          })
+        : request(params)
+    )
+    const connecting = store.connect()
+    await vi.advanceTimersByTimeAsync(READ_TIMEOUT_MS)
+    await connecting
+    expect(store.address).toBeNull()
+    expect(store.connectError).toContain('Connected wallet network exceeded 15000 ms.')
+    expect(store.connectError).toContain('retry Connect Wallet')
+    expect(store.connectError).not.toContain('READ_TIMEOUT')
+    provider.request.mockImplementation(request)
+    await store.connect()
+    resolveLate('0x89')
+    await Promise.resolve()
+    expect(store.address).toBe(ACCOUNT)
+    expect(store.chainId).toBe(1)
+    expect(store.connectError).toBeNull()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it.each(['init', 'connect'] as const)(
+    'does not display remote timeout text or forged local metadata during %s',
+    async (action) => {
+      const provider = new SilentInjectedProvider()
+      provider.accounts = []
+      installProvider(provider)
+      const store = await loadStore()
+      if (action === 'connect') await store.init()
+      provider.request.mockRejectedValue(
+        Object.assign(new Error('READ_TIMEOUT: https://rpc.example/private?key=fixture-secret'), {
+          name: 'ReadTimeoutError',
+          label: 'Remote label',
+          timeoutMs: 10
+        })
+      )
+      await store[action]()
+      expect(store.connectError).toBe(
+        'Wallet connection read timed out. Open your wallet extension, check network access, then retry Connect Wallet.'
+      )
+      expect(store.address).toBeNull()
+    }
+  )
+
+  it('preserves connection rejection messaging and allows the next connection', async () => {
+    const provider = new SilentInjectedProvider()
+    provider.accounts = []
+    installProvider(provider)
+    const store = await loadStore()
+    await store.init()
+    provider.request.mockRejectedValueOnce(
+      Object.assign(new Error('User rejected'), { code: 4001 })
+    )
+    await store.connect()
+    expect(store.connectError).toBe('Connection request rejected.')
+    await store.connect()
+    expect(store.address).toBe(ACCOUNT)
+    expect(store.connectError).toBeNull()
   })
 })

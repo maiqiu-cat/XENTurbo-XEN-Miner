@@ -2,19 +2,41 @@
 
 import { Interface } from 'ethers'
 import { CHAIN_CONFIG, getChainConfig } from './chain-config.mjs'
+import {
+  isMainModule,
+  cliValue,
+  normalizeProbeUrl,
+  diagnosticError,
+  safeLogText
+} from './cli-utils.mjs'
+import { rpcBatchResults, rpcStringResult, rpcChainId, rpcAbiWord } from './rpc-response.mjs'
 
 const factoryInterface = new Interface(['function FEE() view returns (uint256)'])
 
 export async function checkRpcEndpoint(url, config, fetchImpl = fetch) {
-  const endpoint = new URL(url)
-  if (endpoint.protocol !== 'https:') {
-    return { url, healthy: false, error: 'HTTPS_REQUIRED: RPC endpoint must use https://.' }
+  try {
+    return await inspectRpcEndpoint(url, config, fetchImpl)
+  } catch (error) {
+    return {
+      url,
+      healthy: false,
+      error: `INVALID_RPC_RESPONSE: ${diagnosticError(error)}`
+    }
+  }
+}
+
+async function inspectRpcEndpoint(url, config, fetchImpl) {
+  try {
+    normalizeProbeUrl(url)
+  } catch (error) {
+    return { url, healthy: false, error: error.message }
   }
 
   let response
   try {
     response = await fetchImpl(url, {
       method: 'POST',
+      redirect: 'error',
       headers: { 'Content-Type': 'application/json' },
       signal: AbortSignal.timeout(10_000),
       body: JSON.stringify([
@@ -34,7 +56,7 @@ export async function checkRpcEndpoint(url, config, fetchImpl = fetch) {
     return {
       url,
       healthy: false,
-      error: `REQUEST_FAILED: ${error instanceof Error ? error.message : String(error)}`
+      error: `REQUEST_FAILED: ${diagnosticError(error)}`
     }
   }
 
@@ -47,23 +69,13 @@ export async function checkRpcEndpoint(url, config, fetchImpl = fetch) {
     return {
       url,
       healthy: false,
-      error: `INVALID_JSON: ${error instanceof Error ? error.message : String(error)}`
+      error: `INVALID_JSON: ${diagnosticError(error)}`
     }
   }
 
-  const results = new Map(Array.isArray(payload) ? payload.map((item) => [item.id, item]) : [])
-  const chainIdResult = results.get(1)
-  const feeResult = results.get(2)
-  if (!chainIdResult?.result || !feeResult?.result) {
-    return {
-      url,
-      healthy: false,
-      error: 'RPC_RESULT_MISSING: expected eth_chainId and factory FEE() results.'
-    }
-  }
-
-  const chainId = Number(BigInt(chainIdResult.result))
-  if (chainId !== config.chainId) {
+  const results = rpcBatchResults(payload, [1, 2])
+  const chainId = rpcChainId(rpcStringResult(results, 1, 'eth_chainId'))
+  if (chainId !== BigInt(config.chainId)) {
     return {
       url,
       healthy: false,
@@ -72,13 +84,14 @@ export async function checkRpcEndpoint(url, config, fetchImpl = fetch) {
   }
 
   try {
-    const [fee] = factoryInterface.decodeFunctionResult('FEE', feeResult.result)
-    return { url, healthy: true, chainId, fee }
+    const feeResult = rpcStringResult(results, 2, 'FEE')
+    const [fee] = factoryInterface.decodeFunctionResult('FEE', rpcAbiWord(feeResult, 'FEE'))
+    return { url, healthy: true, chainId: Number(chainId), fee }
   } catch (error) {
     return {
       url,
       healthy: false,
-      error: `FEE_CALL_FAILED: ${error instanceof Error ? error.message : String(error)}`
+      error: `FEE_CALL_FAILED: ${diagnosticError(error).replace(/^FEE_CALL_FAILED:\s*/, '')}`
     }
   }
 }
@@ -88,8 +101,8 @@ function parseArgs(argv) {
   const rpcUrls = []
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index]
-    if (value === '--chain') chain = argv[++index]
-    else if (value === '--rpc') rpcUrls.push(argv[++index])
+    if (value === '--chain') chain = cliValue(argv, ++index, value)
+    else if (value === '--rpc') rpcUrls.push(cliValue(argv, ++index, value))
     else throw new Error(`Unknown argument ${JSON.stringify(value)}. Use --chain and --rpc.`)
   }
   if (rpcUrls.length > 0 && !chain)
@@ -110,10 +123,12 @@ async function main() {
     for (const url of urls) {
       const result = await checkRpcEndpoint(url, config)
       if (result.healthy) {
-        console.log(`PASS ${result.url} https=true chainId=${result.chainId} FEE=${result.fee}`)
+        console.log(
+          safeLogText(`PASS ${result.url} https=true chainId=${result.chainId} FEE=${result.fee}`)
+        )
       } else {
         failed = true
-        console.error(`FAIL ${result.url} ${result.error}`)
+        console.error(safeLogText(`FAIL ${result.url} ${result.error}`))
       }
     }
   }
@@ -121,9 +136,9 @@ async function main() {
   if (failed) process.exitCode = 1
 }
 
-if (import.meta.url === new URL(process.argv[1], 'file:').href) {
+if (isMainModule(import.meta.url)) {
   main().catch((error) => {
-    console.error(error instanceof Error ? error.message : String(error))
+    console.error(diagnosticError(error))
     process.exitCode = 1
   })
 }

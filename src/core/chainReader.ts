@@ -79,10 +79,15 @@ export async function readVmuCount(
 }
 
 /** Read the current XEN global rank (for reward estimation). */
-export async function readGlobalRank(chain: ChainKey): Promise<number> {
+export async function readGlobalRank(
+  chain: ChainKey,
+  context: ChainReadContext = {}
+): Promise<number> {
   const provider = getReadProvider(chain)
   const xen = new Contract(CONTRACTS[chain].xenCrypto, XENCryptoABI as unknown as any[], provider)
-  const rank = await withRetry(() => xen.globalRank())
+  const rank = await withRetry(() => xen.globalRank(blockOverrides(context)), {
+    signal: context.signal
+  })
   const result = Number(rank)
   if (!Number.isSafeInteger(result) || result < 0)
     throw new Error('Invalid global rank returned by RPC')
@@ -100,6 +105,21 @@ export async function readFee(chain: ChainKey): Promise<bigint> {
   return (await withRetry(() => factory.FEE())) as bigint
 }
 
+export function timestampSecondsToMs(seconds: unknown, allowZero = false): number {
+  if (
+    typeof seconds !== 'number' ||
+    !Number.isSafeInteger(seconds) ||
+    seconds < (allowZero ? 0 : 1)
+  ) {
+    throw new Error('RPC returned an invalid timestamp')
+  }
+  const milliseconds = seconds * 1_000
+  if (!Number.isSafeInteger(milliseconds)) {
+    throw new Error('RPC returned an invalid timestamp')
+  }
+  return milliseconds
+}
+
 /** Latest block timestamp is the authoritative clock for maturity decisions. */
 export async function readChainTimestamp(
   chain: ChainKey,
@@ -109,11 +129,7 @@ export async function readChainTimestamp(
     () => getReadProvider(chain).getBlock(context.blockTag ?? 'latest'),
     { signal: context.signal }
   )
-  const timestamp = block?.timestamp
-  if (!Number.isSafeInteger(timestamp) || timestamp! <= 0) {
-    throw new Error('Latest block returned an invalid timestamp')
-  }
-  return timestamp! * 1_000
+  return timestampSecondsToMs(block?.timestamp)
 }
 
 export function classifyVmuStatus(
@@ -158,7 +174,7 @@ function decodeUserMint(
   try {
     const decoded = xenIface.decodeFunctionResult('userMints', res.returnData)
     const term = Number(decoded.term)
-    const maturityTs = Number(decoded.maturityTs) * 1000
+    const maturityTs = timestampSecondsToMs(Number(decoded.maturityTs), true)
     const rank = Number(decoded.rank)
     const amplifier = Number(decoded.amplifier)
     const eaaRate = Number(decoded.eaaRate)
