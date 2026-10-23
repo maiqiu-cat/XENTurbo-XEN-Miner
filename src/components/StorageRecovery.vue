@@ -93,7 +93,7 @@ async function recover() {
     message.value = active.signal.aborted
       ? 'Recovery cancelled or timed out. Inspect again; no unverified records were removed.'
       : error instanceof Error
-        ? normalizeError(error)
+        ? normalizeError(error, 'storage-recovery')
         : 'Recovery failed. Original records were retained.'
   } finally {
     clearTimeout(timer)

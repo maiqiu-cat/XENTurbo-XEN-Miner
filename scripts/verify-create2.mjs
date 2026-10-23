@@ -310,7 +310,13 @@ async function main() {
         if ([301, 302, 307, 308].includes(response.statusCode)) {
           throw new Error('RPC_REDIRECT_REQUIRES_EXPLICIT_URL: pass the final RPC URL with --rpc.')
         }
-        if (response.statusCode !== 429 || attempt === 2) return response
+        if (response.statusCode !== 429) return response
+        if (attempt === 2) {
+          console.log(
+            'RPC_RATE_LIMITED: HTTP 429 persisted after 3 attempts. Wait before retrying a fresh full verification.'
+          )
+          return response
+        }
         const delay = rateLimitDelay(
           response.headers['retry-after'],
           attempt,

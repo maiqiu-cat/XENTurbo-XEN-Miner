@@ -896,11 +896,18 @@ test('a stalled initial wallet read times out and Connect Wallet can recover', a
   await emulateDesktopGoogleChrome(page)
   await mockSameOriginRpc(page)
   await installInjectedWallet(page, { initiallyStalled: ['eth_accounts'] })
+  const errors: string[] = []
+  page.on('pageerror', (error) => errors.push(error.message))
   await page.clock.install()
   await page.goto('/')
   await expect(page.getByRole('heading', { name: 'XENTurbo XEN Miner' })).toBeVisible()
   await page.clock.runFor(15_100)
-  await expect(page.locator('.connect-err')).toContainText('READ_TIMEOUT')
+  await expect(page.locator('.connect-err')).toContainText('Wallet connection read timed out.')
+  await expect(page.locator('.connect-err')).toContainText(
+    'Initial wallet accounts exceeded 15000 ms.'
+  )
+  await expect(page.locator('.connect-err')).not.toContainText('READ_TIMEOUT')
+  await captureQaScreenshot(page, 'wallet-init-timeout-detail')
 
   await page.evaluate(() => window.__walletMock.setStalled('eth_accounts', false))
   await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
@@ -910,6 +917,7 @@ test('a stalled initial wallet read times out and Connect Wallet can recover', a
     sendAttempts: 0,
     successfulBroadcasts: 0
   })
+  expect(errors).toEqual([])
   await captureQaScreenshot(page, 'wallet-init-recovered')
 })
 
@@ -1393,9 +1401,69 @@ test('storage recovery exports original evidence and repairs only wallet-settled
   expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
 })
 
+test('storage recovery stops after a durable backup if transaction evidence changes', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page)
+  const errors: string[] = []
+  page.on('pageerror', (error) => errors.push(error.message))
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+  const original = await page.evaluate(
+    ({ wallet, hash }) => {
+      const raw = JSON.stringify([
+        { chain: 'eth', wallet, txHash: hash, batch: 'damaged', ids: ['1'] }
+      ])
+      localStorage.setItem('sm.vmuLocks', raw)
+      window.__walletMock.setMinedReceipt(true)
+      const set = Storage.prototype.setItem
+      Storage.prototype.setItem = function (key, value) {
+        set.call(this, key, value)
+        if (key.startsWith('sm.storageRecovery.backup.')) {
+          set.call(this, 'sm.pendingOps.event.concurrent', '{unreadable-concurrent-evidence')
+        }
+      }
+      return raw
+    },
+    { wallet: ACCOUNT_A, hash: TX_HASH }
+  )
+  await page.getByRole('button', { name: 'Transaction storage recovery', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Transaction storage recovery' })
+  const download = page.waitForEvent('download')
+  await dialog.getByRole('button', { name: 'Export backup' }).click()
+  await download
+  await dialog.getByRole('checkbox').check()
+  await dialog.getByRole('button', { name: 'Verify and repair' }).click()
+  await expect(dialog.getByRole('status')).toContainText('Transaction records changed')
+  await expect(dialog.getByRole('status')).not.toContainText('archived and repaired')
+  const stored = await page.evaluate(() => {
+    const keys = Object.keys(localStorage).filter((key) =>
+      key.startsWith('sm.storageRecovery.backup.')
+    )
+    return {
+      locks: localStorage.getItem('sm.vmuLocks'),
+      concurrent: localStorage.getItem('sm.pendingOps.event.concurrent'),
+      backups: keys.map((key) => JSON.parse(localStorage.getItem(key)!))
+    }
+  })
+  expect(stored.locks).toBe(original)
+  expect(stored.concurrent).toBe('{unreadable-concurrent-evidence')
+  expect(stored.backups).toHaveLength(1)
+  expect(stored.backups[0].entries).toContainEqual({ key: 'sm.vmuLocks', raw: original })
+  await captureQaScreenshot(page, 'recovery-post-backup-change')
+  await dialog.getByRole('button', { name: 'Close recovery' }).click()
+  await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeDisabled()
+  expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+  expect(errors).toEqual([])
+})
+
 test('closing a repaired dialog stays blocked until post-recovery wallet reconciliation succeeds', async ({
   page
 }) => {
+  await page.clock.install()
   await emulateDesktopGoogleChrome(page)
   await mockSameOriginRpc(page)
   await installInjectedWallet(page)
@@ -1420,6 +1488,7 @@ test('closing a repaired dialog stays blocked until post-recovery wallet reconci
       const request = provider.request.bind(provider)
       let reject!: (error: Error) => void
       let release!: (value: string) => void
+      let blocked = true
       const gate = new Promise<string>((resolve, fail) => {
         release = resolve
         reject = fail
@@ -1427,12 +1496,15 @@ test('closing a repaired dialog stays blocked until post-recovery wallet reconci
       window.__pendingCheckGate = {
         reads: 0,
         reject: () => reject(new Error('Recovery reconciliation offline fixture')),
-        release: () => release('0x0')
+        release: () => {
+          blocked = false
+          release('0x0')
+        }
       }
       provider.request = async (args) => {
         if (args.method === 'eth_getTransactionCount') {
           window.__pendingCheckGate.reads += 1
-          if (window.__pendingCheckGate.reads <= 2) return gate
+          if (blocked) return gate
         }
         return request(args)
       }
@@ -1460,6 +1532,14 @@ test('closing a repaired dialog stays blocked until post-recovery wallet reconci
     page.getByText('Blocked: pending transaction check failed. Recheck before submitting.').first()
   ).toBeVisible()
   await expect(mint).toBeDisabled()
+  // Even an idle poll must keep failing until this fixture explicitly restores the wallet.
+  await page.clock.runFor(30_001)
+  await expect.poll(() => page.evaluate(() => window.__pendingCheckGate.reads)).toBeGreaterThan(2)
+  await expect(mint).toBeDisabled()
+  await expect(
+    page.getByText('Blocked: pending transaction check failed. Recheck before submitting.').first()
+  ).toBeVisible()
+  await page.evaluate(() => window.__pendingCheckGate.release())
   await page.getByRole('button', { name: 'Recheck', exact: true }).click()
   await expect(mint).toBeEnabled()
   expect(await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks')!))).toEqual([])

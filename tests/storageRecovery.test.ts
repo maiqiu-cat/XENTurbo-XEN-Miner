@@ -172,6 +172,39 @@ describe('receipt-authenticated transaction storage recovery', () => {
     )
     expect(request).not.toHaveBeenCalled()
   })
+  it.each(['storage', 'abort'] as const)(
+    'retains the verified backup and every original when %s changes after backup',
+    async (kind) => {
+      const raw = JSON.stringify(badEvent)
+      localStorage.setItem(eventKey, raw)
+      const snapshot = inspectTransactionStorage()
+      const controller = new AbortController()
+      const set = localStorage.setItem.bind(localStorage)
+      const write = vi.spyOn(localStorage, 'setItem').mockImplementation((key, value) => {
+        set(key, value)
+        if (!key.startsWith('sm.storageRecovery.backup.')) return
+        // Another tab can add evidence while the backup is being persisted.
+        if (kind === 'storage') set('sm.vmuLocks', JSON.stringify([validLock]))
+        else controller.abort()
+      })
+      const remove = vi.spyOn(localStorage, 'removeItem')
+      const recovery = recoverTransactionStorage(snapshot, 'eth', wallet, controller.signal)
+      if (kind === 'storage') await expect(recovery).rejects.toThrow('Transaction records changed')
+      else await expect(recovery).rejects.toMatchObject({ name: 'AbortError' })
+      const backups = write.mock.calls.filter(([key]) =>
+        key.startsWith('sm.storageRecovery.backup.')
+      )
+      expect(backups).toHaveLength(1)
+      expect(localStorage.getItem(backups[0][0])).toBe(storageBackupJson(snapshot))
+      expect(localStorage.getItem(eventKey)).toBe(raw)
+      expect(localStorage.getItem('sm.vmuLocks')).toBe(
+        kind === 'storage' ? JSON.stringify([validLock]) : null
+      )
+      expect(remove).not.toHaveBeenCalled()
+      expect(write).toHaveBeenCalledTimes(1)
+      expect(request.mock.calls.some(([args]) => args.method === 'eth_sendTransaction')).toBe(false)
+    }
+  )
   it.each(['wallet', 'storage', 'abort'] as const)(
     'stops before mutation if %s changes during wallet verification',
     async (kind) => {

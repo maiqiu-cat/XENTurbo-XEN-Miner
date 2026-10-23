@@ -397,7 +397,11 @@ describe('CREATE2 verification release gate', () => {
       expect(result.stdout).toContain('fresh full verification')
       expect(result.stdout).not.toContain('resume with')
       expect(result.stdout).not.toContain('CREATE2 derivation VERIFIED')
-      if ('rateLimitAlways' in failure) expect(result.stderr).toContain('SERVER_ERROR')
+      if ('rateLimitAlways' in failure) {
+        expect(result.stderr).toContain('SERVER_ERROR')
+        expect(result.stdout).toContain('RPC_RATE_LIMITED: HTTP 429 persisted after 3 attempts.')
+        expect(result.stdout).toContain('Wait before retrying a fresh full verification.')
+      } else expect(result.stdout).not.toContain('RPC_RATE_LIMITED')
       expect(result.openConnections).toBe(0)
     }
   )
@@ -429,6 +433,27 @@ describe('CREATE2 verification release gate', () => {
       rateLimitDelay('Thu, 22 Oct 2026 12:00:01 GMT', 0, 1500, Date.UTC(2026, 9, 22, 12))
     ).toBe(1000)
   })
+
+  it.each(['60, 60', '3, 3'])(
+    'bounds fallback for a single malformed Retry-After value: %s',
+    (header) => {
+      const now = Date.UTC(2026, 9, 23)
+      expect(rateLimitDelay(header, 0, 1500, now)).toBe(100)
+      expect(rateLimitDelay(header, 1, 1500, now)).toBe(200)
+      expect(() => rateLimitDelay(header, 1, 200, now)).toThrow('RATE_LIMIT_BACKOFF_EXCEEDS_BUDGET')
+    }
+  )
+
+  it.each(['60, 60', '3, 3'])(
+    'recovers through the HTTP transport from one 429 with a malformed header: %s',
+    async (retryAfter) => {
+      const result = await runVerification({ activeIds: [1], rateLimitOnce: true, retryAfter })
+      expect(result.code).toBe(0)
+      expect(result.stdout).toContain('CREATE2 derivation VERIFIED')
+      expect(result.stdout).not.toContain('RPC_RATE_LIMITED')
+      expect(result.openConnections).toBe(0)
+    }
+  )
 
   it.each(['--wallet', '--rpc', '--chain'])(
     'rejects a missing %s value without silently choosing defaults',

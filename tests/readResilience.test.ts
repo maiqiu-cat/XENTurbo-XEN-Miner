@@ -70,6 +70,17 @@ describe('bounded read recovery', () => {
     expect(normalizeError(new Error(`${code}: private fixture`))).toBe(message)
   })
 
+  it.each(['LOCK_STORAGE_INVALID', 'PENDING_STORAGE_READ_FAILED', 'PENDING_STORAGE_WRITE_FAILED'])(
+    'uses in-dialog recovery guidance for %s without changing the default entry guidance',
+    (code) => {
+      const error = new Error(`${code}: private fixture`)
+      expect(normalizeError(error, 'storage-recovery')).toBe(
+        'Local transaction storage is unavailable or damaged. Restore storage access, then inspect again. Do not clear site data or resend; check wallet Activity first.'
+      )
+      expect(normalizeError(error)).toContain('Open transaction storage recovery.')
+    }
+  )
+
   it('times out a stalled read and ignores its late success', async () => {
     vi.useFakeTimers()
     let resolve!: (value: number) => void

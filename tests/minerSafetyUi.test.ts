@@ -67,13 +67,13 @@ afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
 })
-function render() {
+function render(realPendingPanel = false) {
   wrapper = mount(MinerView, {
     global: {
       stubs: {
         WalletButton: true,
         RpcSettings: true,
-        PendingOpsPanel: true,
+        PendingOpsPanel: !realPendingPanel,
         MintList: {
           props: ['busy', 'blockedReason'],
           template: '<div data-testid="mint-list" :data-busy="busy">{{ blockedReason }}</div>'
@@ -157,7 +157,7 @@ it.each(['PENDING_STORAGE_READ_FAILED', 'LOCK_STORAGE_INVALID'])(
     vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:offline-test')
     vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
     vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
-    const view = render()
+    const view = render(true)
     await flushPromises()
     localStorage.setItem('sm.vmuLocks', JSON.stringify([{ damaged: true }]))
     const recovery = view.getComponent(StorageRecovery)
@@ -214,8 +214,17 @@ it.each(['PENDING_STORAGE_READ_FAILED', 'LOCK_STORAGE_INVALID'])(
     // No polling timers run: only the real recovery callback can have requested this check.
     expect(refreshPendingOps).toHaveBeenCalledOnce()
     vi.mocked(refreshPendingOps).mockResolvedValue(empty)
-    view.findComponent({ name: 'PendingOpsPanel' }).vm.$emit('recheck')
+    await view
+      .findAll('button')
+      .find((button) => button.text() === 'Recheck')!
+      .trigger('click')
     await flushPromises()
+    expect(refreshPendingOps).toHaveBeenCalledTimes(2)
+    expect(refreshPendingOps).toHaveBeenLastCalledWith(
+      'eth',
+      useWalletStore().address,
+      expect.objectContaining({ reverifyResults: true })
+    )
     expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('false')
     expect(mint().attributes('disabled')).toBeUndefined()
     expect(sendPreparedOperation).not.toHaveBeenCalled()

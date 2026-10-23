@@ -9,7 +9,8 @@ import {
   MAX_RPC_INPUT_LENGTH,
   MAX_RPC_URL_LENGTH
 } from '@/config/chains'
-import { withReadDeadline } from '@/core/readDeadline'
+import { ReadTimeoutError, withReadDeadline } from '@/core/readDeadline'
+import { normalizeError } from '@/core/txManager'
 import {
   ensureRecentReadProvider,
   ensureHealthyReadProvider,
@@ -41,6 +42,41 @@ beforeEach(() => {
 })
 
 describe('RPC retry policy', () => {
+  it('preserves the production read timeout type and label through UI normalization', async () => {
+    vi.useFakeTimers()
+    const operation = vi.fn(() => new Promise<string>(() => {}))
+    const result = withRetry(operation, { retries: 0, timeoutMs: 50 }).catch(
+      (error: unknown) => error
+    )
+    await vi.advanceTimersByTimeAsync(50)
+    const error = await result
+    expect(error).toBeInstanceOf(ReadTimeoutError)
+    expect(error).toMatchObject({ label: 'RPC read', timeoutMs: 50 })
+    expect(normalizeError(error)).toContain('RPC read exceeded 50 ms.')
+    expect(normalizeError(error)).not.toContain('READ_TIMEOUT')
+    expect(operation).toHaveBeenCalledOnce()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('stops before another RPC call when backoff consumes the total retry budget', async () => {
+    vi.useFakeTimers()
+    const operation = vi.fn(async () => {
+      throw Object.assign(new Error('rate limit'), { status: 429, retryAfterMs: 100 })
+    })
+    const result = withRetry(operation, {
+      totalTimeoutMs: 100,
+      jitterRatio: 0
+    }).catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(100)
+    const error = await result
+    expect(error).toBeInstanceOf(ReadTimeoutError)
+    expect(error).toMatchObject({ label: 'RPC retry deadline', timeoutMs: 100 })
+    expect(normalizeError(error)).toContain('RPC retry deadline exceeded 100 ms.')
+    expect(normalizeError(error)).toContain('Do not resend.')
+    expect(operation).toHaveBeenCalledOnce()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it('does not retry semantic contract failures', async () => {
     const operation = vi.fn(async () => {
       throw Object.assign(new Error('execution reverted'), { code: 'CALL_EXCEPTION' })
@@ -94,6 +130,7 @@ describe('RPC retry policy', () => {
 
 afterEach(() => {
   resetProviders()
+  vi.useRealTimers()
   vi.unstubAllGlobals()
 })
 

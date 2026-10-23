@@ -1154,7 +1154,10 @@ export async function resumePendingLocks(chain: ChainKey, wallet: string): Promi
   return resolvedAny
 }
 
-export function normalizeError(err: any): string {
+export function normalizeError(
+  err: any,
+  context: 'transaction' | 'storage-recovery' = 'transaction'
+): string {
   const msg: string = err?.shortMessage || err?.reason || err?.message || String(err)
   if (/OPERATION_CANCELLED/i.test(msg)) return 'Operation cancelled. No transaction was submitted.'
   if (/OPERATION_ALREADY_STARTED/i.test(msg))
@@ -1163,8 +1166,13 @@ export function normalizeError(err: any): string {
     return 'The prepared transaction expired after 2 minutes. Estimate it again before signing.'
   if (/RPC_UNAVAILABLE|RPC_NOT_VALIDATED/i.test(msg))
     return 'No configured RPC endpoint responded on the expected network. Your RPC list was preserved. Check internet access, DNS, firewall, and proxy/VPN settings, then retry; or change endpoints in RPC settings.'
-  if (/PENDING_STORAGE_(?:READ|WRITE)_FAILED|LOCK_STORAGE_INVALID/i.test(msg))
-    return 'Local transaction storage is unavailable or damaged. Open transaction storage recovery. Do not clear site data or resend; check wallet Activity first.'
+  if (/PENDING_STORAGE_(?:READ|WRITE)_FAILED|LOCK_STORAGE_INVALID/i.test(msg)) {
+    const action =
+      context === 'storage-recovery'
+        ? 'Restore storage access, then inspect again.'
+        : 'Open transaction storage recovery.'
+    return `Local transaction storage is unavailable or damaged. ${action} Do not clear site data or resend; check wallet Activity first.`
+  }
   if (/WALLET_CONTEXT_CHANGED/i.test(msg))
     return 'Wallet account or network changed. Reconnect the original account and network, then recheck transaction records. Do not resend.'
   if (/READ_TIMEOUT/i.test(msg)) {

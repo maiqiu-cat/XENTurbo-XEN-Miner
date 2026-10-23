@@ -87,7 +87,7 @@ it('shows damage classifications without rendering the damaged payload', async (
   expect(issues.querySelector('img')).toBeNull()
 })
 
-it('explains that a damaged lock without a hash cannot be repaired here and keeps it intact', async () => {
+it('explains the no-hash limitation and displays the blocked result returned by recovery', async () => {
   const evidence = JSON.stringify([{ chain: 'eth', wallet, ids: ['1'], batch: 'damaged' }])
   localStorage.setItem('sm.vmuLocks', evidence)
   await open()
@@ -142,6 +142,9 @@ it.each([
   expect(status()).toContain(message)
   expect(status()).not.toContain(code)
   expect(status()).toMatch(/Do not (?:clear site data or )?resend/)
+  expect(status()).not.toContain('Open transaction storage recovery')
+  if (code === 'LOCK_STORAGE_INVALID' || code === 'PENDING_STORAGE_READ_FAILED')
+    expect(status()).toContain('Restore storage access, then inspect again.')
   expect(localStorage.getItem('sm.vmuLocks')).toBe(JSON.stringify([{ unknown: true }]))
 })
 

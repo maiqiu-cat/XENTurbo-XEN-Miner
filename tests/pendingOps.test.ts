@@ -189,12 +189,50 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
   vi.resetModules()
   vi.clearAllMocks()
 })
 
 describe('pending operation reconciliation', () => {
+  it.each([true, false])(
+    'bounds the production RPC health read and permits reconciliation retry (freshRpc=%s)',
+    async (freshRpc) => {
+      const { pending, provider, ensureHealthyReadProvider, releaseLock, releaseLocksByTxHash } =
+        await installPendingHarness({ latestNonce: 7, pendingNonce: 7 })
+      const { ReadTimeoutError, READ_TIMEOUT_MS } = await import('../src/core/readDeadline')
+      const { normalizeError } = await import('../src/core/txManager')
+      const gate = deferred<typeof provider>()
+      ensureHealthyReadProvider.mockReturnValueOnce(gate.promise)
+      recordBroadcast(pending)
+      const before = JSON.stringify(pending.listPendingOps('eth', WALLET))
+      vi.useFakeTimers()
+      const result = pending
+        .refreshPendingOps('eth', WALLET, { freshRpc })
+        .catch((error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(READ_TIMEOUT_MS)
+      const error = await result
+      expect(error).toBeInstanceOf(ReadTimeoutError)
+      expect(error).toMatchObject({ label: 'RPC health check', timeoutMs: READ_TIMEOUT_MS })
+      expect(normalizeError(error)).toContain('RPC health check exceeded 15000 ms.')
+      expect(normalizeError(error)).not.toContain('READ_TIMEOUT')
+      expect(provider.getTransactionReceipt).not.toHaveBeenCalled()
+      expect(releaseLock).not.toHaveBeenCalled()
+      expect(releaseLocksByTxHash).not.toHaveBeenCalled()
+      expect(JSON.stringify(pending.listPendingOps('eth', WALLET))).toBe(before)
+      expect(vi.getTimerCount()).toBe(0)
+      gate.resolve(provider)
+      await Promise.resolve()
+      expect(JSON.stringify(pending.listPendingOps('eth', WALLET))).toBe(before)
+      await expect(pending.refreshPendingOps('eth', WALLET, { freshRpc })).resolves.toMatchObject({
+        unresolvedCount: 1
+      })
+      expect(ensureHealthyReadProvider).toHaveBeenCalledTimes(2)
+      expect(vi.getTimerCount()).toBe(0)
+    }
+  )
+
   it.each([null, { status: 1 }])(
     'legacy lock recovery requires wallet receipt evidence',
     async (walletReceipt) => {
