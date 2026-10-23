@@ -62,6 +62,8 @@ export function usePendingTx(
       return Promise.resolve(0)
     }
     const myGen = gen
+    // Recovery/manual verification must not reuse readiness from before storage changed.
+    if (options.reverifyResults) ready.value = false
     if (active?.generation === myGen) {
       queued.value = true
       if (!trailing) {
@@ -88,7 +90,7 @@ export function usePendingTx(
         localUnresolvedCount.value = unresolvedCount
         ops.value = views
         lastCheckedAt.value = Date.now()
-        ready.value = pageVisible()
+        ready.value = pageVisible() && trailing?.options.reverifyResults !== true
         if (confirmedOps?.length) onConfirmed?.(confirmedOps)
         return pendingNonceGap
       })

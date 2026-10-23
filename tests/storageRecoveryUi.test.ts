@@ -3,6 +3,7 @@ import { mount, flushPromises } from '@vue/test-utils'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import StorageRecovery from '@/components/StorageRecovery.vue'
 import { recoverTransactionStorage } from '@/core/storageRecovery'
+import { ReadTimeoutError } from '@/core/readDeadline'
 
 vi.mock('@/core/storageRecovery', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/core/storageRecovery')>()),
@@ -86,6 +87,21 @@ it('shows damage classifications without rendering the damaged payload', async (
   expect(issues.querySelector('img')).toBeNull()
 })
 
+it('explains that a damaged lock without a hash cannot be repaired here and keeps it intact', async () => {
+  const evidence = JSON.stringify([{ chain: 'eth', wallet, ids: ['1'], batch: 'damaged' }])
+  localStorage.setItem('sm.vmuLocks', evidence)
+  await open()
+  const dialog = document.querySelector('[role="dialog"]')!
+  expect(dialog.textContent).toContain('without a transaction hash cannot be verified here')
+  expect(dialog.textContent).toContain('exported backup for manual investigation')
+  expect(dialog.textContent).toContain('mining stays blocked for this site in this browser profile')
+  await authorize()
+  button('Verify and repair').click()
+  await flushPromises()
+  expect(status()).toContain('1 record(s) remain blocked')
+  expect(localStorage.getItem('sm.vmuLocks')).toBe(evidence)
+})
+
 it('explains all retained-record reasons and requires fresh authorization after verification', async () => {
   vi.mocked(recoverTransactionStorage).mockResolvedValue({
     repaired: 0,
@@ -114,6 +130,8 @@ it('explains all retained-record reasons and requires fresh authorization after 
 it.each([
   ['WALLET_CONTEXT_CHANGED', 'Wallet account or network changed'],
   ['READ_TIMEOUT', 'Wallet or network read timed out'],
+  ['LOCK_STORAGE_INVALID', 'Local transaction storage is unavailable or damaged'],
+  ['PENDING_STORAGE_READ_FAILED', 'Local transaction storage is unavailable or damaged'],
   ['WALLET_EVIDENCE_UNAVAILABLE', 'Wallet transaction evidence is unavailable']
 ])('shows actionable text for %s without raw prefixes', async (code, message) => {
   vi.mocked(recoverTransactionStorage).mockRejectedValue(new Error(`${code}: fixture details`))
@@ -123,8 +141,21 @@ it.each([
   await flushPromises()
   expect(status()).toContain(message)
   expect(status()).not.toContain(code)
-  expect(status()).toContain('Do not resend')
+  expect(status()).toMatch(/Do not (?:clear site data or )?resend/)
   expect(localStorage.getItem('sm.vmuLocks')).toBe(JSON.stringify([{ unknown: true }]))
+})
+
+it('preserves the wallet receipt timeout label in recovery without raw error prefixes', async () => {
+  vi.mocked(recoverTransactionStorage).mockRejectedValue(
+    new ReadTimeoutError('Wallet eth_getTransactionReceipt', 15_000)
+  )
+  await open()
+  await authorize()
+  button('Verify and repair').click()
+  await flushPromises()
+  expect(status()).toContain('Wallet eth_getTransactionReceipt exceeded 15000 ms.')
+  expect(status()).toContain('Do not resend.')
+  expect(status()).not.toContain('READ_TIMEOUT')
 })
 
 it.each(['wallet', 'chain', 'unmount'] as const)(
@@ -146,12 +177,55 @@ it.each(['wallet', 'chain', 'unmount'] as const)(
     if (kind === 'wallet')
       await view.setProps({ wallet: '0x2222222222222222222222222222222222222222' })
     else if (kind === 'chain') await view.setProps({ chain: 'polygon' })
-    else view.unmount()
+    else {
+      view.unmount()
+      wrapper = undefined
+    }
     await flushPromises()
     expect(signal?.aborted).toBe(true)
     expect(onOpen).toHaveBeenLastCalledWith(false)
     expect(document.querySelector('[role="dialog"]')).toBeNull()
-    if (kind === 'unmount') wrapper = undefined
+  }
+)
+
+it.each(['close button', 'backdrop'] as const)(
+  'aborts in-flight recovery through the %s without losing evidence or reopening the dialog',
+  async (interaction) => {
+    let signal: AbortSignal | undefined
+    let reject!: (error: Error) => void
+    vi.mocked(recoverTransactionStorage).mockImplementation(
+      (_snapshot, _chain, _wallet, active) => {
+        signal = active
+        return new Promise((_resolve, fail) => {
+          reject = fail
+        })
+      }
+    )
+    const evidence = localStorage.getItem('sm.vmuLocks')
+    const view = await open()
+    await authorize()
+    button('Verify and repair').click()
+    await flushPromises()
+    const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!
+    dialog.click()
+    await flushPromises()
+    expect(signal?.aborted).toBe(false)
+    if (interaction === 'close button')
+      document.querySelector<HTMLButtonElement>('[aria-label="Close recovery"]')!.click()
+    else document.querySelector<HTMLElement>('.recovery-mask')!.click()
+    await flushPromises()
+    expect(signal?.aborted).toBe(true)
+    expect(onOpen).toHaveBeenLastCalledWith(false)
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+    reject(new Error('Late recovery response'))
+    await flushPromises()
+    expect(view.emitted('changed')).toHaveLength(1)
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+    expect(localStorage.getItem('sm.vmuLocks')).toBe(evidence)
+    await view.get('button').trigger('click')
+    expect(status()).toBe('')
+    expect(button('Verify and repair').disabled).toBe(true)
+    expect(recoverTransactionStorage).toHaveBeenCalledOnce()
   }
 )
 

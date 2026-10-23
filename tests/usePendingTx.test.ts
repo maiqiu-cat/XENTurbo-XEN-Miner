@@ -330,12 +330,61 @@ describe('usePendingTx', () => {
     )
     expect(completed).toBe(false)
     expect(state.checking.value).toBe(true)
+    expect(state.ready.value).toBe(false)
     second.resolve({ views: [], pendingNonceGap: 1, unresolvedCount: 1, confirmedOps: [] })
     await Promise.all([explicit, reuse])
     expect(completed).toBe(true)
     expect(state.hasPending.value).toBe(true)
     scope.stop()
   })
+
+  it.each([false, true])(
+    'invalidates prior readiness until explicit revalidation completes (queued: %s)',
+    async (queued) => {
+      const empty = { views: [], pendingNonceGap: 0, unresolvedCount: 0, confirmedOps: [] }
+      vi.mocked(refreshPendingOps).mockResolvedValue(empty)
+      const scope = effectScope()
+      const first = deferred<typeof empty>()
+      const verified = deferred<typeof empty>()
+      const state = scope.run(() =>
+        usePendingTx(
+          () => '0x1',
+          () => 'eth'
+        )
+      )!
+      try {
+        await vi.waitFor(() => expect(state.ready.value).toBe(true))
+        vi.mocked(refreshPendingOps).mockClear()
+        let polling: Promise<number> | undefined
+        if (queued) {
+          vi.mocked(refreshPendingOps).mockReturnValueOnce(first.promise)
+          polling = state.check({ freshRpc: false })
+          expect(state.ready.value).toBe(true)
+        }
+        vi.mocked(refreshPendingOps).mockReturnValueOnce(verified.promise)
+        const explicit = state.check({ reverifyResults: true })
+        expect(state.ready.value).toBe(false)
+        if (queued) {
+          first.resolve(empty)
+          await polling
+          expect(state.ready.value).toBe(false)
+        }
+        expect(refreshPendingOps).toHaveBeenLastCalledWith(
+          'eth',
+          '0x1',
+          expect.objectContaining({ reverifyResults: true })
+        )
+        verified.resolve(empty)
+        await explicit
+        expect(state.ready.value).toBe(true)
+        expect(state.checking.value).toBe(false)
+      } finally {
+        first.resolve(empty)
+        verified.resolve(empty)
+        scope.stop()
+      }
+    }
+  )
 
   it('invalidates readiness while hidden until the visibility refresh succeeds', async () => {
     const empty = { views: [], pendingNonceGap: 0, unresolvedCount: 0, confirmedOps: [] }

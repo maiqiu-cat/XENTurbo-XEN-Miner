@@ -8,7 +8,7 @@ import {
   type ChainKey
 } from '@/config/chains'
 import { CONTRACTS } from '@/config/contracts'
-import { withReadDeadline } from './readDeadline'
+import { ReadTimeoutError, withReadDeadline } from './readDeadline'
 import { mapWithConcurrency } from '@/utils/concurrency'
 
 export type ReadProvider = JsonRpcProvider | FallbackProvider
@@ -473,7 +473,8 @@ export async function withRetry<T>(
     if (opts.signal?.aborted) throw abortReason(opts.signal)
     try {
       const remaining = deadline - Date.now()
-      if (remaining <= 0) throw new Error('READ_TIMEOUT: RPC retry deadline exceeded')
+      if (remaining <= 0)
+        throw new ReadTimeoutError('RPC retry deadline', opts.totalTimeoutMs ?? 30_000)
       return await withReadDeadline(fn, 'RPC read', {
         timeoutMs: Math.min(opts.timeoutMs ?? 12_000, remaining),
         signal: opts.signal

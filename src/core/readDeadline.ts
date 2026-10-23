@@ -1,5 +1,25 @@
 export const READ_TIMEOUT_MS = 15_000
 
+export class ReadTimeoutError extends Error {
+  constructor(
+    readonly label: string,
+    readonly timeoutMs: number
+  ) {
+    super(`READ_TIMEOUT: ${label} exceeded ${timeoutMs} ms`)
+    this.name = 'ReadTimeoutError'
+  }
+
+  get diagnostic(): string {
+    // Only local operation labels, never a raw RPC error or endpoint, enter the UI.
+    const label = /^[A-Za-z][A-Za-z0-9_ -]{0,79}$/.test(this.label) ? this.label : 'Read operation'
+    const limit =
+      Number.isSafeInteger(this.timeoutMs) && this.timeoutMs > 0
+        ? `${this.timeoutMs} ms`
+        : 'its time limit'
+    return `${label} exceeded ${limit}.`
+  }
+}
+
 /** Bounds reads only. A wallet send is non-cancellable and must never use this helper. */
 export function withReadDeadline<T>(
   read: () => Promise<T>,
@@ -19,7 +39,7 @@ export function withReadDeadline<T>(
     }
     const aborted = () => finish(() => reject(signal?.reason ?? abortError()))
     const timer = setTimeout(
-      () => finish(() => reject(new Error(`READ_TIMEOUT: ${label} exceeded ${timeoutMs} ms`))),
+      () => finish(() => reject(new ReadTimeoutError(label, timeoutMs))),
       timeoutMs
     )
     signal?.addEventListener('abort', aborted, { once: true })

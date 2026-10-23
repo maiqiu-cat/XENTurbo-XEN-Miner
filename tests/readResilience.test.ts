@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { withReadDeadline } from '@/core/readDeadline'
+import { ReadTimeoutError, withReadDeadline } from '@/core/readDeadline'
+import { normalizeError } from '@/core/txManager'
 
 afterEach(() => {
   vi.useRealTimers()
@@ -8,6 +9,67 @@ afterEach(() => {
 })
 
 describe('bounded read recovery', () => {
+  it.each([
+    'Wallet eth_getTransactionCount',
+    'Wallet eth_getTransactionReceipt',
+    'RPC health check',
+    'RPC read'
+  ])('keeps the local timeout label for %s in actionable diagnostics', async (label) => {
+    vi.useFakeTimers()
+    const result = withReadDeadline(() => new Promise(() => {}), label, { timeoutMs: 50 }).catch(
+      (error: unknown) => normalizeError(error)
+    )
+    await vi.advanceTimersByTimeAsync(50)
+    const message = await result
+    expect(message).toContain('Wallet or network read timed out.')
+    expect(message).toContain(`${label} exceeded 50 ms.`)
+    expect(message).toContain('Do not resend.')
+    expect(message).not.toContain('READ_TIMEOUT')
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('does not render untrusted timeout details or forged metadata from RPC errors', () => {
+    const endpoint = new URL('https://rpc.example/private')
+    endpoint.username = 'fixture-user'
+    endpoint.password = 'fixture-password'
+    const error = Object.assign(new Error(`READ_TIMEOUT: ${endpoint.href}`), {
+      name: 'ReadTimeoutError',
+      label: endpoint.href,
+      timeoutMs: 50
+    })
+    expect(normalizeError(error)).toBe(
+      'Wallet or network read timed out. Check your connection and wallet, then recheck transaction records. Do not resend.'
+    )
+  })
+
+  it.each([
+    'https://rpc.example/private?key=fixture-secret',
+    'x\nAuthorization secret',
+    'x'.repeat(81)
+  ])('hides an invalid local operation label: %s', (label) => {
+    const message = normalizeError(new ReadTimeoutError(label, 50))
+    expect(message).toContain('Read operation exceeded 50 ms.')
+    expect(message).not.toContain(label)
+  })
+
+  it.each([
+    ['OPERATION_CANCELLED', 'Operation cancelled. No transaction was submitted.'],
+    [
+      'OPERATION_ALREADY_STARTED',
+      'This prepared operation has already started or finished. Check wallet Activity and recheck pending operations. Do not resend.'
+    ],
+    [
+      'LOCK_STORAGE_INVALID',
+      'Local transaction storage is unavailable or damaged. Open transaction storage recovery. Do not clear site data or resend; check wallet Activity first.'
+    ],
+    [
+      'PENDING_STORAGE_READ_FAILED',
+      'Local transaction storage is unavailable or damaged. Open transaction storage recovery. Do not clear site data or resend; check wallet Activity first.'
+    ]
+  ])('maps %s without exposing raw diagnostic details', (code, message) => {
+    expect(normalizeError(new Error(`${code}: private fixture`))).toBe(message)
+  })
+
   it('times out a stalled read and ignores its late success', async () => {
     vi.useFakeTimers()
     let resolve!: (value: number) => void

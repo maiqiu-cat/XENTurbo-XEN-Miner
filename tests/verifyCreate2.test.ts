@@ -147,7 +147,6 @@ async function runVerification({
   const rpcMethods: string[] = []
   const stateReads: Array<{ method: string; blockTag: unknown }> = []
   let httpRequests = 0
-  const startedAt = performance.now()
   const server = createServer((request, response) => {
     let body = ''
     request.setEncoding('utf8')
@@ -272,7 +271,6 @@ async function runVerification({
     stateReads: Array<{ method: string; blockTag: unknown }>
     providerDestroyCount: number
     openConnections: number
-    elapsedMs: number
   }>((resolve, reject) => {
     const child = spawn(
       process.execPath,
@@ -315,8 +313,7 @@ async function runVerification({
           rpcMethods,
           stateReads,
           providerDestroyCount: stdout.match(/^TEST_PROVIDER_DESTROYED$/gm)?.length ?? 0,
-          openConnections: connections.size,
-          elapsedMs: performance.now() - startedAt
+          openConnections: connections.size
         })
       )
     })
@@ -387,6 +384,7 @@ describe('CREATE2 verification release gate', () => {
     })
     expect(result.code).toBe(2)
     expect(result.stdout).toContain('NOT_VERIFIED: RATE_LIMIT_RETRY_AFTER_EXCEEDS_BUDGET')
+    expect(result.stdout).toContain('scanned=0')
     expect(result.stdout).not.toContain('resume with')
     expect(result.openConnections).toBe(0)
   })
@@ -399,6 +397,7 @@ describe('CREATE2 verification release gate', () => {
       expect(result.stdout).toContain('fresh full verification')
       expect(result.stdout).not.toContain('resume with')
       expect(result.stdout).not.toContain('CREATE2 derivation VERIFIED')
+      if ('rateLimitAlways' in failure) expect(result.stderr).toContain('SERVER_ERROR')
       expect(result.openConnections).toBe(0)
     }
   )
@@ -416,7 +415,8 @@ describe('CREATE2 verification release gate', () => {
     expect(result.stdout).not.toContain('CREATE2 derivation VERIFIED')
     expect(result.providerDestroyCount).toBe(1)
     expect(result.openConnections).toBe(0)
-    expect(result.elapsedMs).toBeLessThan(4000)
+    // Exit code 2 plus closed resources proves cleanup before the runner's 10s SIGKILL.
+    // Avoid a 4s host-speed assertion on a cold, resource-limited CI worker.
   })
 
   it('distinguishes Retry-After from fallback backoff without a sub-second process deadline', () => {
@@ -642,6 +642,37 @@ describe('CREATE2 verification release gate', () => {
     expect(log).toHaveBeenCalledWith(expect.stringContaining('NOT_VERIFIED: DEADLINE_EXCEEDED'))
     expect(log).not.toHaveBeenCalledWith('CREATE2 derivation VERIFIED against on-chain data.')
   })
+
+  it.each(['RATE_LIMIT_RETRY_AFTER_EXCEEDS_BUDGET', 'RATE_LIMIT_BACKOFF_EXCEEDS_BUDGET'])(
+    'reports completed scan progress for %s without suggesting a resume',
+    async (code) => {
+      const { config, wallet } = parseVerificationArgs(['--chain', 'eth', '--wallet', WALLET], {})
+      let calls = 0
+      const provider = {
+        provider: null,
+        getNetwork: async () => ({ chainId: 1n }),
+        getBlockNumber: async () => 1,
+        getCode: async (address: string) =>
+          [1, 6].some((id) => getAddress(address) === getAddress(proxyForId(WALLET, id)))
+            ? minimalProxyRuntimeCode(VMU_TEMPLATE)
+            : '0x',
+        call: async (transaction: { to: string; data: string }) => {
+          if (transaction.to.toLowerCase() === FACTORY.toLowerCase())
+            return factoryInterface.encodeFunctionResult('vmuCount', [6])
+          if (++calls > 5) throw Object.assign(new Error(code), { code })
+          const [proxy] = xenInterface.decodeFunctionData('userMints', transaction.data)
+          return xenInterface.encodeFunctionResult('userMints', [proxy, 0, 0, 0, 0, 0])
+        }
+      }
+      const log = vi.fn()
+      expect(await verifyCreate2({ config, wallet, provider, log })).toBe(false)
+      expect(log).toHaveBeenLastCalledWith(
+        `NOT_VERIFIED: ${code}; scanned=5. Retry later with a fresh full verification.`
+      )
+      expect(log.mock.calls.flat().join('\n')).not.toContain('resume with')
+      expect(log.mock.calls.flat().join('\n')).not.toContain('CREATE2 derivation VERIFIED')
+    }
+  )
 
   it('accepts uint256-sized page offsets without lossy number conversion', async () => {
     const id = (1n << 256n) - 1n

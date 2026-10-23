@@ -7,6 +7,7 @@ import { refreshPendingOps } from '@/core/pendingOps'
 import { ensureHealthyReadProvider, resetProviders } from '@/core/rpc'
 import { useWalletStore } from '@/stores/walletStore'
 import { useVmuStore } from '@/stores/vmuStore'
+import { recoverTransactionStorage } from '@/core/storageRecovery'
 import {
   abortPrepared,
   prepareOperation,
@@ -34,6 +35,10 @@ vi.mock('@/core/pendingOps', async (importOriginal) => ({
 vi.mock('@/composables/useGasPrice', () => ({
   useGasPrice: () => ({ gwei: ref('1'), loading: ref(false), poll: vi.fn() })
 }))
+vi.mock('@/core/storageRecovery', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/core/storageRecovery')>()),
+  recoverTransactionStorage: vi.fn()
+}))
 
 let wrapper: ReturnType<typeof mount> | undefined
 const empty = { views: [], pendingNonceGap: 0, unresolvedCount: 0, confirmedOps: [] }
@@ -43,6 +48,7 @@ beforeEach(() => {
   resetProviders()
   setActivePinia(createPinia())
   vi.mocked(refreshPendingOps).mockReset().mockResolvedValue(empty)
+  vi.mocked(recoverTransactionStorage).mockReset()
   const store = useVmuStore()
   vi.spyOn(store, 'load').mockResolvedValue()
   vi.spyOn(store, 'refresh').mockResolvedValue()
@@ -58,6 +64,7 @@ afterEach(() => {
   wrapper?.unmount()
   wrapper = undefined
   resetProviders()
+  vi.useRealTimers()
   vi.restoreAllMocks()
 })
 function render() {
@@ -143,31 +150,77 @@ it.each(['disconnect', 'unsupported-chain'] as const)(
   }
 )
 
-it('explains the recovery gate and requires successful reconciliation after recovery changes', async () => {
-  const view = render()
-  await flushPromises()
-  const recovery = view.getComponent(StorageRecovery)
-  await recovery.get('button').trigger('click')
-  expect(view.get('[data-testid="mint-list"]').text()).toContain(
-    'Transaction storage recovery is open'
-  )
-  vi.mocked(refreshPendingOps).mockRejectedValue(new Error('PENDING_STORAGE_READ_FAILED: fixture'))
-  recovery.vm.$emit('changed')
-  recovery.vm.$emit('open', false)
-  await flushPromises()
-  expect(refreshPendingOps).toHaveBeenLastCalledWith(
-    'eth',
-    useWalletStore().address,
-    expect.objectContaining({ reverifyResults: true })
-  )
-  expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('true')
-  expect(view.text()).toContain('Open transaction storage recovery')
-  expect(view.text()).not.toContain('PENDING_STORAGE_READ_FAILED')
-  vi.mocked(refreshPendingOps).mockResolvedValue(empty)
-  recovery.vm.$emit('changed')
-  await flushPromises()
-  expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('false')
-})
+it.each(['PENDING_STORAGE_READ_FAILED', 'LOCK_STORAGE_INVALID'])(
+  'forces reconciliation after real recovery clicks and stays blocked through %s',
+  async (code) => {
+    vi.useFakeTimers()
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:offline-test')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    const view = render()
+    await flushPromises()
+    localStorage.setItem('sm.vmuLocks', JSON.stringify([{ damaged: true }]))
+    const recovery = view.getComponent(StorageRecovery)
+    await recovery.get('button').trigger('click')
+    expect(view.get('[data-testid="mint-list"]').text()).toContain(
+      'Transaction storage recovery is open'
+    )
+    let reject!: (error: Error) => void
+    vi.mocked(refreshPendingOps)
+      .mockClear()
+      .mockReturnValue(
+        new Promise((_resolve, fail) => {
+          reject = fail
+        })
+      )
+    const repaired = {
+      repaired: 1,
+      blocked: 0,
+      backupKey: 'fixture-backup',
+      blockedReasons: { unidentified: 0, otherContext: 0, unconfirmed: 0, readLimit: 0 }
+    }
+    if (code === 'LOCK_STORAGE_INVALID')
+      vi.mocked(recoverTransactionStorage).mockRejectedValue(
+        new Error('WALLET_EVIDENCE_UNAVAILABLE')
+      )
+    else vi.mocked(recoverTransactionStorage).mockResolvedValue(repaired)
+    const dialogButton = (name: string) =>
+      [...document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')].find(
+        (button) => button.textContent?.trim() === name
+      )!
+    dialogButton('Export backup').click()
+    document.querySelector<HTMLInputElement>('[role="dialog"] input[type="checkbox"]')!.click()
+    await flushPromises()
+    dialogButton('Verify and repair').click()
+    await flushPromises()
+    expect(recoverTransactionStorage).toHaveBeenCalledOnce()
+    expect(refreshPendingOps).toHaveBeenCalledOnce()
+    expect(refreshPendingOps).toHaveBeenLastCalledWith(
+      'eth',
+      useWalletStore().address,
+      expect.objectContaining({ reverifyResults: true })
+    )
+    document.querySelector<HTMLButtonElement>('[aria-label="Close recovery"]')!.click()
+    await flushPromises()
+    const mint = () => view.findAll('button').find((button) => button.text() === 'Confirm Mint')!
+    expect(mint().attributes('disabled')).toBeDefined()
+    expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('true')
+    reject(new Error(`${code}: fixture`))
+    await flushPromises()
+    expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('true')
+    expect(view.text()).toContain('Open transaction storage recovery')
+    expect(view.text()).not.toContain(code)
+    expect(mint().attributes('disabled')).toBeDefined()
+    // No polling timers run: only the real recovery callback can have requested this check.
+    expect(refreshPendingOps).toHaveBeenCalledOnce()
+    vi.mocked(refreshPendingOps).mockResolvedValue(empty)
+    view.findComponent({ name: 'PendingOpsPanel' }).vm.$emit('recheck')
+    await flushPromises()
+    expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('false')
+    expect(mint().attributes('disabled')).toBeUndefined()
+    expect(sendPreparedOperation).not.toHaveBeenCalled()
+  }
+)
 
 it('closes recovery on a same-account generation change without bypassing wallet verification', async () => {
   const view = render()

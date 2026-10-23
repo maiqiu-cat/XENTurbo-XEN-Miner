@@ -144,7 +144,12 @@ onScopeDispose(close)
         <p class="dim">
           Only damaged records with a matching mined receipt from your connected wallet can be
           repaired. Unreadable JSON, missing identity, pending transactions and other accounts
-          remain blocked; retain the backup for manual investigation.
+          remain blocked.
+        </p>
+        <p class="dim">
+          Damaged records without a transaction hash cannot be verified here. Keep their exported
+          backup for manual investigation. While such records remain, mining stays blocked for this
+          site in this browser profile.
         </p>
         <label class="recovery-ack"
           ><input v-model="acknowledged" type="checkbox" :disabled="working" />I have checked wallet

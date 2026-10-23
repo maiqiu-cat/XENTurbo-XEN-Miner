@@ -52,6 +52,7 @@ declare global {
     }
     __confirmedWrites: Array<{ id: string; hasOutcome: boolean }>
     __pendingCheckGate: { reads: number; reject(): void; release(): void }
+    __recoveryRead: { reads: number; release(): void }
     __restoreStorage?: () => void
   }
 }
@@ -613,7 +614,7 @@ test('a stalled wallet nonce read times out without opening a transaction reques
   await expect(page.getByText('Checking pending transactions through the wallet...')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Cancel' })).toBeVisible()
   const timeoutMessage =
-    'Wallet or network read timed out. Check your connection and wallet, then recheck transaction records. Do not resend.'
+    'Wallet or network read timed out. Wallet eth_getTransactionCount exceeded 15000 ms. Check your connection and wallet, then recheck transaction records. Do not resend.'
   await expect(page.locator('.modal-body .err-text')).toHaveText(timeoutMessage, {
     timeout: 17_000
   })
@@ -627,6 +628,7 @@ test('a stalled wallet nonce read times out without opening a transaction reques
     successfulBroadcasts: 0
   })
   await expect(page.getByRole('button', { name: 'Close' })).toBeVisible()
+  await captureQaScreenshot(page, 'nonce-timeout-detail')
 })
 
 test('an unsigned prepared operation is invalidated by an account change', async ({ page }) => {
@@ -1391,15 +1393,52 @@ test('storage recovery exports original evidence and repairs only wallet-settled
   expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
 })
 
-test('unidentifiable journal corruption stays blocked after recovery and reload', async ({
+test('closing a repaired dialog stays blocked until post-recovery wallet reconciliation succeeds', async ({
   page
 }) => {
   await emulateDesktopGoogleChrome(page)
   await mockSameOriginRpc(page)
   await installInjectedWallet(page)
+  const errors: string[] = []
+  page.on('pageerror', (error) => errors.push(error.message))
   await page.goto('/')
-  await page.evaluate(() => localStorage.setItem('sm.pendingOps.event.broken', '{'))
   await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
+  await expect(mint).toBeEnabled()
+  await page.evaluate(
+    ({ wallet, hash }) => {
+      localStorage.setItem(
+        'sm.vmuLocks',
+        JSON.stringify([{ chain: 'eth', wallet, txHash: hash, batch: 'damaged', ids: ['1'] }])
+      )
+      window.__walletMock.setMinedReceipt(true)
+      const provider = (
+        window as unknown as {
+          ethereum: { request: (args: { method: string }) => Promise<unknown> }
+        }
+      ).ethereum
+      const request = provider.request.bind(provider)
+      let reject!: (error: Error) => void
+      let release!: (value: string) => void
+      const gate = new Promise<string>((resolve, fail) => {
+        release = resolve
+        reject = fail
+      })
+      window.__pendingCheckGate = {
+        reads: 0,
+        reject: () => reject(new Error('Recovery reconciliation offline fixture')),
+        release: () => release('0x0')
+      }
+      provider.request = async (args) => {
+        if (args.method === 'eth_getTransactionCount') {
+          window.__pendingCheckGate.reads += 1
+          if (window.__pendingCheckGate.reads <= 2) return gate
+        }
+        return request(args)
+      }
+    },
+    { wallet: ACCOUNT_A, hash: TX_HASH }
+  )
   await page.getByRole('button', { name: 'Transaction storage recovery', exact: true }).click()
   const dialog = page.getByRole('dialog', { name: 'Transaction storage recovery' })
   const download = page.waitForEvent('download')
@@ -1408,17 +1447,72 @@ test('unidentifiable journal corruption stays blocked after recovery and reload'
   await dialog.getByRole('checkbox').check()
   await dialog.getByRole('button', { name: 'Verify and repair' }).click()
   await expect(dialog.getByRole('status')).toContainText(
-    '0 settled record(s) archived and repaired. 1 record(s) remain blocked.'
+    '1 settled record(s) archived and repaired. 0 record(s) remain blocked.'
   )
-  await captureQaScreenshot(page, 'storage-recovery-blocked')
+  await expect.poll(() => page.evaluate(() => window.__pendingCheckGate.reads)).toBe(2)
   await dialog.getByRole('button', { name: 'Close recovery' }).click()
-  await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeDisabled()
-  await page.reload()
-  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
-  await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeDisabled()
-  expect(await page.evaluate(() => localStorage.getItem('sm.pendingOps.event.broken'))).toBe('{')
+  await expect(mint).toBeDisabled()
+  await expect(
+    page.getByText('Blocked: verifying pending transactions for this account and network.').first()
+  ).toBeVisible()
+  await page.evaluate(() => window.__pendingCheckGate.reject())
+  await expect(
+    page.getByText('Blocked: pending transaction check failed. Recheck before submitting.').first()
+  ).toBeVisible()
+  await expect(mint).toBeDisabled()
+  await page.getByRole('button', { name: 'Recheck', exact: true }).click()
+  await expect(mint).toBeEnabled()
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks')!))).toEqual([])
   expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+  expect(errors).toEqual([])
 })
+
+for (const kind of ['journal', 'lock without hash'] as const) {
+  test(`unidentifiable ${kind} corruption stays blocked after recovery and reload`, async ({
+    page
+  }) => {
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await installInjectedWallet(page)
+    const errors: string[] = []
+    page.on('pageerror', (error) => errors.push(error.message))
+    await page.goto('/')
+    const key = kind === 'journal' ? 'sm.pendingOps.event.broken' : 'sm.vmuLocks'
+    const original =
+      kind === 'journal'
+        ? '{'
+        : JSON.stringify([{ chain: 'eth', wallet: ACCOUNT_A, batch: 'damaged', ids: ['1'] }])
+    await page.evaluate(({ key, original }) => localStorage.setItem(key, original), {
+      key,
+      original
+    })
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    await page.getByRole('button', { name: 'Transaction storage recovery', exact: true }).click()
+    const dialog = page.getByRole('dialog', { name: 'Transaction storage recovery' })
+    await expect(dialog).toContainText('without a transaction hash cannot be verified here')
+    await expect(dialog).toContainText('mining stays blocked for this site in this browser profile')
+    const download = page.waitForEvent('download')
+    await dialog.getByRole('button', { name: 'Export backup' }).click()
+    await download
+    await dialog.getByRole('checkbox').check()
+    await dialog.getByRole('button', { name: 'Verify and repair' }).click()
+    await expect(dialog.getByRole('status')).toContainText(
+      '0 settled record(s) archived and repaired. 1 record(s) remain blocked.'
+    )
+    await captureQaScreenshot(
+      page,
+      kind === 'journal' ? 'storage-recovery-blocked' : 'storage-recovery-no-hash'
+    )
+    await dialog.getByRole('button', { name: 'Close recovery' }).click()
+    await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeDisabled()
+    await page.reload()
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeDisabled()
+    expect(await page.evaluate((key) => localStorage.getItem(key), key)).toBe(original)
+    expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+    expect(errors).toEqual([])
+  })
+}
 
 for (const change of ['disconnect', 'unsupported-chain', 'same-account'] as const) {
   test(`recovery dialog releases its UI gate after ${change}`, async ({ page }) => {
@@ -1462,9 +1556,9 @@ test('recovery presents a friendly wallet timeout and retains damaged evidence',
   await emulateDesktopGoogleChrome(page)
   await mockSameOriginRpc(page)
   await installInjectedWallet(page)
-  await page.goto('/')
   const errors: string[] = []
   page.on('pageerror', (error) => errors.push(error.message))
+  await page.goto('/')
   await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
   await page.evaluate(
     ({ wallet, hash }) => {
@@ -1474,17 +1568,7 @@ test('recovery presents a friendly wallet timeout and retains damaged evidence',
           { chain: 'eth', wallet, txHash: hash, ids: ['1'], batch: 'damaged', lockedAt: Date.now() }
         ])
       )
-      const provider = (
-        window as unknown as {
-          ethereum: { request: (args: { method: string }) => Promise<unknown> }
-        }
-      ).ethereum
-      const request = provider.request.bind(provider)
-      provider.request = async (args) => {
-        if (args.method === 'eth_getTransactionReceipt')
-          throw new Error('READ_TIMEOUT: Wallet receipt fixture')
-        return request(args)
-      }
+      window.__walletMock.setStalled('eth_getTransactionReceipt', true)
     },
     { wallet: ACCOUNT_A, hash: TX_HASH }
   )
@@ -1497,7 +1581,12 @@ test('recovery presents a friendly wallet timeout and retains damaged evidence',
   await expect(dialog.getByRole('button', { name: 'Verify and repair' })).toBeDisabled()
   await dialog.getByRole('checkbox').check()
   await dialog.getByRole('button', { name: 'Verify and repair' }).click()
-  await expect(dialog.getByRole('status')).toContainText('Wallet or network read timed out')
+  await expect(dialog.getByRole('status')).toContainText('Wallet or network read timed out', {
+    timeout: 17_000
+  })
+  await expect(dialog.getByRole('status')).toContainText(
+    'Wallet eth_getTransactionReceipt exceeded 15000 ms.'
+  )
   await expect(dialog.getByRole('status')).not.toContainText('READ_TIMEOUT')
   await captureQaScreenshot(page, 'recovery-error-desktop')
   await page.setViewportSize({ width: 390, height: 844 })
@@ -1511,6 +1600,69 @@ test('recovery presents a friendly wallet timeout and retains damaged evidence',
   expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
   expect(errors).toEqual([])
 })
+
+for (const interaction of ['close button', 'backdrop'] as const) {
+  test(`in-flight recovery can close through the ${interaction} without clearing damaged evidence`, async ({
+    page
+  }) => {
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await installInjectedWallet(page)
+    const errors: string[] = []
+    page.on('pageerror', (error) => errors.push(error.message))
+    await page.goto('/')
+    const original = JSON.stringify([
+      { chain: 'eth', wallet: ACCOUNT_A, txHash: TX_HASH, batch: 'damaged', ids: ['1'] }
+    ])
+    await page.evaluate((original) => {
+      localStorage.setItem('sm.vmuLocks', original)
+      window.__walletMock.setMinedReceipt(true)
+      const provider = (
+        window as unknown as {
+          ethereum: { request: (args: { method: string }) => Promise<unknown> }
+        }
+      ).ethereum
+      const request = provider.request.bind(provider)
+      let release!: () => void
+      window.__recoveryRead = { reads: 0, release: () => release() }
+      provider.request = async (args) => {
+        if (args.method === 'eth_getTransactionReceipt') {
+          window.__recoveryRead.reads += 1
+          await new Promise<void>((resolve) => {
+            release = resolve
+          })
+        }
+        return request(args)
+      }
+    }, original)
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    await page.getByRole('button', { name: 'Transaction storage recovery', exact: true }).click()
+    const dialog = page.getByRole('dialog', { name: 'Transaction storage recovery' })
+    const download = page.waitForEvent('download')
+    await dialog.getByRole('button', { name: 'Export backup' }).click()
+    await download
+    await dialog.getByRole('checkbox').check()
+    await dialog.getByRole('button', { name: 'Verify and repair' }).click()
+    await expect.poll(() => page.evaluate(() => window.__recoveryRead.reads)).toBe(1)
+    await dialog.locator('#recovery-title').click()
+    await expect(dialog).toBeVisible()
+    if (interaction === 'close button')
+      await dialog.getByRole('button', { name: 'Close recovery' }).click()
+    else await page.locator('.recovery-mask').click({ position: { x: 2, y: 2 } })
+    await expect(dialog).toBeHidden()
+    await page.evaluate(() => window.__recoveryRead.release())
+    await page.getByRole('button', { name: 'Recheck', exact: true }).click()
+    await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeDisabled()
+    expect(await page.evaluate(() => localStorage.getItem('sm.vmuLocks'))).toBe(original)
+    expect(
+      await page.evaluate(() =>
+        Object.keys(localStorage).some((key) => key.startsWith('sm.storageRecovery.backup.'))
+      )
+    ).toBe(false)
+    expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+    expect(errors).toEqual([])
+  })
+}
 
 test('simultaneous tab submissions produce only one broadcast while reconciliation is unresolved', async ({
   page,

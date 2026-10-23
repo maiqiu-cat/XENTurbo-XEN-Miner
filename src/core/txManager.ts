@@ -12,6 +12,7 @@ import {
 import { writeFactory, warmUpInjected } from './wallet'
 import { readFee, readVmuStatuses, readVmuStates } from './chainReader'
 import { readWalletEvidence, type WalletReceipt } from './walletEvidence'
+import { ReadTimeoutError } from './readDeadline'
 import { mapWithConcurrency } from '@/utils/concurrency'
 import { ensureHealthyReadProvider, getReadProvider } from './rpc'
 import { releaseLock, newBatchId, pendingLocks, tryAcquireLock, clearSoftLocks } from './localLock'
@@ -1166,8 +1167,10 @@ export function normalizeError(err: any): string {
     return 'Local transaction storage is unavailable or damaged. Open transaction storage recovery. Do not clear site data or resend; check wallet Activity first.'
   if (/WALLET_CONTEXT_CHANGED/i.test(msg))
     return 'Wallet account or network changed. Reconnect the original account and network, then recheck transaction records. Do not resend.'
-  if (/READ_TIMEOUT/i.test(msg))
-    return 'Wallet or network read timed out. Check your connection and wallet, then recheck transaction records. Do not resend.'
+  if (/READ_TIMEOUT/i.test(msg)) {
+    const detail = err instanceof ReadTimeoutError ? ` ${err.diagnostic}` : ''
+    return `Wallet or network read timed out.${detail} Check your connection and wallet, then recheck transaction records. Do not resend.`
+  }
   if (/WALLET_EVIDENCE_UNAVAILABLE/i.test(msg))
     return 'Wallet transaction evidence is unavailable. Check wallet Activity and the selected network, then recheck. Do not resend.'
   if (/PENDING_STATE_UNCERTAIN/i.test(msg))

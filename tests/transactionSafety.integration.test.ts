@@ -215,6 +215,7 @@ async function detachAtWalletTimeout(harness: Awaited<ReturnType<typeof installO
     expect.objectContaining({ id: prepared.batch, phase: 'awaiting-wallet', txHash: '' })
   ])
   expect(harness.activeLocks).toContain(harness.lockKey)
+  expect(prepared.lifecycle.phase).toBe('dispatched')
   expect(onStep.mock.lastCall?.[0]).toMatchObject({ send: 'error', confirm: 'wait' })
   expect(onStep.mock.lastCall?.[0].error).toContain(
     'MetaMask did not return a result within 2 minutes'
@@ -727,6 +728,7 @@ describe('offline transaction safety integration (H-08)', () => {
       expect(harness.readProvider.getTransactionCount).not.toHaveBeenCalled()
       expect(harness.locks.lockedIds('eth', WALLET).size).toBe(0)
       expect(harness.pending.countUnresolvedPendingOps('eth', WALLET)).toBe(0)
+      expect(prepared.lifecycle.phase).toBe('cancelled')
       const fresh = await harness.prepare()
       expect(fresh.batch).not.toBe(prepared.batch)
     }
@@ -743,6 +745,33 @@ describe('offline transaction safety integration (H-08)', () => {
     await expect(harness.tx.sendPreparedOperation(prepared)).rejects.toThrow('OPERATION_CANCELLED')
     expect(harness.sendRequests()).toHaveLength(0)
     expect(harness.pending.countUnresolvedPendingOps('eth', WALLET)).toBe(0)
+    expect(harness.locks.lockedIds('eth', WALLET)).toEqual(new Set())
+    expect(prepared.lifecycle.phase).toBe('cancelled')
+    harness.request.mockClear()
+    harness.readProvider.getTransactionCount.mockClear()
+    await expect(harness.tx.sendPreparedOperation(prepared)).rejects.toThrow('OPERATION_CANCELLED')
+    expect(harness.request).not.toHaveBeenCalled()
+    expect(harness.readProvider.getTransactionCount).not.toHaveBeenCalled()
+    expect(prepared.lifecycle.phase).toBe('cancelled')
+  })
+
+  it('rejects reuse after wallet timeout without releasing dispatched evidence or sending again', async () => {
+    const harness = await installOfflineHarness()
+    const { prepared } = await detachAtWalletTimeout(harness)
+    const journal = harness.pending.listPendingOps('eth', WALLET)
+    const locks = harness.storage.getItem('sm.vmuLocks')
+    harness.tx.abortPrepared(prepared)
+    await expect(harness.tx.sendPreparedOperation(prepared)).rejects.toThrow(
+      'OPERATION_ALREADY_STARTED'
+    )
+    expect(prepared.lifecycle.phase).toBe('dispatched')
+    expect(harness.sendRequests()).toHaveLength(1)
+    expect(harness.pending.listPendingOps('eth', WALLET)).toEqual(journal)
+    expect(harness.storage.getItem('sm.vmuLocks')).toBe(locks)
+    expect(harness.activeLocks).toContain(harness.lockKey)
+    harness.walletResponse.reject(harness.userRejection)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(harness.activeLocks.size).toBe(0)
   })
 
   it('does not release a dispatched operation and rejects reuse of its prepared object', async () => {

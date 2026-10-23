@@ -154,7 +154,9 @@ export async function verifyCreate2({
       error?.code === 'RATE_LIMIT_RETRY_AFTER_EXCEEDS_BUDGET' ||
       error?.code === 'RATE_LIMIT_BACKOFF_EXCEEDS_BUDGET'
     ) {
-      log(`NOT_VERIFIED: ${error.code}. Retry later with a fresh full verification.`)
+      log(
+        `NOT_VERIFIED: ${error.code}; scanned=${scanned}. Retry later with a fresh full verification.`
+      )
       return false
     }
     if (error !== deadlineError) {
