@@ -127,13 +127,14 @@ it('explains all retained-record reasons and requires fresh authorization after 
   expect(localStorage.getItem('sm.vmuLocks')).toBe(JSON.stringify([{ unknown: true }]))
 })
 
+// These injected rejections exercise UI mapping, not error codes produced by real storage recovery.
 it.each([
   ['WALLET_CONTEXT_CHANGED', 'Wallet account or network changed'],
   ['READ_TIMEOUT', 'Wallet or network read timed out'],
   ['LOCK_STORAGE_INVALID', 'Local transaction storage is unavailable or damaged'],
   ['PENDING_STORAGE_READ_FAILED', 'Local transaction storage is unavailable or damaged'],
   ['WALLET_EVIDENCE_UNAVAILABLE', 'Wallet transaction evidence is unavailable']
-])('shows actionable text for %s without raw prefixes', async (code, message) => {
+])('maps an injected %s recovery error without raw prefixes', async (code, message) => {
   vi.mocked(recoverTransactionStorage).mockRejectedValue(new Error(`${code}: fixture details`))
   await open()
   await authorize()

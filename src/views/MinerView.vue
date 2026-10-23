@@ -10,6 +10,7 @@ import {
   abortPrepared,
   resumePendingLocks,
   clearAbandonedSoftLocks,
+  normalizeError,
   type OpType,
   type TxStepState,
   type PreparedOp
@@ -149,7 +150,7 @@ async function onTrackHash(payload: { hash: string; seenText?: string }) {
   try {
     await trackPendingHash(payload.hash, payload.seenText)
   } catch (err: any) {
-    trackError.value = err?.message || String(err)
+    trackError.value = normalizeError(err)
   }
 }
 
@@ -163,7 +164,7 @@ async function onMarkPendingDropped(id: string) {
   try {
     await markPendingDropped(id)
   } catch (err: any) {
-    trackError.value = err?.message || String(err)
+    trackError.value = normalizeError(err)
   }
 }
 

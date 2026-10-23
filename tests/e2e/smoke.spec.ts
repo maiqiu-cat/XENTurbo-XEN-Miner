@@ -33,6 +33,16 @@ async function captureQaScreenshot(page: Page, name: string): Promise<void> {
   if (directory) await page.screenshot({ path: join(directory, `${name}.png`), fullPage: true })
 }
 
+async function expectPendingNonceReads(page: Page, expected: number): Promise<void> {
+  // With the clock paused, advance only the short timers needed by wallet/RPC batching.
+  await expect
+    .poll(async () => {
+      await page.clock.runFor(50)
+      return page.evaluate(() => window.__pendingCheckGate.reads)
+    })
+    .toBe(expected)
+}
+
 interface WalletMockStats {
   sendAttempts: number
   successfulBroadcasts: number
@@ -52,6 +62,7 @@ declare global {
     }
     __confirmedWrites: Array<{ id: string; hasOutcome: boolean }>
     __pendingCheckGate: { reads: number; reject(): void; release(): void }
+    __trackingReads: number
     __recoveryRead: { reads: number; release(): void }
     __restoreStorage?: () => void
   }
@@ -648,6 +659,199 @@ test('an unsigned prepared operation is invalidated by an account change', async
   await expect(page.getByRole('button', { name: '0x2222...2222' }).first()).toBeVisible()
 })
 
+for (const width of [1280, 390]) {
+  test(`manual hash tracking explains a real wallet read timeout and allows a safe retry (${width}px)`, async ({
+    page
+  }) => {
+    await page.setViewportSize({ width, height: 900 })
+    await page.clock.install()
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await installInjectedWallet(page)
+    const errors: string[] = []
+    page.on('pageerror', (error) => errors.push(error.message))
+    await page.goto('/')
+    await expect(page.getByRole('heading', { name: 'XENTurbo XEN Miner' })).toBeVisible()
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
+    await expect(mint).toBeEnabled()
+    await expect(page.locator('tbody tr')).toHaveCount(1)
+    const layoutBefore = await page.evaluate(() => ({
+      viewportWidth: innerWidth,
+      documentWidth: document.documentElement.scrollWidth
+    }))
+    await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1_000))
+    await page.evaluate(() => {
+      const provider = (
+        window as unknown as {
+          ethereum: { request(args: { method: string; params?: unknown[] }): Promise<unknown> }
+        }
+      ).ethereum
+      const request = provider.request.bind(provider)
+      window.__trackingReads = 0
+      window.__walletMock.setStalled('eth_getTransactionByHash', true)
+      provider.request = async (args) => {
+        if (args.method === 'eth_getTransactionByHash') window.__trackingReads += 1
+        return request(args)
+      }
+    })
+    const storedRecords = () =>
+      page.evaluate(() =>
+        Object.fromEntries(
+          Object.keys(localStorage)
+            .filter((key) => key.startsWith('sm.pendingOps') || key === 'sm.vmuLocks')
+            .map((key) => [key, localStorage.getItem(key)])
+        )
+      )
+    const original = await storedRecords()
+    await page.locator('.paste-input').fill(TX_HASH)
+    await page.getByRole('button', { name: 'Track', exact: true }).click()
+    await expect
+      .poll(async () => {
+        await page.clock.runFor(50)
+        return page.evaluate(() => window.__trackingReads)
+      })
+      .toBe(1)
+    await page.clock.runFor(15_001)
+    const warning = page.locator('.warn-card')
+    await expect(warning).toContainText('Wallet or network read timed out.')
+    await expect(warning).toContainText('Wallet eth_getTransactionByHash exceeded 15000 ms.')
+    await expect(warning).toContainText('Do not resend.')
+    await expect(warning).not.toContainText('READ_TIMEOUT')
+    await warning.scrollIntoViewIfNeeded()
+    await expect(warning).toBeInViewport()
+    const layoutAfter = await warning.evaluate((element) => ({
+      viewportWidth: innerWidth,
+      documentWidth: document.documentElement.scrollWidth,
+      left: element.getBoundingClientRect().left,
+      right: element.getBoundingClientRect().right,
+      scrollWidth: element.scrollWidth,
+      clientWidth: element.clientWidth
+    }))
+    await test.info().attach('manual-track-layout', {
+      body: JSON.stringify({ before: layoutBefore, after: layoutAfter }),
+      contentType: 'application/json'
+    })
+    // Verify this warning fits and adds no overflow; the rest of the narrow desktop layout is unchanged.
+    expect(layoutAfter.documentWidth).toBe(layoutBefore.documentWidth)
+    expect(layoutAfter.left).toBeGreaterThanOrEqual(0)
+    expect(layoutAfter.right).toBeLessThanOrEqual(layoutAfter.viewportWidth)
+    expect(layoutAfter.scrollWidth).toBeLessThanOrEqual(layoutAfter.clientWidth)
+    expect(await storedRecords()).toEqual(original)
+    await expect(mint).toBeEnabled()
+    await captureQaScreenshot(page, `manual-track-timeout-${width}`)
+
+    await page.evaluate(() => window.__walletMock.setStalled('eth_getTransactionByHash', false))
+    await page.locator('.paste-input').fill(TX_HASH)
+    await page.getByRole('button', { name: 'Track', exact: true }).click()
+    await expect
+      .poll(async () => {
+        await page.clock.runFor(50)
+        return (await warning.allTextContents()).join('')
+      })
+      .toBe('Transaction not found through the wallet. Check the hash / network.')
+    expect(await page.evaluate(() => window.__trackingReads)).toBe(2)
+    expect(await storedRecords()).toEqual(original)
+    await expect(mint).toBeEnabled()
+    expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+      sendAttempts: 0,
+      successfulBroadcasts: 0
+    })
+    expect(errors).toEqual([])
+  })
+}
+
+test('marking an unknown transaction dropped explains storage failure without clearing its gate', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page)
+  const errors: string[] = []
+  page.on('pageerror', (error) => errors.push(error.message))
+  await page.goto('/')
+  const original = await page.evaluate(
+    ({ wallet, hash }) => {
+      const record = {
+        id: 'manual-drop-fixture',
+        chain: 'eth',
+        wallet,
+        op: 'CLAIM',
+        ids: [1],
+        count: 1,
+        term: 0,
+        txHash: hash,
+        nonce: null,
+        phase: 'broadcast',
+        submittedAt: Date.now(),
+        updatedAt: Date.now(),
+        origin: 'local'
+      }
+      const raw = JSON.stringify({ recordId: record.id, updatedAt: record.updatedAt, record })
+      localStorage.setItem('sm.pendingOps.event.manual-drop-fixture', raw)
+      return raw
+    },
+    { wallet: ACCOUNT_A, hash: TX_HASH }
+  )
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  const drop = page.getByRole('button', { name: 'Mark dropped', exact: true })
+  const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
+  await expect(drop).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Recheck', exact: true })).toBeEnabled()
+  await expect(mint).toBeDisabled()
+  page.once('dialog', (dialog) => dialog.dismiss())
+  await drop.click()
+  expect(
+    await page.evaluate(() => localStorage.getItem('sm.pendingOps.event.manual-drop-fixture'))
+  ).toBe(original)
+  await expect(mint).toBeDisabled()
+
+  await page.evaluate(() => {
+    const set = Storage.prototype.setItem
+    Storage.prototype.setItem = function (key, value) {
+      if (this === localStorage && key.startsWith('sm.pendingOps.event.'))
+        throw new DOMException('Offline storage write fixture', 'QuotaExceededError')
+      return set.call(this, key, value)
+    }
+    window.__restoreStorage = () => {
+      Storage.prototype.setItem = set
+    }
+  })
+  page.once('dialog', (dialog) => dialog.accept())
+  await drop.click()
+  await expect(page.locator('.warn-card')).toContainText(
+    'Local transaction storage is unavailable or damaged.'
+  )
+  await expect(page.locator('.warn-card')).toContainText('Open transaction storage recovery.')
+  await expect(page.locator('.warn-card')).toContainText('Do not clear site data or resend')
+  await expect(page.locator('.warn-card')).not.toContainText('PENDING_STORAGE_WRITE_FAILED')
+  expect(
+    await page.evaluate(() => localStorage.getItem('sm.pendingOps.event.manual-drop-fixture'))
+  ).toBe(original)
+  await expect(mint).toBeDisabled()
+  await expect(drop).toBeVisible()
+  await captureQaScreenshot(page, 'manual-drop-storage-failure')
+
+  await page.evaluate(() => window.__restoreStorage?.())
+  page.once('dialog', (dialog) => dialog.accept())
+  await drop.click()
+  await expect(mint).toBeEnabled()
+  await expect(page.locator('.warn-card')).toHaveCount(0)
+  await expect(drop).toHaveCount(0)
+  const dropped = await page.evaluate(() =>
+    Object.keys(localStorage)
+      .filter((key) => key.startsWith('sm.pendingOps.event.'))
+      .map((key) => JSON.parse(localStorage.getItem(key)!).record)
+      .filter((record) => record?.id === 'manual-drop-fixture' && record.phase === 'dropped')
+  )
+  expect(dropped).toHaveLength(1)
+  expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+    sendAttempts: 0,
+    successfulBroadcasts: 0
+  })
+  expect(errors).toEqual([])
+})
+
 test('prepared signing stays blocked if a shared pending check fails during a trailing retry', async ({
   page
 }) => {
@@ -660,6 +864,7 @@ test('prepared signing stays blocked if a shared pending check fails during a tr
   await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
   await page.getByRole('button', { name: 'Confirm Mint' }).click()
   await expect(page.getByRole('button', { name: 'Open MetaMask & Sign' })).toBeVisible()
+  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1_000))
   await page.evaluate(() => {
     const provider = (
       window as unknown as {
@@ -690,10 +895,10 @@ test('prepared signing stays blocked if a shared pending check fails during a tr
     }
   })
   await page.clock.runFor(30_001)
-  await expect.poll(() => page.evaluate(() => window.__pendingCheckGate.reads)).toBe(2)
+  await expectPendingNonceReads(page, 2)
   await page.getByRole('button', { name: 'Open MetaMask & Sign' }).click()
   await page.evaluate(() => window.__pendingCheckGate.reject())
-  await expect.poll(() => page.evaluate(() => window.__pendingCheckGate.reads)).toBe(4)
+  await expectPendingNonceReads(page, 4)
   await expect(page.locator('.modal-body .err-text')).toContainText('Pending check offline fixture')
   expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
     sendAttempts: 0,
@@ -701,7 +906,13 @@ test('prepared signing stays blocked if a shared pending check fails during a tr
   })
   await page.evaluate(() => window.__pendingCheckGate.release())
   await page.getByRole('button', { name: 'Close', exact: true }).click()
-  await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
+  await expect
+    .poll(async () => {
+      await page.clock.runFor(50)
+      return page.getByRole('button', { name: 'Confirm Mint' }).isEnabled()
+    })
+    .toBe(true)
+  expect(await page.evaluate(() => window.__pendingCheckGate.reads)).toBe(4)
   expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
     sendAttempts: 0,
     successfulBroadcasts: 0
@@ -1473,6 +1684,7 @@ test('closing a repaired dialog stays blocked until post-recovery wallet reconci
   await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
   const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
   await expect(mint).toBeEnabled()
+  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1_000))
   await page.evaluate(
     ({ wallet, hash }) => {
       localStorage.setItem(
@@ -1521,7 +1733,7 @@ test('closing a repaired dialog stays blocked until post-recovery wallet reconci
   await expect(dialog.getByRole('status')).toContainText(
     '1 settled record(s) archived and repaired. 0 record(s) remain blocked.'
   )
-  await expect.poll(() => page.evaluate(() => window.__pendingCheckGate.reads)).toBe(2)
+  await expectPendingNonceReads(page, 2)
   await dialog.getByRole('button', { name: 'Close recovery' }).click()
   await expect(mint).toBeDisabled()
   await expect(
@@ -1534,14 +1746,20 @@ test('closing a repaired dialog stays blocked until post-recovery wallet reconci
   await expect(mint).toBeDisabled()
   // Even an idle poll must keep failing until this fixture explicitly restores the wallet.
   await page.clock.runFor(30_001)
-  await expect.poll(() => page.evaluate(() => window.__pendingCheckGate.reads)).toBeGreaterThan(2)
+  await expectPendingNonceReads(page, 4)
   await expect(mint).toBeDisabled()
   await expect(
     page.getByText('Blocked: pending transaction check failed. Recheck before submitting.').first()
   ).toBeVisible()
   await page.evaluate(() => window.__pendingCheckGate.release())
   await page.getByRole('button', { name: 'Recheck', exact: true }).click()
-  await expect(mint).toBeEnabled()
+  await expect
+    .poll(async () => {
+      await page.clock.runFor(50)
+      return mint.isEnabled()
+    })
+    .toBe(true)
+  expect(await page.evaluate(() => window.__pendingCheckGate.reads)).toBe(6)
   expect(await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks')!))).toEqual([])
   expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
   expect(errors).toEqual([])
