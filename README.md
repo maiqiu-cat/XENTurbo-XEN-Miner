@@ -1,6 +1,16 @@
 # XENTurbo XEN Miner
 
-Current release: **v1.1.4**. The page header displays the same version as the source package and Git release tag.
+Current release: **v1.1.5**. The page header displays the same version as the source package and Git release tag.
+
+### v1.1.5 Transaction Recovery And RPC Hardening
+
+- Preserved configured RPC lists on failures, bounded configuration validation, and distinguished invalid settings from unavailable networks consistently across the interface.
+- Strengthened pending reconciliation, wallet-context invalidation and cross-tab transaction serialization. A failed check cannot revive an earlier signing intent.
+- Preserved timely and late transaction hashes when browser storage fails. Damaged transaction records can be exported and repaired only with matching wallet-authenticated mined receipts.
+- Damaged locks without a transaction hash remain preserved and block mining in that browser profile. There is no automatic deletion or in-app bypass; retain the backup for manual investigation.
+- Hardened read cancellation, pinned-block CREATE2 probes, CLI entry validation and rate-limit diagnostics. Updated compatible development dependencies without changing major versions.
+- P2-C remains **unproven**: historical destroy/count semantics lack a complete evidence match to both current deployments. Strict boundary checks, active witnesses and nonzero NOT_VERIFIED exits remain required.
+- Contracts, ABI, deployment addresses, default RPC lists, wallet-selected Gas and Cloudflare Analytics behavior are unchanged. Transaction tests use mock wallets and RPC; they do not establish real-wallet or historical contract semantics.
 
 ### v1.1.4 Read Recovery And Analytics
 
