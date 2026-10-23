@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route } from '@playwright/test'
+import { expect, test, type Locator, type Page, type Route } from '@playwright/test'
 import { join } from 'node:path'
 import { Interface } from 'ethers'
 import { computeProxyAddress, minimalProxyRuntimeCode } from '../../src/core/create2'
@@ -41,6 +41,15 @@ async function expectPendingNonceReads(page: Page, expected: number): Promise<vo
       return page.evaluate(() => window.__pendingCheckGate.reads)
     })
     .toBe(expected)
+}
+
+async function expectEnabledWithClock(page: Page, button: Locator): Promise<void> {
+  await expect
+    .poll(async () => {
+      await page.clock.runFor(50)
+      return button.isEnabled()
+    })
+    .toBe(true)
 }
 
 interface WalletMockStats {
@@ -761,6 +770,85 @@ for (const width of [1280, 390]) {
   })
 }
 
+for (const width of [1280, 390]) {
+  for (const kind of ['count', 'length'] as const) {
+    test(`legacy RPC configuration ${kind} has actionable Track guidance and recovers after an explicit correction (${width}px)`, async ({
+      page
+    }) => {
+      await page.setViewportSize({ width, height: 900 })
+      await emulateDesktopGoogleChrome(page)
+      await mockSameOriginRpc(page)
+      await installInjectedWallet(page)
+      const urls =
+        kind === 'count'
+          ? Array.from({ length: 17 }, (_, index) => `https://legacy-rpc${index}.example/`)
+          : [`https://legacy-rpc.example/${'x'.repeat(2048)}`]
+      const stored = JSON.stringify({ eth: urls })
+      await page.addInitScript((value) => localStorage.setItem('sm.customRpc', value), stored)
+      let invalidEndpointRequests = 0
+      await page.route(/^https:\/\/legacy-rpc[0-9]*\.example\//, async (route) => {
+        invalidEndpointRequests += 1
+        await route.abort()
+      })
+      const errors: string[] = []
+      page.on('pageerror', (error) => errors.push(error.message))
+      await page.goto('/')
+      await expect(page.getByRole('heading', { name: 'XENTurbo XEN Miner' })).toBeVisible()
+      await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+      const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
+      await expect(mint).toBeDisabled()
+      const banner = page.locator('.rpc-health-banner')
+      const reason = kind === 'count' ? 'Use at most 16 RPC endpoints' : '2048 characters'
+      await expect(banner).toContainText(reason)
+      await page.locator('.paste-input').fill(TX_HASH)
+      await page.getByRole('button', { name: 'Track', exact: true }).click()
+      const warning = page.locator('.warn-card')
+      await expect(warning).toContainText(`RPC configuration is invalid:`)
+      await expect(warning).toContainText(reason)
+      await expect(warning).toContainText('Open the RPC settings')
+      await expect(warning).not.toContainText('Check internet access')
+      await expect(warning).not.toContainText('RPC_UNAVAILABLE')
+      await expect(warning).toHaveText(await banner.locator(':scope > span').innerText())
+      expect(await page.evaluate(() => localStorage.getItem('sm.customRpc'))).toBe(stored)
+      expect(invalidEndpointRequests).toBe(0)
+      await expect(mint).toBeDisabled()
+      await warning.scrollIntoViewIfNeeded()
+      await expect(warning).toBeInViewport()
+      const layout = await warning.evaluate((element) => ({
+        left: element.getBoundingClientRect().left,
+        right: element.getBoundingClientRect().right,
+        viewport: innerWidth,
+        scrollWidth: element.scrollWidth,
+        clientWidth: element.clientWidth
+      }))
+      expect(layout.left).toBeGreaterThanOrEqual(0)
+      expect(layout.right).toBeLessThanOrEqual(layout.viewport)
+      expect(layout.scrollWidth).toBeLessThanOrEqual(layout.clientWidth)
+      await captureQaScreenshot(page, `rpc-config-${kind}-${width}`)
+
+      await page.getByRole('button', { name: 'RPC', exact: true }).click()
+      await page.locator('textarea').fill('https://ethereum.publicnode.com/')
+      await page.getByRole('button', { name: 'Save', exact: true }).click()
+      await expect(mint).toBeEnabled()
+      await expect(banner).toHaveCount(0)
+      expect(
+        await page.evaluate(() => JSON.parse(localStorage.getItem('sm.customRpc')!).eth)
+      ).toEqual(['https://ethereum.publicnode.com/'])
+      await page.locator('.paste-input').fill(TX_HASH)
+      await page.getByRole('button', { name: 'Track', exact: true }).click()
+      await expect(warning).toHaveText(
+        'Transaction not found through the wallet. Check the hash / network.'
+      )
+      await expect(mint).toBeEnabled()
+      expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+        sendAttempts: 0,
+        successfulBroadcasts: 0
+      })
+      expect(errors).toEqual([])
+    })
+  }
+}
+
 test('marking an unknown transaction dropped explains storage failure without clearing its gate', async ({
   page
 }) => {
@@ -860,11 +948,17 @@ test('prepared signing stays blocked if a shared pending check fails during a tr
   await mockSameOriginRpc(page)
   await installInjectedWallet(page)
   await page.goto('/')
-  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
-  await expect(page.getByRole('button', { name: 'Confirm Mint' })).toBeEnabled()
-  await page.getByRole('button', { name: 'Confirm Mint' }).click()
-  await expect(page.getByRole('button', { name: 'Open MetaMask & Sign' })).toBeVisible()
+  // Freeze before wallet connection starts the idle poll; host delays cannot age its deadline.
   await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1_000))
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await expectEnabledWithClock(page, page.getByRole('button', { name: 'Confirm Mint' }))
+  await page.getByRole('button', { name: 'Confirm Mint' }).click()
+  await expect
+    .poll(async () => {
+      await page.clock.runFor(50)
+      return page.getByRole('button', { name: 'Open MetaMask & Sign' }).isVisible()
+    })
+    .toBe(true)
   await page.evaluate(() => {
     const provider = (
       window as unknown as {
@@ -1681,10 +1775,11 @@ test('closing a repaired dialog stays blocked until post-recovery wallet reconci
   const errors: string[] = []
   page.on('pageerror', (error) => errors.push(error.message))
   await page.goto('/')
+  // Start wallet reconciliation on a paused clock, before any idle poll can accumulate host time.
+  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1_000))
   await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
   const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
-  await expect(mint).toBeEnabled()
-  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1_000))
+  await expectEnabledWithClock(page, mint)
   await page.evaluate(
     ({ wallet, hash }) => {
       localStorage.setItem(

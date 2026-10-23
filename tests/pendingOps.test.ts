@@ -140,7 +140,8 @@ async function installPendingHarness(options: {
   })
 
   const ensureHealthyReadProvider = vi.fn(async () => provider)
-  vi.doMock('../src/core/rpc', () => ({
+  vi.doMock('../src/core/rpc', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../src/core/rpc')>()),
     ensureHealthyReadProvider,
     ensureRecentReadProvider: ensureHealthyReadProvider,
     getReadProvider: () => provider
@@ -989,6 +990,42 @@ describe('pending operation reconciliation', () => {
     expect(stored.some((record) => record.id === 'expired-terminal')).toBe(false)
   })
 
+  it('keeps the real journal unresolved and does not release locks when a dropped event cannot be written', async () => {
+    const { pending, releaseLock, releaseLocksByTxHash } = await installPendingHarness({
+      latestNonce: 7,
+      pendingNonce: 7
+    })
+    recordBroadcast(pending, { id: 'batch-1' })
+    const snapshot = () =>
+      Object.fromEntries(
+        Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index)!).map(
+          (key) => [key, localStorage.getItem(key)]
+        )
+      )
+    const original = snapshot()
+    const records = pending.listPendingOps('eth', WALLET)
+    const write = localStorage.setItem.bind(localStorage)
+    const failure = vi.spyOn(localStorage, 'setItem').mockImplementation((key, value) => {
+      if (key.startsWith('sm.pendingOps.event.')) throw new Error('QuotaExceededError fixture')
+      write(key, value)
+    })
+    expect(() => pending.markPendingOpDropped('batch-1')).toThrow('PENDING_STORAGE_WRITE_FAILED')
+    expect(snapshot()).toEqual(original)
+    expect(pending.listPendingOps('eth', WALLET)).toEqual(records)
+    expect(pending.countUnresolvedPendingOps('eth', WALLET)).toBe(1)
+    expect(releaseLock).not.toHaveBeenCalled()
+    expect(releaseLocksByTxHash).not.toHaveBeenCalled()
+
+    failure.mockRestore()
+    expect(pending.markPendingOpDropped('batch-1')?.phase).toBe('dropped')
+    const events = snapshot()
+    for (const [key, value] of Object.entries(original)) expect(events[key]).toBe(value)
+    expect(Object.keys(events)).toHaveLength(Object.keys(original).length + 1)
+    expect(pending.countUnresolvedPendingOps('eth', WALLET)).toBe(0)
+    expect(releaseLock).toHaveBeenCalledOnce()
+    expect(releaseLocksByTxHash).toHaveBeenCalledOnce()
+  })
+
   it('supports an explicit dropped transition and only then releases the lock', async () => {
     const { pending, releaseLock, releaseLocksByTxHash } = await installPendingHarness({
       latestNonce: 7,
@@ -1132,7 +1169,8 @@ describe('transaction lock lifecycle', () => {
         return HASH
       })
     }))
-    vi.doMock('../src/core/rpc', () => ({
+    vi.doMock('../src/core/rpc', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('../src/core/rpc')>()),
       ensureHealthyReadProvider: vi.fn(async () => provider),
       getReadProvider: () => provider
     }))

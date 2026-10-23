@@ -225,11 +225,10 @@ function unknownPendingView(): PendingOpView {
 }
 
 it.each(['PENDING_STORAGE_WRITE_FAILED', 'LOCK_STORAGE_INVALID'])(
-  'normalizes injected %s from Mark dropped and preserves the stored record',
+  'maps injected %s from Mark dropped and keeps the UI blocked without reconciling',
   async (code) => {
+    // UI mapping only; pendingOps and browser tests exercise real journal write failures.
     const candidate = unknownPendingView()
-    const original = JSON.stringify([candidate])
-    localStorage.setItem('sm.pendingOps', original)
     vi.mocked(refreshPendingOps).mockResolvedValue({
       ...empty,
       views: [candidate],
@@ -251,7 +250,6 @@ it.each(['PENDING_STORAGE_WRITE_FAILED', 'LOCK_STORAGE_INVALID'])(
     expect(view.get('.warn-card').text()).toContain('Open transaction storage recovery.')
     expect(view.get('.warn-card').text()).toContain('Do not clear site data or resend')
     expect(view.get('.warn-card').text()).not.toContain(code)
-    expect(localStorage.getItem('sm.pendingOps')).toBe(original)
     expect(refreshPendingOps).not.toHaveBeenCalled()
     expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('true')
     expect(sendPreparedOperation).not.toHaveBeenCalled()
@@ -308,6 +306,35 @@ it.each(['count', 'length'] as const)(
     expect(localStorage.getItem('sm.customRpc')).toBe(stored)
   }
 )
+
+it.each(['count', 'length'] as const)(
+  'reports a real RPC configuration failure at Track (%s) without blaming the network',
+  async (kind) => {
+    const urls =
+      kind === 'count'
+        ? Array.from({ length: 17 }, (_, id) => `https://rpc${id}.example/`)
+        : [`https://rpc.example/${'x'.repeat(2048)}`]
+    const stored = JSON.stringify({ eth: urls })
+    localStorage.setItem('sm.customRpc', stored)
+    const actual = await vi.importActual<typeof import('@/core/pendingOps')>('@/core/pendingOps')
+    vi.mocked(trackPendingTxHash).mockImplementationOnce(actual.trackPendingTxHash)
+    const view = render(true)
+    await flushPromises()
+    await submitTrackedHash(view, `0x${'d'.repeat(64)}`)
+    const warning = view.get('.warn-card').text()
+    expect(warning).toContain('RPC configuration is invalid:')
+    expect(warning).toContain(kind === 'count' ? 'Use at most 16 RPC endpoints' : '2048 characters')
+    expect(warning).toContain('RPC settings')
+    expect(warning).toContain('Your RPC list was not changed.')
+    expect(warning).not.toContain('Check internet access')
+    expect(warning).not.toContain('RPC_UNAVAILABLE')
+    expect(warning).toBe(view.get('.rpc-health-banner > span').text())
+    expect(localStorage.getItem('sm.customRpc')).toBe(stored)
+    expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('true')
+    expect(sendPreparedOperation).not.toHaveBeenCalled()
+  }
+)
+
 it('blocks every operation after a new scope check fails and until its retry succeeds', async () => {
   let resolve!: (value: typeof empty) => void
   const retry = new Promise<typeof empty>((done) => {

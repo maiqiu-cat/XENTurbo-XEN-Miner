@@ -13,6 +13,13 @@ import { mapWithConcurrency } from '@/utils/concurrency'
 
 export type ReadProvider = JsonRpcProvider | FallbackProvider
 
+export class RpcConfigurationError extends Error {
+  constructor(chain: ChainKey, reason: string) {
+    super(`RPC_UNAVAILABLE: ${CHAINS[chain].name} RPC configuration is invalid: ${reason}`)
+    this.name = 'RpcConfigurationError'
+  }
+}
+
 export interface RpcHealthFailure {
   url: string
   message: string
@@ -262,17 +269,18 @@ export function ensureHealthyReadProvider(
       urls = normalizeRpcUrls(getRpcUrls(key))
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
+      const failure = new RpcConfigurationError(key, message)
       const state: RpcHealthState = {
         ...emptyHealthState(key),
         checkedAt: Date.now(),
         errorKind: 'configuration',
-        error: `RPC_UNAVAILABLE: ${CHAINS[key].name} RPC configuration is invalid: ${message}`
+        error: failure.message
       }
       if ((providerGenerations.get(key) ?? 0) === generation) {
         evictProvider(key)
         publishHealthState(key, state)
       }
-      throw new Error(state.error!)
+      throw failure
     }
 
     publishHealthState(key, {

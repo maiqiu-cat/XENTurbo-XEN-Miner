@@ -14,7 +14,7 @@ import { readFee, readVmuStatuses, readVmuStates } from './chainReader'
 import { readWalletEvidence, type WalletReceipt } from './walletEvidence'
 import { ReadTimeoutError } from './readDeadline'
 import { mapWithConcurrency } from '@/utils/concurrency'
-import { ensureHealthyReadProvider, getReadProvider } from './rpc'
+import { ensureHealthyReadProvider, getReadProvider, RpcConfigurationError } from './rpc'
 import { releaseLock, newBatchId, pendingLocks, tryAcquireLock, clearSoftLocks } from './localLock'
 import { countUnresolvedPendingOps, recordPendingOp, removePendingOpRecord } from './pendingOps'
 import { operationKey, runWalletExclusive } from './operationGate'
@@ -1164,8 +1164,11 @@ export function normalizeError(
     return 'This prepared operation has already started or finished. Check wallet Activity and recheck pending operations. Do not resend.'
   if (/Prepared transaction expired/i.test(msg))
     return 'The prepared transaction expired after 2 minutes. Estimate it again before signing.'
-  if (/RPC_UNAVAILABLE|RPC_NOT_VALIDATED/i.test(msg))
+  if (/RPC_UNAVAILABLE|RPC_NOT_VALIDATED/i.test(msg)) {
+    if (err instanceof RpcConfigurationError)
+      return `${err.message.replace(/^RPC_UNAVAILABLE:\s*/, '')}. Your RPC list was not changed. Open the RPC settings to correct the configuration or reset to defaults. Chain reads and transactions remain blocked until validation succeeds.`
     return 'No configured RPC endpoint responded on the expected network. Your RPC list was preserved. Check internet access, DNS, firewall, and proxy/VPN settings, then retry; or change endpoints in RPC settings.'
+  }
   if (/PENDING_STORAGE_(?:READ|WRITE)_FAILED|LOCK_STORAGE_INVALID/i.test(msg)) {
     const action =
       context === 'storage-recovery'

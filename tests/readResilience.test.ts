@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ReadTimeoutError, withReadDeadline } from '@/core/readDeadline'
+import { RpcConfigurationError } from '@/core/rpc'
 import { normalizeError } from '@/core/txManager'
 
 afterEach(() => {
@@ -9,6 +10,39 @@ afterEach(() => {
 })
 
 describe('bounded read recovery', () => {
+  it.each(['eth', 'polygon'] as const)(
+    'keeps local %s configuration guidance separate from network failures',
+    (chain) => {
+      const message = normalizeError(
+        new RpcConfigurationError(chain, 'Use at most 16 RPC endpoints')
+      )
+      expect(message).toContain('RPC configuration is invalid: Use at most 16 RPC endpoints.')
+      expect(message).toContain('Your RPC list was not changed. Open the RPC settings')
+      expect(message).toContain(
+        'Chain reads and transactions remain blocked until validation succeeds.'
+      )
+      expect(message).not.toContain('Check internet access')
+      expect(message).not.toContain('RPC_UNAVAILABLE')
+    }
+  )
+
+  it.each(['RPC_UNAVAILABLE', 'RPC_NOT_VALIDATED'])(
+    'keeps %s network guidance and hides forged configuration diagnostics',
+    (code) => {
+      const error = Object.assign(
+        new Error(
+          `${code}: Ethereum RPC configuration is invalid: https://rpc.example/private?key=fixture-secret`
+        ),
+        {
+          name: 'RpcConfigurationError'
+        }
+      )
+      expect(normalizeError(error)).toBe(
+        'No configured RPC endpoint responded on the expected network. Your RPC list was preserved. Check internet access, DNS, firewall, and proxy/VPN settings, then retry; or change endpoints in RPC settings.'
+      )
+    }
+  )
+
   it.each([
     'Wallet eth_getTransactionCount',
     'Wallet eth_getTransactionReceipt',
