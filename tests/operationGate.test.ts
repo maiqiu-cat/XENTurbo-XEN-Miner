@@ -22,6 +22,18 @@ function preparedContext() {
   }
 }
 
+async function expectRpcErrorMapping(): Promise<void> {
+  const { RpcConfigurationError } =
+    await vi.importActual<typeof import('../src/core/rpc')>('../src/core/rpc')
+  const { normalizeError } = await import('../src/core/txManager')
+  expect(
+    normalizeError(new RpcConfigurationError('eth', 'Use at most 16 RPC endpoints'))
+  ).toContain('Open the RPC settings')
+  expect(normalizeError(new Error('RPC_UNAVAILABLE: offline fixture'))).toContain(
+    'Check internet access'
+  )
+}
+
 describe('operation gate', () => {
   it('scopes sends by chain and normalized wallet address', () => {
     expect(operationKey('eth', '0xAbC')).toBe('xenturbo:eth:0xabc:send')
@@ -124,7 +136,8 @@ describe('operation gate', () => {
         return `0x${'a'.repeat(64)}`
       })
     }))
-    vi.doMock('../src/core/rpc', () => ({
+    vi.doMock('../src/core/rpc', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('../src/core/rpc')>()),
       ensureHealthyReadProvider: vi.fn(async () => provider),
       getReadProvider: () => provider
     }))
@@ -188,6 +201,7 @@ describe('operation gate', () => {
     })
 
     const { sendPreparedOperation } = await import('../src/core/txManager')
+    await expectRpcErrorMapping()
     await sendPreparedOperation({
       chain: 'eth',
       wallet: walletAddress,
@@ -243,7 +257,8 @@ describe('operation gate', () => {
       warmUpInjected: vi.fn(),
       writeFactory
     }))
-    vi.doMock('../src/core/rpc', () => ({
+    vi.doMock('../src/core/rpc', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('../src/core/rpc')>()),
       ensureHealthyReadProvider: vi.fn(async () => provider),
       getReadProvider: () => provider
     }))
@@ -281,6 +296,7 @@ describe('operation gate', () => {
     })
 
     const { sendPreparedOperation } = await import('../src/core/txManager')
+    await expectRpcErrorMapping()
     const prepared = {
       chain: 'eth' as const,
       wallet: '0xAbC',
@@ -329,7 +345,8 @@ describe('operation gate', () => {
       warmUpInjected: vi.fn(),
       writeFactory
     }))
-    vi.doMock('../src/core/rpc', () => ({
+    vi.doMock('../src/core/rpc', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('../src/core/rpc')>()),
       ensureHealthyReadProvider: vi.fn(async () => provider),
       getReadProvider: () => provider
     }))
@@ -382,6 +399,7 @@ describe('operation gate', () => {
     })
 
     const { sendPreparedOperation } = await import('../src/core/txManager')
+    await expectRpcErrorMapping()
     await expect(
       sendPreparedOperation({
         chain: 'eth',

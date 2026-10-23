@@ -26,6 +26,7 @@ import PendingOpsPanel from '@/components/PendingOpsPanel.vue'
 import StorageRecovery from '@/components/StorageRecovery.vue'
 import { CONTRACTS } from '@/config/contracts'
 import { APP_VERSION } from '@/config/version'
+import { rpcConfigurationMessage } from '@/core/rpc'
 
 const wallet = useWalletStore()
 const store = useVmuStore()
@@ -42,7 +43,7 @@ const { state: rpcHealth, unavailable: rpcUnavailable } = useRpcHealth(() => rea
 const rpcHealthMessage = computed(() => {
   const state = rpcHealth.value
   if (state.error && state.errorKind === 'configuration') {
-    return `${state.error.replace(/^RPC_UNAVAILABLE:\s*/, '')}. Your RPC list was not changed. Open the RPC settings to correct the configuration or reset to defaults. Chain reads and transactions remain blocked until validation succeeds.`
+    return rpcConfigurationMessage(state.error)
   }
   if (state.error || (state.checkedAt !== null && state.healthyUrls.length === 0)) {
     return `No usable ${CHAINS[state.chain].name} RPC endpoints (${state.healthyUrls.length}/${state.totalUrls}). Your RPC list was not changed. Check internet access, DNS, firewall, and proxy/VPN settings, then recheck; or use the RPC button to change endpoints. Chain reads and transactions are blocked until a recheck succeeds.`
@@ -735,7 +736,9 @@ const explorerAddrUrl = computed(() => {
         "
         :blocked-reason="
           rpcUnavailable
-            ? `Blocked: no healthy ${CHAINS[readChain].name} RPC endpoint`
+            ? rpcHealth.errorKind === 'configuration'
+              ? `Blocked: invalid ${CHAINS[readChain].name} RPC configuration. Open RPC settings to correct it.`
+              : `Blocked: no healthy ${CHAINS[readChain].name} RPC endpoint`
             : !wallet.contractWalletChecked
               ? 'Blocked: wallet type is not verified'
               : pendingBlockedReason

@@ -45,10 +45,14 @@ async function expectPendingNonceReads(page: Page, expected: number): Promise<vo
 
 async function expectEnabledWithClock(page: Page, button: Locator): Promise<void> {
   await expect
-    .poll(async () => {
-      await page.clock.runFor(50)
-      return button.isEnabled()
-    })
+    .poll(
+      async () => {
+        await page.clock.runFor(50)
+        return button.isEnabled()
+      },
+      // Advance paused timers frequently without skipping the readiness gate or background polls.
+      { timeout: 15_000, intervals: [100] }
+    )
     .toBe(true)
 }
 
@@ -595,6 +599,40 @@ test('wallet initialization, connect, account changes, and chain changes update 
   await expect(page.getByRole('combobox')).toHaveValue('polygon')
 })
 
+test('paused-clock readiness waits for delayed wallet nonce checks without bypassing the gate', async ({
+  page
+}) => {
+  await page.clock.install()
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page)
+  await page.goto('/')
+  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1_000))
+  await page.evaluate(() => {
+    const provider = (
+      window as unknown as {
+        ethereum: { request(args: { method: string; params?: unknown[] }): Promise<unknown> }
+      }
+    ).ethereum
+    const request = provider.request.bind(provider)
+    provider.request = async (args) => {
+      if (args.method === 'eth_getTransactionCount') {
+        await new Promise((resolve) => setTimeout(resolve, 600))
+      }
+      return request(args)
+    }
+  })
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
+  await expect(mint).toBeDisabled()
+  await expectEnabledWithClock(page, mint)
+  await expect(mint).toBeEnabled()
+  expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+    sendAttempts: 0,
+    successfulBroadcasts: 0
+  })
+})
+
 test('claim selection is cleared when the connected wallet changes', async ({ page }) => {
   await emulateDesktopGoogleChrome(page)
   await mockSameOriginRpc(page)
@@ -668,8 +706,10 @@ test('an unsigned prepared operation is invalidated by an account change', async
   await expect(page.getByRole('button', { name: '0x2222...2222' }).first()).toBeVisible()
 })
 
-for (const width of [1280, 390]) {
-  test(`manual hash tracking explains a real wallet read timeout and allows a safe retry (${width}px)`, async ({
+for (const { width, stableGutter } of [1280, 390].flatMap((width) =>
+  [false, true].map((stableGutter) => ({ width, stableGutter }))
+)) {
+  test(`manual hash tracking explains a real wallet read timeout and allows a safe retry (${width}px${stableGutter ? ', stable gutter' : ''})`, async ({
     page
   }) => {
     await page.setViewportSize({ width, height: 900 })
@@ -680,6 +720,9 @@ for (const width of [1280, 390]) {
     const errors: string[] = []
     page.on('pageerror', (error) => errors.push(error.message))
     await page.goto('/')
+    if (stableGutter) {
+      await page.addStyleTag({ content: 'html { overflow-y: scroll; scrollbar-gutter: stable; }' })
+    }
     await expect(page.getByRole('heading', { name: 'XENTurbo XEN Miner' })).toBeVisible()
     await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
     const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
@@ -687,8 +730,11 @@ for (const width of [1280, 390]) {
     await expect(page.locator('tbody tr')).toHaveCount(1)
     const layoutBefore = await page.evaluate(() => ({
       viewportWidth: innerWidth,
-      documentWidth: document.documentElement.scrollWidth
+      documentWidth: document.documentElement.scrollWidth,
+      documentClientWidth: document.documentElement.clientWidth,
+      scrollbarGutter: getComputedStyle(document.documentElement).scrollbarGutter
     }))
+    if (stableGutter) expect(layoutBefore.scrollbarGutter).toBe('stable')
     await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1_000))
     await page.evaluate(() => {
       const provider = (
@@ -732,6 +778,7 @@ for (const width of [1280, 390]) {
     const layoutAfter = await warning.evaluate((element) => ({
       viewportWidth: innerWidth,
       documentWidth: document.documentElement.scrollWidth,
+      documentClientWidth: document.documentElement.clientWidth,
       left: element.getBoundingClientRect().left,
       right: element.getBoundingClientRect().right,
       scrollWidth: element.scrollWidth,
@@ -743,12 +790,16 @@ for (const width of [1280, 390]) {
     })
     // Verify this warning fits and adds no overflow; the rest of the narrow desktop layout is unchanged.
     expect(layoutAfter.documentWidth).toBe(layoutBefore.documentWidth)
+    expect(layoutAfter.documentClientWidth).toBe(layoutBefore.documentClientWidth)
     expect(layoutAfter.left).toBeGreaterThanOrEqual(0)
     expect(layoutAfter.right).toBeLessThanOrEqual(layoutAfter.viewportWidth)
     expect(layoutAfter.scrollWidth).toBeLessThanOrEqual(layoutAfter.clientWidth)
     expect(await storedRecords()).toEqual(original)
     await expect(mint).toBeEnabled()
-    await captureQaScreenshot(page, `manual-track-timeout-${width}`)
+    await captureQaScreenshot(
+      page,
+      `manual-track-timeout-${width}${stableGutter ? '-stable-gutter' : ''}`
+    )
 
     await page.evaluate(() => window.__walletMock.setStalled('eth_getTransactionByHash', false))
     await page.locator('.paste-input').fill(TX_HASH)
@@ -809,6 +860,15 @@ for (const width of [1280, 390]) {
       await expect(warning).not.toContainText('Check internet access')
       await expect(warning).not.toContainText('RPC_UNAVAILABLE')
       await expect(warning).toHaveText(await banner.locator(':scope > span').innerText())
+      const listError = page.locator('.err-banner')
+      const pendingError = page.locator('p.dim[role="status"]').filter({
+        hasText: 'Blocked: pending transaction check failed'
+      })
+      await expect(listError).toHaveText(await banner.locator(':scope > span').innerText())
+      await expect(pendingError).toContainText(reason)
+      await expect(pendingError).toContainText('Open the RPC settings')
+      await expect(pendingError).not.toContainText('Check internet access')
+      await expect(page.locator('body')).not.toContainText('RPC_UNAVAILABLE')
       expect(await page.evaluate(() => localStorage.getItem('sm.customRpc'))).toBe(stored)
       expect(invalidEndpointRequests).toBe(0)
       await expect(mint).toBeDisabled()
@@ -831,6 +891,8 @@ for (const width of [1280, 390]) {
       await page.getByRole('button', { name: 'Save', exact: true }).click()
       await expect(mint).toBeEnabled()
       await expect(banner).toHaveCount(0)
+      await expect(listError).toHaveCount(0)
+      await expect(pendingError).toHaveCount(0)
       expect(
         await page.evaluate(() => JSON.parse(localStorage.getItem('sm.customRpc')!).eth)
       ).toEqual(['https://ethereum.publicnode.com/'])
@@ -847,6 +909,59 @@ for (const width of [1280, 390]) {
       expect(errors).toEqual([])
     })
   }
+}
+
+for (const width of [1280, 390]) {
+  test(`selected claim actions explain invalid RPC configuration and recover after correction (${width}px)`, async ({
+    page
+  }) => {
+    await page.setViewportSize({ width, height: 900 })
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await installInjectedWallet(page)
+    const errors: string[] = []
+    page.on('pageerror', (error) => errors.push(error.message))
+    await page.goto('/')
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    const mint = page.getByRole('button', { name: 'Confirm Mint', exact: true })
+    await expect(mint).toBeEnabled()
+    const checkbox = page.locator('tbody input[type="checkbox"]').first()
+    await checkbox.click()
+    await expect(page.getByText('1 VMUs selected')).toBeVisible()
+    const stored = JSON.stringify({
+      eth: Array.from({ length: 17 }, (_, index) => `https://legacy-rpc${index}.example/`)
+    })
+    await page.evaluate((value) => localStorage.setItem('sm.customRpc', value), stored)
+    await page.locator('.paste-input').fill(TX_HASH)
+    await page.getByRole('button', { name: 'Track', exact: true }).click()
+    const reason = page.locator('.action-bar .blocked-reason')
+    await expect(reason).toHaveText(
+      'Blocked: invalid Ethereum RPC configuration. Open RPC settings to correct it.'
+    )
+    await expect(checkbox).toBeChecked()
+    const claim = page.getByRole('button', { name: 'Claim only', exact: true })
+    const remint = page.getByRole('button', { name: 'Claim & Re-Mint (100d)', exact: true })
+    await expect(claim).toBeDisabled()
+    await expect(remint).toBeDisabled()
+    await expect(mint).toBeDisabled()
+    expect(await page.evaluate(() => localStorage.getItem('sm.customRpc'))).toBe(stored)
+    await captureQaScreenshot(page, `selected-rpc-config-${width}`)
+
+    await page.getByRole('button', { name: 'RPC', exact: true }).click()
+    await page.locator('textarea').fill('https://ethereum.publicnode.com/')
+    await page.getByRole('button', { name: 'Save', exact: true }).click()
+    await expect(mint).toBeEnabled()
+    await expect(checkbox).not.toBeChecked()
+    await checkbox.click()
+    await expect(claim).toBeEnabled()
+    await expect(remint).toBeEnabled()
+    await expect(reason).toHaveCount(0)
+    expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+      sendAttempts: 0,
+      successfulBroadcasts: 0
+    })
+    expect(errors).toEqual([])
+  })
 }
 
 test('marking an unknown transaction dropped explains storage failure without clearing its gate', async ({

@@ -11,7 +11,11 @@ import {
 } from '@/core/chainReader'
 import { loadSnapshot, saveSnapshot, clearSnapshot } from '@/core/idb'
 import { broadcastLockedIds } from '@/core/localLock'
-import { ensureHealthyReadProvider } from '@/core/rpc'
+import {
+  ensureHealthyReadProvider,
+  RpcConfigurationError,
+  rpcConfigurationMessage
+} from '@/core/rpc'
 import { assertReadActive, withReadDeadline } from '@/core/readDeadline'
 import { estimateGroupXen } from '@/utils/rewards'
 
@@ -330,7 +334,10 @@ export const useVmuStore = defineStore('vmu', {
         } catch (err: any) {
           if (controller.signal.aborted || err?.name === 'AbortError') return
           if (!isCurrent()) return
-          this.error = err?.shortMessage || err?.message || 'Failed to read chain'
+          this.error =
+            err instanceof RpcConfigurationError
+              ? rpcConfigurationMessage(err.message)
+              : err?.shortMessage || err?.message || 'Failed to read chain'
         } finally {
           if (isCurrent()) this.loading = false
         }
@@ -436,7 +443,12 @@ export const useVmuStore = defineStore('vmu', {
           if (isCurrent()) this.scheduleMaturityRefresh()
         } catch (error) {
           if (isCurrent())
-            this.error = error instanceof Error ? error.message : 'Failed to refresh affected VMUs'
+            this.error =
+              error instanceof RpcConfigurationError
+                ? rpcConfigurationMessage(error.message)
+                : error instanceof Error
+                  ? error.message
+                  : 'Failed to refresh affected VMUs'
         } finally {
           if (isCurrent()) this.loading = false
         }

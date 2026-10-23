@@ -2,6 +2,7 @@ import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Vmu, WalletSnapshot } from '@/core/types'
 import { READ_TIMEOUT_MS } from '@/core/readDeadline'
+import { RpcConfigurationError } from '@/core/rpc'
 
 const chainReader = vi.hoisted(() => ({
   readVmuCount: vi.fn(),
@@ -27,7 +28,10 @@ const rpcHealth = vi.hoisted(() => ({
 
 vi.mock('@/core/chainReader', () => chainReader)
 vi.mock('@/core/idb', () => snapshots)
-vi.mock('@/core/rpc', () => rpcHealth)
+vi.mock('@/core/rpc', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/core/rpc')>()),
+  ...rpcHealth
+}))
 vi.mock('@/core/localLock', () => ({
   broadcastLockedIds: () => new Set<number>()
 }))
@@ -96,6 +100,45 @@ describe('vmu store request invalidation', () => {
       chainReader.readVmuCount.mock.invocationCallOrder[0]
     )
   })
+
+  it.each(['full', 'affected'] as const)(
+    'explains an RPC configuration failure during a %s refresh and recovers without losing inventory',
+    async (kind) => {
+      const store = useVmuStore()
+      const vmu = mintingVmu()
+      store.$patch({ chain: 'eth', wallet: walletA, vmuCount: 1, vmus: [vmu], syncedAt: 123 })
+      rpcHealth.ensureHealthyReadProvider.mockRejectedValueOnce(
+        new RpcConfigurationError('eth', 'Use at most 16 RPC endpoints')
+      )
+      const refresh = () => (kind === 'full' ? store.refresh() : store.refreshAffected([1]))
+      try {
+        await refresh()
+        expect(store.error).toContain('Ethereum RPC configuration is invalid: Use at most 16')
+        expect(store.error).toContain('Open the RPC settings')
+        expect(store.error).toContain('Your RPC list was not changed.')
+        expect(store.error).not.toContain('RPC_UNAVAILABLE')
+        expect(store.error).not.toContain('Check internet access')
+        expect(store.vmus).toEqual([vmu])
+        expect(store.syncedAt).toBe(123)
+        expect(store.loading).toBe(false)
+        expect(chainReader.readVmuCount).not.toHaveBeenCalled()
+        expect(snapshots.saveSnapshot).not.toHaveBeenCalled()
+
+        rpcHealth.ensureHealthyReadProvider.mockResolvedValue({})
+        chainReader.readVmuCount.mockResolvedValue(1)
+        chainReader.readGlobalRank.mockResolvedValue(100)
+        chainReader.readWalletVmus.mockResolvedValue([vmu])
+        chainReader.readVmuStates.mockResolvedValue([vmu])
+        await refresh()
+        expect(store.error).toBeNull()
+        expect(store.loading).toBe(false)
+        expect(store.vmus).toEqual([vmu])
+        expect(snapshots.saveSnapshot).toHaveBeenCalledOnce()
+      } finally {
+        store.detach()
+      }
+    }
+  )
 
   it('passes the same cancellation signal to all initial reads and the final clock read', async () => {
     chainReader.readVmuCount.mockResolvedValue(0)

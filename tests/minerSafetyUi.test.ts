@@ -310,6 +310,8 @@ it.each(['count', 'length'] as const)(
 it.each(['count', 'length'] as const)(
   'reports a real RPC configuration failure at Track (%s) without blaming the network',
   async (kind) => {
+    const fetch = vi.fn(() => Promise.reject(new Error('Network access is forbidden in this test')))
+    vi.stubGlobal('fetch', fetch)
     const urls =
       kind === 'count'
         ? Array.from({ length: 17 }, (_, id) => `https://rpc${id}.example/`)
@@ -329,9 +331,13 @@ it.each(['count', 'length'] as const)(
     expect(warning).not.toContain('Check internet access')
     expect(warning).not.toContain('RPC_UNAVAILABLE')
     expect(warning).toBe(view.get('.rpc-health-banner > span').text())
+    expect(view.get('[data-testid="mint-list"]').text()).toBe(
+      'Blocked: invalid Ethereum RPC configuration. Open RPC settings to correct it.'
+    )
     expect(localStorage.getItem('sm.customRpc')).toBe(stored)
     expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('true')
     expect(sendPreparedOperation).not.toHaveBeenCalled()
+    expect(fetch).not.toHaveBeenCalled()
   }
 )
 

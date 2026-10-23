@@ -4,6 +4,7 @@ import { effectScope, nextTick, ref } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { refreshPendingOps, trackPendingTxHash } from '../src/core/pendingOps'
 import { usePendingTx } from '../src/composables/usePendingTx'
+import { RpcConfigurationError } from '../src/core/rpc'
 
 vi.mock('../src/core/pendingOps', () => ({
   canMarkPendingOpDropped: vi.fn(),
@@ -88,6 +89,44 @@ describe('usePendingTx', () => {
       value: 'visible'
     })
   })
+
+  it.each(['eth', 'polygon'] as const)(
+    'keeps %s pending checks blocked with actionable RPC configuration guidance until retry succeeds',
+    async (chain) => {
+      vi.mocked(refreshPendingOps).mockRejectedValueOnce(
+        new RpcConfigurationError(chain, 'Use at most 16 RPC endpoints')
+      )
+      const scope = effectScope()
+      const state = scope.run(() =>
+        usePendingTx(
+          () => '0x1',
+          () => chain
+        )
+      )!
+      try {
+        await vi.waitFor(() => expect(state.error.value).toContain('Open the RPC settings'))
+        expect(state.error.value).toContain('Use at most 16 RPC endpoints')
+        expect(state.error.value).toContain('Your RPC list was not changed.')
+        expect(state.error.value).not.toContain('Check internet access')
+        expect(state.error.value).not.toContain('RPC_UNAVAILABLE')
+        expect(state.ready.value).toBe(false)
+        expect(state.checking.value).toBe(false)
+        expect(state.lastCheckedAt.value).toBeNull()
+        vi.mocked(refreshPendingOps).mockResolvedValue({
+          views: [],
+          pendingNonceGap: 0,
+          unresolvedCount: 0,
+          confirmedOps: []
+        })
+        await state.check()
+        expect(state.error.value).toBeNull()
+        expect(state.ready.value).toBe(true)
+        expect(refreshPendingOps).toHaveBeenCalledTimes(2)
+      } finally {
+        scope.stop()
+      }
+    }
+  )
 
   it('uses a slower polling interval while the account has no pending work', async () => {
     vi.useFakeTimers()

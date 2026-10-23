@@ -209,7 +209,8 @@ async function installSendHarness(options: {
     writeFactory
   }))
   const ensureHealthyReadProvider = vi.fn(async () => readProvider)
-  vi.doMock('../src/core/rpc', () => ({
+  vi.doMock('../src/core/rpc', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../src/core/rpc')>()),
     ensureHealthyReadProvider,
     getReadProvider: () => readProvider
   }))
@@ -250,6 +251,28 @@ async function installSendHarness(options: {
 }
 
 describe('authoritative pre-send state', () => {
+  it.each(['configuration', 'network'] as const)(
+    'reports %s RPC errors before dispatch without masking them with an incomplete mock',
+    async (kind) => {
+      const harness = await installSendHarness({ walletNonce: 7, rpcNonce: 7 })
+      const { RpcConfigurationError } =
+        await vi.importActual<typeof import('../src/core/rpc')>('../src/core/rpc')
+      const failure =
+        kind === 'configuration'
+          ? new RpcConfigurationError('eth', 'Use at most 16 RPC endpoints')
+          : new Error('RPC_UNAVAILABLE: offline fixture')
+      harness.ensureHealthyReadProvider.mockRejectedValueOnce(failure)
+      const onStep = vi.fn()
+      await expect(harness.sendPreparedOperation(preparedOperation(), { onStep })).rejects.toBe(
+        failure
+      )
+      expect(onStep.mock.lastCall?.[0].error).toContain(
+        kind === 'configuration' ? 'Open the RPC settings' : 'Check internet access'
+      )
+      expect(onStep.mock.lastCall?.[0].error).not.toContain('RPC_UNAVAILABLE')
+      expect(harness.writeFactory).not.toHaveBeenCalled()
+    }
+  )
   it('blocks an injected-wallet nonce gap even when the read RPC hides it', async () => {
     const { sendPreparedOperation, writeFactory } = await installSendHarness({
       walletNonce: 9,

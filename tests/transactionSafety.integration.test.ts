@@ -73,7 +73,8 @@ async function installOfflineHarness(storageFailure?: 'QuotaExceededError' | 'Se
     getBlock: vi.fn(async () => ({ gasLimit: 30_000_000n })),
     waitForTransaction: vi.fn()
   }
-  vi.doMock('@/core/rpc', () => ({
+  vi.doMock('@/core/rpc', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('@/core/rpc')>()),
     getReadProvider: () => readProvider,
     ensureHealthyReadProvider: vi.fn(async () => readProvider),
     ensureRecentReadProvider: vi.fn(async () => readProvider),
@@ -223,6 +224,19 @@ async function detachAtWalletTimeout(harness: Awaited<ReturnType<typeof installO
   expect(onStep.mock.lastCall?.[0].logs.at(-1)).toMatchObject({ status: 'error' })
   return { prepared, onStep }
 }
+
+it('normalizes RPC errors with the real error class in the offline transaction harness', async () => {
+  const harness = await installOfflineHarness()
+  const { RpcConfigurationError } = await vi.importActual<typeof import('@/core/rpc')>('@/core/rpc')
+  expect(
+    harness.tx.normalizeError(new RpcConfigurationError('eth', 'Use at most 16 RPC endpoints'))
+  ).toContain('Open the RPC settings')
+  expect(harness.tx.normalizeError(new Error('RPC_UNAVAILABLE: offline fixture'))).toContain(
+    'Check internet access'
+  )
+  expect(harness.sendRequests()).toEqual([])
+  expect(harness.activeLocks.size).toBe(0)
+})
 
 function mockRevertedReceipt(harness: Awaited<ReturnType<typeof installOfflineHarness>>) {
   const request = harness.request.getMockImplementation()!
