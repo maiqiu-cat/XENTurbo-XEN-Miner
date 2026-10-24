@@ -103,6 +103,7 @@ function blockResult(chainId: number, timestamp = BLOCK_TIMESTAMP) {
 }
 
 interface RpcMockState {
+  vmuCount?: number
   successfulTx?: boolean
   confirmed?: boolean
   operation?: 'GENERAL_MINT' | 'CREATE_EMPTY_SLOT' | 'MINT_EMPTY_SLOT' | 'CLAIM' | 'CLAIM_REUSE'
@@ -120,7 +121,9 @@ function contractReadResult(chainId: 1 | 137, params: unknown[], state: RpcMockS
       const allocated =
         state.confirmed &&
         (state.operation === 'GENERAL_MINT' || state.operation === 'CREATE_EMPTY_SLOT')
-      return factoryInterface.encodeFunctionResult('vmuCount', [allocated ? 3n : 1n])
+      return factoryInterface.encodeFunctionResult('vmuCount', [
+        state.vmuCount ?? (allocated ? 3n : 1n)
+      ])
     }
     if (parsed?.name === 'FEE') {
       return factoryInterface.encodeFunctionResult('FEE', [18_000_000_000_000n])
@@ -1741,6 +1744,122 @@ test('two tabs serialize wallet sends with a shared Web Lock', async ({ page, co
 
 test.describe('Traditional Chinese interface', () => {
   test.use({ locale: 'zh-TW' })
+
+  test('loads and refreshes a large Polygon wallet through constrained RPCs while preserving language choice', async ({
+    page
+  }) => {
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await installInjectedWallet(page)
+    const errors: string[] = []
+    const rpcBatchSizes: number[] = []
+    const multicallSizes: number[] = []
+    const rejected: string[] = []
+    const externalRequests: string[] = []
+    page.on('pageerror', (error) => errors.push(error.message))
+    const polygonEndpoints = [
+      /^https:\/\/polygon-bor-rpc\.publicnode\.com(?:\/.*)?$/,
+      /^https:\/\/polygon\.publicnode\.com(?:\/.*)?$/,
+      /^https:\/\/polygon\.drpc\.org(?:\/.*)?$/,
+      /^https:\/\/1rpc\.io\/matic(?:[/?].*)?$/
+    ]
+    for (const endpoint of polygonEndpoints) {
+      await page.route(endpoint, async (route) => {
+        const payload = route.request().postDataJSON() as
+          | { id: number; method: string; params: unknown[] }
+          | Array<{ id: number; method: string; params: unknown[] }>
+        const requests = Array.isArray(payload) ? payload : [payload]
+        rpcBatchSizes.push(requests.length)
+        const replies = requests.map(({ id, method, params }) => {
+          if (requests.length > 3) {
+            rejected.push('JSON-RPC batch exceeds 3')
+            return { jsonrpc: '2.0', id, error: { code: 31, message: rejected.at(-1) } }
+          }
+          const result = rpcResult(method, 137, params, { vmuCount: 601 })
+          if (
+            method === 'eth_call' &&
+            (params[0] as { to: string }).to.toLowerCase() === MULTICALL.toLowerCase()
+          ) {
+            const data = (params[0] as { data: string }).data
+            multicallSizes.push(
+              multicallInterface.decodeFunctionData('aggregate3', data).calls.length
+            )
+            if ((String(result).length - 2) / 2 > 100_000) {
+              rejected.push('Multicall response exceeds 100000 bytes')
+              return { jsonrpc: '2.0', id, error: { code: -32000, message: rejected.at(-1) } }
+            }
+          }
+          return { jsonrpc: '2.0', id, result }
+        })
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify(Array.isArray(payload) ? replies.reverse() : replies[0])
+        })
+      })
+    }
+    // All network access stays in local fixtures; unexpected endpoints fail this test.
+    await page.route('https://**/*', async (route) => {
+      const url = route.request().url()
+      if (
+        ETHEREUM_RPC_ROUTES.some((pattern) => pattern.test(url)) ||
+        polygonEndpoints.some((pattern) => pattern.test(url))
+      )
+        return route.fallback()
+      if (url === 'https://gasstation.polygon.technology/v2') {
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ standard: { maxFee: 40, maxPriorityFee: 30 } })
+        })
+      }
+      externalRequests.push(url)
+      await route.abort()
+    })
+
+    await page.goto('/')
+    await expect(page.locator('html')).toHaveAttribute('lang', 'zh-Hant')
+    await page.evaluate(() => window.__walletMock.emitChain('0x89'))
+    await page.getByRole('button', { name: '連接錢包' }).first().click()
+    await expect(page.getByRole('combobox', { name: '網路', exact: true })).toHaveValue('polygon')
+    await expect(page.locator('.group-note')).toContainText('共 601 個 VMU')
+    await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeEnabled()
+    await expect(page.getByText('讀取錯誤', { exact: false })).toHaveCount(0)
+    expect(multicallSizes).toEqual([300, 300, 1])
+    await captureQaScreenshot(page, 'rpc-polygon-large-wallet-zh')
+
+    await page.getByTestId('language-selector').selectOption('en')
+    await expect(page.locator('.group-note')).toContainText('601 VMUs total')
+    await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+    await expect.poll(() => multicallSizes.length).toBe(6)
+    await expect(page.getByRole('button', { name: 'Refresh', exact: true })).toBeEnabled()
+    await expect(page.locator('.group-note')).toContainText('601 VMUs total')
+    await page.getByTestId('language-selector').selectOption('zh-Hant')
+    expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+      sendAttempts: 0,
+      successfulBroadcasts: 0
+    })
+    await page.reload()
+    await expect(page.getByTestId('language-selector')).toHaveValue('zh-Hant')
+    await expect(page.locator('html')).toHaveAttribute('lang', 'zh-Hant')
+    await page.evaluate(() => window.__walletMock.emitChain('0x89'))
+    await page.getByRole('button', { name: '連接錢包' }).first().click()
+    await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeEnabled()
+    await expect(page.locator('.group-note')).toContainText('共 601 個 VMU')
+    await expect.poll(() => multicallSizes.length).toBe(9)
+    expect(multicallSizes).toEqual([300, 300, 1, 300, 300, 1, 300, 300, 1])
+    expect(rpcBatchSizes.length).toBeGreaterThan(0)
+    expect(rpcBatchSizes.every((size) => size >= 1 && size <= 3)).toBe(true)
+    expect(rejected).toEqual([])
+    expect(externalRequests).toEqual([])
+    expect(errors).toEqual([])
+    expect(await page.evaluate(() => localStorage.getItem('sm.customRpc'))).toBeNull()
+    expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+      sendAttempts: 0,
+      successfulBroadcasts: 0
+    })
+    await captureQaScreenshot(page, 'rpc-polygon-large-wallet-zh-reloaded')
+  })
 
   test('follows browser language, remembers a manual choice, and restores automatic selection', async ({
     page

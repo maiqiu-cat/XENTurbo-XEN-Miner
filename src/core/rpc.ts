@@ -119,7 +119,9 @@ function buildReadProvider(key: ChainKey, urls: string[]): ReadProvider {
   const endpoint = (url: string) => {
     const request = new FetchRequest(url)
     request.timeout = 12_000
-    return new JsonRpcProvider(request, network)
+    // Public endpoints such as dRPC limit a JSON-RPC batch to three items.
+    // This transport limit is separate from the calls inside a Multicall eth_call.
+    return new JsonRpcProvider(request, network, { batchMaxCount: 3 })
   }
   if (urls.length === 1) return endpoint(urls[0])
 

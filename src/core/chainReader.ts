@@ -11,8 +11,9 @@ import { mapWithConcurrency } from '@/utils/concurrency'
 
 const xenIface = new Interface(XENCryptoABI as unknown as any[])
 
-// Multicall batch size: number of userMints calls per aggregate3 request.
-const BATCH_SIZE = 400
+// Polygon public nodes cap eth_call return data at 100 KB: 300 userMints
+// results encode to 96,064 bytes, while 400 exceed the limit (128,064 bytes).
+const MULTICALL_BATCH_SIZE: Record<ChainKey, number> = { eth: 400, polygon: 300 }
 const BATCH_CONCURRENCY = 2
 const CODE_BATCH_SIZE = 32
 export const MAX_WALLET_VMU_COUNT = 100_000
@@ -214,9 +215,10 @@ async function readVmuIds(
   const { factory, vmuTemplate, xenCrypto, multicall3 } = CONTRACTS[chain]
   const multicall = new Contract(multicall3, Multicall3ABI as unknown as any[], provider)
   const vmus: Vmu[] = []
-  for (let start = 0; start < ids.length; start += BATCH_SIZE) {
+  const batchSize = MULTICALL_BATCH_SIZE[chain]
+  for (let start = 0; start < ids.length; start += batchSize) {
     throwIfAborted(signal)
-    const slice = ids.slice(start, start + BATCH_SIZE).map((id) => ({
+    const slice = ids.slice(start, start + batchSize).map((id) => ({
       id,
       address: computeProxyAddress({ factory, vmuTemplate, wallet, vmuId: id })
     }))
@@ -250,7 +252,7 @@ async function readVmuIds(
  * Read the on-chain state of every VMU owned by `wallet`.
  * Proxy addresses are computed locally (CREATE2); userMints is batched via Multicall3.
  * Failed multicall entries are marked READ_ERROR (never silently treated as EMPTY)
- * and retried once in a small batch.
+ * and retried once in bounded batches.
  */
 export async function readWalletVmus(
   chain: ChainKey,
@@ -278,9 +280,10 @@ export async function readWalletVmus(
     Multicall3ABI as unknown as any[],
     getReadProvider(chain)
   )
-  const batches = Array.from({ length: Math.ceil(total / BATCH_SIZE) }, (_, index) => ({
-    fromId: index * BATCH_SIZE + 1,
-    toId: Math.min(total, (index + 1) * BATCH_SIZE)
+  const batchSize = MULTICALL_BATCH_SIZE[chain]
+  const batches = Array.from({ length: Math.ceil(total / batchSize) }, (_, index) => ({
+    fromId: index * batchSize + 1,
+    toId: Math.min(total, (index + 1) * batchSize)
   }))
 
   let loaded = 0
@@ -321,7 +324,7 @@ export async function readWalletVmus(
   throwIfAborted(opts.signal)
   const vmus = vmuBatches.flat()
 
-  // Retry failed reads once (small batch) so transient RPC blips don't stick.
+  // Retry failed reads once in bounded batches so transient RPC blips don't stick.
   const failedIds = vmus.filter((v) => !v.readOk).map((v) => v.id)
   if (failedIds.length) {
     try {
