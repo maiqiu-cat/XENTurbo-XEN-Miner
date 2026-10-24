@@ -1,6 +1,14 @@
 # XENTurbo XEN Miner
 
-Current release: **v1.1.5**. The page header displays the same version as the source package and Git release tag.
+Current release: **v1.1.6**. The page header displays the same version as the source package and Git release tag.
+
+### v1.1.6 Traditional Chinese And Test Dependency Security
+
+- Added English and Traditional Chinese interface switching, defaulting to the browser's preferred supported language. Manual choices persist locally and synchronize between tabs without reloading or changing transaction state.
+- Localized known application diagnostics, RPC settings, transaction progress, storage recovery and browser requirements. Unrecognized wallet and RPC messages remain verbatim.
+- Pinned the development-only `happy-dom` dependency to 21.0.4, fixing GHSA-834v-8h66-3h79. Regression tests cover malformed import aliases and valid module imports; dependency JavaScript evaluation remains disabled by default.
+- Added language-selection, transaction-state preservation and dependency-security regressions. Contracts, ABI, RPC defaults, wallet signing and transaction safety gates are unchanged.
+- Damaged locks without a hash remain preserved and blocking. P2-C remains unproven; no safety gate has been relaxed.
 
 ### v1.1.5 Transaction Recovery And RPC Hardening
 
@@ -56,6 +64,15 @@ backend. It reads mining state directly from the blockchain and stores temporary
 cache and pending-transaction information only in your browser.
 
 ## Browser and wallet requirements
+
+The interface supports English and Traditional Chinese. The header language menu
+defaults to the first supported language in the browser's preference list. Chinese
+locales (including `zh-TW`, `zh-HK` and `zh-CN`) use Traditional Chinese; other
+unsupported languages fall back to English. Select **English** or **繁體中文** to
+remember a manual choice, or **Browser language / 跟隨瀏覽器** to restore automatic
+selection. This preference is stored only in this browser. Language changes do not
+reload the page, reconnect the wallet, or change transaction data. External wallet
+and RPC diagnostics without a known translation are kept verbatim.
 
 - Use Google Chrome on a desktop computer.
 - Install MetaMask or another injected EIP-1193 extension wallet.

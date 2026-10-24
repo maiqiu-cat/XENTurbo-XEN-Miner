@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { checkBrowserSupport, type BrowserNavigator } from '@/core/browserGuard'
+import { t, message as localize } from '@/i18n'
+import LanguageSelect from '@/components/LanguageSelect.vue'
 
 const supported = ref(true)
 const message = ref('XENTurbo XEN Miner requires Google Chrome.')
@@ -21,9 +23,9 @@ onMounted(() => {
     aria-labelledby="chrome-guard-title"
   >
     <div class="chrome-guard__panel">
-      <p id="chrome-guard-title" class="chrome-guard__title">Please use PC Chrome</p>
+      <p id="chrome-guard-title" class="chrome-guard__title">{{ t('Please use PC Chrome') }}</p>
       <p class="chrome-guard__body">
-        {{ message }}
+        {{ localize(message) }}
       </p>
       <a
         class="btn btn-primary chrome-guard__action"
@@ -31,8 +33,9 @@ onMounted(() => {
         target="_blank"
         rel="noreferrer"
       >
-        Get Chrome
+        {{ t('Get Chrome') }}
       </a>
+      <div class="chrome-guard__language"><LanguageSelect /></div>
     </div>
   </div>
 </template>
@@ -76,6 +79,9 @@ onMounted(() => {
 .chrome-guard__action {
   display: inline-flex;
   justify-content: center;
+  margin-top: 18px;
+}
+.chrome-guard__language {
   margin-top: 18px;
 }
 </style>

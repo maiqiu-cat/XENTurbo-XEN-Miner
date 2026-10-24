@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import { canMarkPendingOpDropped, type PendingOpView } from '@/core/pendingOps'
 import { useDocumentClock } from '@/composables/useDocumentClock'
+import { t, message } from '@/i18n'
 
 const props = defineProps<{
   ops: PendingOpView[]
@@ -33,11 +34,11 @@ function shortHash(h: string): string {
  */
 function pendingFor(submittedAt: number): string {
   const s = Math.max(0, Math.floor((now.value - submittedAt) / 1000))
-  if (s < 60) return `pending ${s}s`
+  if (s < 60) return t('pending {seconds}s', { seconds: s })
   const m = Math.floor(s / 60)
-  if (m < 60) return `pending ${m}m ${s % 60}s`
+  if (m < 60) return t('pending {minutes}m {seconds}s', { minutes: m, seconds: s % 60 })
   const h = Math.floor(m / 60)
-  return `pending ${h}h ${m % 60}m`
+  return t('pending {hours}h {minutes}m', { hours: h, minutes: m % 60 })
 }
 
 function seenAt(submittedAt: number): string {
@@ -69,20 +70,18 @@ const needsHash =
   <div class="card pending-panel">
     <div class="row between wrap" style="gap: 10px; margin-bottom: 10px">
       <strong>
-        Pending on-chain
+        {{ t('Pending on-chain') }}
         <span class="dim" style="font-weight: 400">
-          · {{ pendingCount }} in-flight nonce{{ pendingCount === 1 ? '' : 's' }}
+          {{ t(pendingCount === 1 ? '· {count} in-flight nonce' : '· {count} in-flight nonces', { count: pendingCount }) }}
         </span>
       </strong>
       <button class="btn" :disabled="checking" @click="emit('recheck')">
-        {{ checking ? 'Checking…' : 'Recheck' }}
+        {{ checking ? t('Checking…') : t('Recheck') }}
       </button>
     </div>
 
     <p class="dim intro">
-      Submits are blocked while a nonce is in-flight. Age uses Etherscan’s First/Last Seen
-      (browser index time for pending txs — not a block timestamp).
-      Stuck? MetaMask → Activity → Speed up / Cancel.
+      {{ t('Submits are blocked while a nonce is in-flight. Age uses Etherscan’s First/Last Seen (browser index time for pending txs — not a block timestamp). Stuck? MetaMask → Activity → Speed up / Cancel.') }}
     </p>
 
     <ul v-if="ops.length" class="ops">
@@ -90,20 +89,20 @@ const needsHash =
         <div class="row between wrap" style="gap: 8px">
           <div class="op-main">
             <div class="row wrap" style="gap: 8px; align-items: center">
-              <span class="tag tag-warn">{{ op.label }}</span>
-              <span class="tag tag-dim">{{ op.status }}</span>
+              <span class="tag tag-warn">{{ message(op.label) }}</span>
+              <span class="tag tag-dim">{{ message(op.status) }}</span>
             </div>
-            <div class="detail mono">{{ op.detail || '—' }}</div>
+            <div class="detail mono">{{ message(op.detail) || '—' }}</div>
           </div>
           <div class="age-box">
-            <span class="age">{{ op.status === 'confirmed' ? 'confirmed on-chain' : pendingFor(op.submittedAt) }}</span>
-            <span class="dim seen" :title="'Explorer First/Last Seen (indexed pending time)'">
+            <span class="age">{{ op.status === 'confirmed' ? t('confirmed on-chain') : pendingFor(op.submittedAt) }}</span>
+            <span class="dim seen" :title="t('Explorer First/Last Seen (indexed pending time)')">
               {{ seenAt(op.submittedAt) }}
             </span>
           </div>
         </div>
         <div class="row wrap hash-row">
-          <span class="dim">Tx</span>
+          <span class="dim">{{ t('Tx') }}</span>
           <a
             v-if="op.txHash"
             :href="op.explorerUrl"
@@ -114,15 +113,15 @@ const needsHash =
             {{ shortHash(op.txHash) }}
           </a>
           <a v-else :href="op.explorerUrl" target="_blank" rel="noreferrer" class="dim">
-            View address on explorer
+            {{ t('View address on explorer') }}
           </a>
           <button
             v-if="canMarkPendingOpDropped(op)"
             class="btn drop-button"
-            title="Use only after verifying the transaction is not pending"
+            :title="t('Use only after verifying the transaction is not pending')"
             @click="emit('mark-dropped', op.id)"
           >
-            Mark dropped
+            {{ t('Mark dropped') }}
           </button>
         </div>
       </li>
@@ -131,11 +130,11 @@ const needsHash =
     <div class="paste-box" :class="{ 'paste-only': !ops.length }">
       <p class="dim paste-label">
         {{
-          needsHash()
+          t(needsHash()
             ? 'Details missing — paste the pending tx hash from MetaMask / Etherscan:'
             : ops.length
               ? 'Or paste another pending tx hash:'
-              : 'Paste a pending tx hash to show explorer First/Last Seen time:'
+              : 'Paste a pending tx hash to show explorer First/Last Seen time:')
         }}
       </p>
       <div class="row wrap" style="gap: 8px">
@@ -146,16 +145,16 @@ const needsHash =
           spellcheck="false"
           @keyup.enter="submitHash"
         />
-        <button class="btn btn-primary" @click="submitHash">Track</button>
+        <button class="btn btn-primary" @click="submitHash">{{ t('Track') }}</button>
       </div>
       <input
         class="input paste-seen"
         v-model="pasteSeen"
-        placeholder="Optional: paste Etherscan Time Last Seen, e.g. Jul-09-2026 05:53:45 AM UTC"
+        :placeholder="t('Optional: paste Etherscan Time Last Seen, e.g. Jul-09-2026 05:53:45 AM UTC')"
         spellcheck="false"
         @keyup.enter="submitHash"
       />
-      <p v-if="pasteError" class="paste-err">{{ pasteError }}</p>
+      <p v-if="pasteError" class="paste-err">{{ message(pasteError) }}</p>
     </div>
   </div>
 </template>
