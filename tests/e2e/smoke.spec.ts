@@ -603,7 +603,7 @@ test('wallet initialization, connect, account changes, and chain changes update 
   await expect(page.getByRole('button', { name: 'Connect Wallet' }).first()).toBeVisible()
   await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
   await expect(page.getByRole('button', { name: '0x1111...1111' }).first()).toBeVisible()
-  await expect(page.getByRole('combobox')).toHaveValue('eth')
+  await expect(page.getByRole('combobox', { name: 'Network', exact: true })).toHaveValue('eth')
   await page.waitForTimeout(250)
   expect(nonceReads).toBe(0)
 
@@ -611,7 +611,7 @@ test('wallet initialization, connect, account changes, and chain changes update 
   await expect(page.getByRole('button', { name: '0x2222...2222' }).first()).toBeVisible()
 
   await page.evaluate(() => window.__walletMock.emitChain('0x89'))
-  await expect(page.getByRole('combobox')).toHaveValue('polygon')
+  await expect(page.getByRole('combobox', { name: 'Network', exact: true })).toHaveValue('polygon')
 })
 
 test('paused-clock readiness waits for delayed wallet nonce checks without bypassing the gate', async ({
@@ -1737,6 +1737,181 @@ test('two tabs serialize wallet sends with a shared Web Lock', async ({ page, co
   await expect(page.getByText('Transaction rejected', { exact: true })).toBeVisible()
   await expect.poll(() => second.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(1)
   await second.close()
+})
+
+test.describe('Traditional Chinese interface', () => {
+  test.use({ locale: 'zh-TW' })
+
+  test('follows browser language, remembers a manual choice, and restores automatic selection', async ({
+    page
+  }) => {
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    const errors: string[] = []
+    page.on('pageerror', (error) => errors.push(error.message))
+    await page.goto('/')
+    await expect(page.locator('html')).toHaveAttribute('lang', 'zh-Hant')
+    const language = page.getByTestId('language-selector')
+    await expect(language).toHaveValue('auto')
+    await expect(page.getByRole('button', { name: '連接錢包' }).first()).toBeVisible()
+    await captureQaScreenshot(page, 'language-zh-desktop')
+    await language.selectOption('en')
+    await expect(page.locator('html')).toHaveAttribute('lang', 'en')
+    await page.reload()
+    await expect(language).toHaveValue('en')
+    await expect(page.getByRole('button', { name: 'Connect Wallet' }).first()).toBeVisible()
+    await language.selectOption('auto')
+    expect(await page.evaluate(() => localStorage.getItem('xenturbo.language.v1'))).toBeNull()
+    await page.reload()
+    await expect(page.getByRole('button', { name: '連接錢包' }).first()).toBeVisible()
+    await page.setViewportSize({ width: 390, height: 844 })
+    await expect(language).toBeVisible()
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390)
+    await captureQaScreenshot(page, 'language-zh-narrow')
+    expect(errors).toEqual([])
+  })
+
+  test('preserves wallet, form and VMU selection on a switch and relocalizes an open preparation across tabs', async ({
+    page,
+    context
+  }) => {
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await installInjectedWallet(page)
+    await page.goto('/')
+    await page.getByRole('button', { name: '連接錢包' }).first().click()
+    await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeEnabled()
+    await page.getByLabel('鑄造 VMU（最多 128 個）', { exact: true }).fill('2')
+    await page.getByLabel('期限（天，最多 250 天）', { exact: true }).fill('10')
+    const selected = page.locator('tbody input[type="checkbox"]').first()
+    await selected.check()
+    await page.getByTestId('language-selector').selectOption('en')
+    await expect(selected).toBeChecked()
+    await expect(page.getByLabel('Mint VMUs (max 128)', { exact: true })).toHaveValue('2')
+    await expect(page.getByLabel('Term (days, max 250)', { exact: true })).toHaveValue('10')
+    await expect(page.getByRole('button', { name: '0x1111...1111' })).toBeVisible()
+    await page.getByRole('button', { name: 'Claim only', exact: true }).click()
+    await expect(page.getByRole('button', { name: 'Open MetaMask & Sign' })).toBeVisible()
+    const second = await context.newPage()
+    await emulateDesktopGoogleChrome(second)
+    await mockSameOriginRpc(second)
+    await second.goto('/')
+    await second.getByTestId('language-selector').selectOption('zh-Hant')
+    await expect(page.getByRole('button', { name: '開啟 MetaMask 並簽署' })).toBeVisible()
+    await expect(page.getByTestId('tx-log')).toContainText('Gas 估算已完成。')
+    expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+      sendAttempts: 0,
+      successfulBroadcasts: 0
+    })
+    await captureQaScreenshot(page, 'language-zh-prepared')
+    await page.getByRole('button', { name: '取消', exact: true }).click()
+    await expect(page.getByText('準備已取消。未送出任何交易。', { exact: true })).toBeVisible()
+    await second.close()
+  })
+
+  test('completes a wallet-mocked claim in Chinese without changing transaction semantics', async ({
+    page
+  }) => {
+    const rpcState: RpcMockState = { successfulTx: true, confirmed: false, operation: 'CLAIM' }
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page, rpcState)
+    await installInjectedWallet(page, { successfulSend: true })
+    await page.goto('/')
+    await page.getByRole('button', { name: '連接錢包' }).first().click()
+    await page.locator('tbody input[type="checkbox"]').first().check()
+    await page.getByRole('button', { name: '僅領取', exact: true }).click()
+    await page.getByRole('button', { name: '開啟 MetaMask 並簽署' }).click()
+    await expect(page.getByText('交易結果已驗證。', { exact: true })).toBeVisible()
+    await expect(page.locator('.outcome-text')).toContainText(
+      '完整結果已驗證：1/1 個 VMU 的狀態為 空槽。'
+    )
+    expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+      sendAttempts: 1,
+      successfulBroadcasts: 1
+    })
+    await captureQaScreenshot(page, 'language-zh-confirmed')
+  })
+
+  test('retains the no-hash damaged-lock gate and explains recovery in Chinese', async ({
+    page
+  }) => {
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await installInjectedWallet(page)
+    await page.goto('/')
+    const damaged = JSON.stringify([
+      { chain: 'eth', wallet: ACCOUNT_A, ids: ['1'], batch: 'damaged-no-hash', lockedAt: 1 }
+    ])
+    await page.evaluate((value) => localStorage.setItem('sm.vmuLocks', value), damaged)
+    await page.getByRole('button', { name: '連接錢包' }).first().click()
+    await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeDisabled()
+    await page.getByTestId('language-selector').selectOption('en')
+    await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeDisabled()
+    await page.getByTestId('language-selector').selectOption('zh-Hant')
+    await page.getByRole('button', { name: '交易記錄恢復', exact: true }).click()
+    const dialog = page.getByRole('dialog', { name: '交易記錄恢復' })
+    await expect(dialog).toContainText('缺少交易雜湊的損壞記錄無法在此驗證。')
+    await expect(dialog).toContainText('損壞記錄：1 筆')
+    const download = page.waitForEvent('download')
+    await dialog.getByRole('button', { name: '匯出備份' }).click()
+    await download
+    await dialog.getByRole('checkbox').check()
+    await dialog.getByRole('button', { name: '驗證並修復' }).click()
+    await expect(dialog.getByRole('status')).toContainText('1 筆記錄仍保持鎖定')
+    await expect(dialog.getByRole('status')).toContainText('1 筆交易識別資料缺失或無法讀取')
+    expect(await page.evaluate(() => localStorage.getItem('sm.vmuLocks'))).toBe(damaged)
+    await captureQaScreenshot(page, 'language-zh-recovery')
+    await dialog.getByRole('button', { name: '關閉交易記錄恢復' }).click()
+    await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeDisabled()
+    expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+  })
+
+  test('translates RPC validation without persisting an insecure endpoint', async ({ page }) => {
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await page.goto('/')
+    const before = await page.evaluate(() => Object.fromEntries(Object.entries(localStorage)))
+    await page.getByRole('button', { name: 'RPC', exact: true }).click()
+    await page.locator('textarea').fill('http://insecure.invalid')
+    await page.getByRole('button', { name: '儲存', exact: true }).click()
+    await expect(page.locator('.rpc-error')).toHaveText('RPC 節點必須使用 HTTPS')
+    expect(await page.evaluate(() => Object.fromEntries(Object.entries(localStorage)))).toEqual(
+      before
+    )
+    await captureQaScreenshot(page, 'language-zh-rpc')
+  })
+
+  test('offers a language switch inside the mobile guard without bypassing it', async ({
+    browser,
+    baseURL
+  }) => {
+    const context = await browser.newContext({
+      baseURL,
+      locale: 'zh-HK',
+      viewport: { width: 390, height: 844 },
+      isMobile: true,
+      userAgent:
+        'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/130.0.0.0 Mobile Safari/537.36'
+    })
+    try {
+      const page = await context.newPage()
+      await mockSameOriginRpc(page)
+      await page.goto('/')
+      const guard = page.getByRole('alertdialog')
+      await expect(guard).toContainText('請使用電腦版 Chrome')
+      await guard.getByTestId('language-selector').selectOption('en')
+      await expect(guard).toContainText('Mobile browsers are not supported')
+      await guard.getByTestId('language-selector').selectOption('zh-Hant')
+      await expect(guard).toContainText('不支援行動裝置瀏覽器')
+      const bounds = await guard.locator('.chrome-guard__panel').boundingBox()
+      expect(bounds!.x).toBeGreaterThanOrEqual(0)
+      expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(390)
+      expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390)
+      await captureQaScreenshot(page, 'language-zh-mobile-guard')
+    } finally {
+      await context.close()
+    }
+  })
 })
 
 test('a timely hash survives journal failure with a clear submitted state and recovery link', async ({

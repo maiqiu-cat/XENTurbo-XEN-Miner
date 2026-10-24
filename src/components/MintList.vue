@@ -6,6 +6,7 @@ import type { VmuGroup } from '@/core/types'
 import { LIMITS, DEFAULT_TERM, DEFAULT_TERM_MAX } from '@/config/miner'
 import { formatDate, countdownTo, thousands } from '@/utils/format'
 import { useDocumentClock } from '@/composables/useDocumentClock'
+import { t, message } from '@/i18n'
 
 const props = defineProps<{
   busy: boolean
@@ -66,10 +67,10 @@ const chainNow = computed(() => {
 })
 
 function countdown(group: VmuGroup): string {
-  if (group.status === 'CLAIMABLE') return 'Matured'
-  if (chainNow.value === null) return 'Chain time unavailable'
-  if (chainNow.value >= group.maturityTs) return 'Awaiting chain confirmation'
-  return countdownTo(group.maturityTs, chainNow.value)
+  if (group.status === 'CLAIMABLE') return t('Matured')
+  if (chainNow.value === null) return t('Chain time unavailable')
+  if (chainNow.value >= group.maturityTs) return t('Awaiting chain confirmation')
+  return message(countdownTo(group.maturityTs, chainNow.value))
 }
 
 /** Term used for the next Claim & Re-Mint — edited next to the action button. */
@@ -172,65 +173,71 @@ function doClaimReuse() {
 <template>
   <div class="card">
     <div class="row between wrap">
-      <strong>Mint List</strong>
+      <strong>{{ t('Mint List') }}</strong>
       <div class="row wrap">
-        <span class="tag tag-dim">Empty {{ store.counts.EMPTY }}</span>
-        <span class="tag tag-blue">Maturing {{ store.counts.MINTING }}</span>
-        <span class="tag tag-green">Claimable {{ store.counts.CLAIMABLE }}</span>
-        <span v-if="store.readErrors" class="tag tag-warn">Read err {{ store.readErrors }}</span>
+        <span class="tag tag-dim">{{ t('Empty') }} {{ store.counts.EMPTY }}</span>
+        <span class="tag tag-blue">{{ t('Maturing') }} {{ store.counts.MINTING }}</span>
+        <span class="tag tag-green">{{ t('Claimable') }} {{ store.counts.CLAIMABLE }}</span>
+        <span v-if="store.readErrors" class="tag tag-warn"
+          >{{ t('Read err') }} {{ store.readErrors }}</span
+        >
         <button
           class="btn btn-ghost"
           :disabled="props.busy || store.loading"
           @click="store.hardRefresh()"
         >
-          Refresh
+          {{ t('Refresh') }}
         </button>
       </div>
     </div>
 
-    <p v-if="store.error" class="err-banner">{{ store.error }}</p>
+    <p v-if="store.error" class="err-banner">{{ message(store.error) }}</p>
     <p v-if="store.rankError" class="rank-banner">
-      Global rank unavailable. Reward estimates are disabled until the next successful refresh.
+      {{
+        t(
+          'Global rank unavailable. Reward estimates are disabled until the next successful refresh.'
+        )
+      }}
     </p>
 
     <div class="row" style="margin: 14px 0">
       <button class="btn" :class="{ 'btn-primary': filter === 'ALL' }" @click="filter = 'ALL'">
-        All
+        {{ t('All') }}
       </button>
       <button
         class="btn"
         :class="{ 'btn-primary': filter === 'CLAIMABLE' }"
         @click="filter = 'CLAIMABLE'"
       >
-        Claimable
+        {{ t('Claimable') }}
       </button>
       <button
         class="btn"
         :class="{ 'btn-primary': filter === 'MINTING' }"
         @click="filter = 'MINTING'"
       >
-        Maturing
+        {{ t('Maturing') }}
       </button>
     </div>
 
     <div v-if="store.loading && !store.vmus.length" class="dim loading-box">
-      Reading on-chain state...
+      {{ t('Reading on-chain state...') }}
       <span v-if="store.progress.total">
         {{ store.progress.loaded }}/{{ store.progress.total }}</span
       >
     </div>
 
-    <div v-else-if="!list.length" class="dim loading-box">No VMUs in this category.</div>
+    <div v-else-if="!list.length" class="dim loading-box">{{ t('No VMUs in this category.') }}</div>
 
     <table v-else class="tbl">
       <thead>
         <tr>
           <th></th>
-          <th>Status</th>
+          <th>{{ t('Status') }}</th>
           <th>VMUs</th>
-          <th>Term</th>
-          <th>Maturity</th>
-          <th>Est. XEN</th>
+          <th>{{ t('Term') }}</th>
+          <th>{{ t('Maturity') }}</th>
+          <th>{{ t('Est. XEN') }}</th>
         </tr>
       </thead>
       <tbody>
@@ -249,35 +256,37 @@ function doClaimReuse() {
             />
           </td>
           <td>
-            <span v-if="g.status === 'CLAIMABLE'" class="tag tag-green">Claimable</span>
-            <span v-else class="tag tag-blue">Maturing</span>
+            <span v-if="g.status === 'CLAIMABLE'" class="tag tag-green">{{ t('Claimable') }}</span>
+            <span v-else class="tag tag-blue">{{ t('Maturing') }}</span>
           </td>
           <td class="mono">{{ g.count }}</td>
-          <td class="mono">{{ g.term }}d</td>
+          <td class="mono">{{ t('{days}d', { days: g.term }) }}</td>
           <td class="mono">
             {{ formatDate(g.maturityTs) }}
             <span class="dim">({{ countdown(g) }})</span>
           </td>
-          <td class="mono">{{ g.estXen === undefined ? 'Unavailable' : thousands(g.estXen) }}</td>
+          <td class="mono">
+            {{ g.estXen === undefined ? t('Unavailable') : thousands(g.estXen) }}
+          </td>
         </tr>
       </tbody>
     </table>
 
-    <nav v-if="pageCount > 1" class="pagination" aria-label="Mint list pages">
+    <nav v-if="pageCount > 1" class="pagination" :aria-label="t('Mint list pages')">
       <button
         class="btn btn-ghost page-button"
-        aria-label="Previous page"
-        title="Previous page"
+        :aria-label="t('Previous page')"
+        :title="t('Previous page')"
         :disabled="page === 1"
         @click="page -= 1"
       >
         &larr;
       </button>
-      <span class="dim mono">Page {{ page }} of {{ pageCount }}</span>
+      <span class="dim mono">{{ t('Page {page} of {pages}', { page, pages: pageCount }) }}</span>
       <button
         class="btn btn-ghost page-button"
-        aria-label="Next page"
-        title="Next page"
+        :aria-label="t('Next page')"
+        :title="t('Next page')"
         :disabled="page === pageCount"
         @click="page += 1"
       >
@@ -286,32 +295,41 @@ function doClaimReuse() {
     </nav>
 
     <p v-if="list.length" class="dim group-note">
-      {{ list.length }} group{{ list.length > 1 ? 's' : '' }} · {{ vmuTotal }} VMU{{
-        vmuTotal > 1 ? 's' : ''
+      {{
+        t('{groups} {groupLabel} · {count} {unitLabel} total', {
+          groups: list.length,
+          groupLabel: t(list.length > 1 ? 'groups' : 'group'),
+          count: vmuTotal,
+          unitLabel: t(vmuTotal > 1 ? 'VMUs' : 'VMU')
+        })
       }}
-      total
-      <span v-if="vmuTotal !== list.length">(rows are grouped by term &amp; maturity)</span>
+      <span v-if="vmuTotal !== list.length">{{ t('(rows are grouped by term & maturity)') }}</span>
     </p>
 
     <div v-if="selectedIds.length" class="action-bar">
       <div class="row wrap between">
         <span class="dim">
-          {{ selectedIds.length }} VMUs selected
+          {{ t('{count} VMUs selected', { count: selectedIds.length }) }}
           <span v-if="overClaim || overReuse">
-            (max Claim {{ claimLimit }} / Claim&amp;Re-Mint {{ claimReuseLimit }})
+            {{
+              t('(max Claim {claim} / Claim&Re-Mint {reuse})', {
+                claim: claimLimit,
+                reuse: claimReuseLimit
+              })
+            }}
           </span>
         </span>
-        <button class="btn" :disabled="props.busy" @click="clearSel">Clear</button>
+        <button class="btn" :disabled="props.busy" @click="clearSel">{{ t('Clear') }}</button>
       </div>
 
-      <p v-if="props.blockedReason" class="blocked-reason">{{ props.blockedReason }}</p>
+      <p v-if="props.blockedReason" class="blocked-reason">{{ message(props.blockedReason) }}</p>
 
       <div class="row wrap action-ops">
         <button class="btn btn-primary" :disabled="props.busy || overClaim" @click="doClaim">
-          Claim only
+          {{ t('Claim only') }}
         </button>
         <label class="reuse-term">
-          <span class="dim">then re-mint for</span>
+          <span class="dim">{{ t('then re-mint for') }}</span>
           <input
             class="input mono inline-term"
             type="number"
@@ -322,15 +340,19 @@ function doClaimReuse() {
             :disabled="props.busy"
             @blur="clampReuseTerm"
           />
-          <span class="dim">days</span>
+          <span class="dim">{{ t('days') }}</span>
         </label>
         <button class="btn" :disabled="props.busy || overReuse" @click="doClaimReuse">
-          Claim &amp; Re-Mint ({{ reuseTerm }}d)
+          {{ t('Claim & Re-Mint ({days}d)', { days: reuseTerm }) }}
         </button>
       </div>
       <p class="dim reuse-hint">
-        Claim only → withdraw XEN and leave slots empty. Claim &amp; Re-Mint → withdraw XEN and
-        start a new {{ reuseTerm }}-day mint on the same VMUs.
+        {{
+          t(
+            'Claim only → withdraw XEN and leave slots empty. Claim & Re-Mint → withdraw XEN and start a new {days}-day mint on the same VMUs.',
+            { days: reuseTerm }
+          )
+        }}
       </p>
     </div>
   </div>

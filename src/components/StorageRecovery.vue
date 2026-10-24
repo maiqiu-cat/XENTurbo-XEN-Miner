@@ -2,6 +2,7 @@
 import { computed, onScopeDispose, ref, watch } from 'vue'
 import type { ChainKey } from '@/config/chains'
 import { normalizeError } from '@/core/txManager'
+import { t, message as localize } from '@/i18n'
 import {
   inspectTransactionStorage,
   recoverTransactionStorage,
@@ -15,7 +16,8 @@ const emit = defineEmits<{ (e: 'changed'): void; (e: 'open', value: boolean): vo
 const open = ref(false)
 const working = ref(false)
 const snapshot = ref<StorageSnapshot | null>(null)
-const message = ref('')
+const messageParts = ref<string[]>([])
+const message = computed(() => messageParts.value.map((part) => localize(part)).join(' '))
 const exported = ref(false)
 const acknowledged = ref(false)
 const issues = computed(() => (snapshot.value ? transactionStorageIssues(snapshot.value) : []))
@@ -31,12 +33,13 @@ function inspect() {
   exported.value = false
   acknowledged.value = false
   snapshot.value = null
-  message.value = ''
+  messageParts.value = []
   try {
     snapshot.value = inspectTransactionStorage()
   } catch {
-    message.value =
+    messageParts.value = [
       'Browser storage is inaccessible. Restore storage access, then inspect again. No records were changed.'
+    ]
   }
 }
 function show() {
@@ -67,7 +70,7 @@ async function recover() {
   const active = new AbortController()
   controller = active
   const timer = setTimeout(() => active.abort(), 30_000)
-  message.value = 'Verifying damaged records through the connected wallet...'
+  messageParts.value = ['Verifying damaged records through the connected wallet...']
   try {
     const result = await recoverTransactionStorage(
       snapshot.value,
@@ -77,7 +80,9 @@ async function recover() {
     )
     if (active.signal.aborted) return
     inspect()
-    message.value = `${result.repaired} settled record(s) archived and repaired. ${result.blocked} record(s) remain blocked. Unidentified or unconfirmed records are never discarded.`
+    messageParts.value = [
+      `${result.repaired} settled record(s) archived and repaired. ${result.blocked} record(s) remain blocked. Unidentified or unconfirmed records are never discarded.`
+    ]
     const reasons = result.blockedReasons
     const details = [
       reasons.unidentified &&
@@ -87,14 +92,18 @@ async function recover() {
       reasons.readLimit &&
         `${reasons.readLimit} deferred by the 20-record verification limit; inspect again to continue.`
     ].filter(Boolean)
-    if (details.length) message.value += ` ${details.join(' ')}`
+    messageParts.value.push(
+      ...details.filter((detail): detail is string => typeof detail === 'string')
+    )
   } catch (error) {
     if (!open.value) return
-    message.value = active.signal.aborted
-      ? 'Recovery cancelled or timed out. Inspect again; no unverified records were removed.'
-      : error instanceof Error
-        ? normalizeError(error, 'storage-recovery')
-        : 'Recovery failed. Original records were retained.'
+    messageParts.value = [
+      active.signal.aborted
+        ? 'Recovery cancelled or timed out. Inspect again; no unverified records were removed.'
+        : error instanceof Error
+          ? normalizeError(error, 'storage-recovery')
+          : 'Recovery failed. Original records were retained.'
+    ]
   } finally {
     clearTimeout(timer)
     working.value = false
@@ -107,7 +116,7 @@ onScopeDispose(close)
 
 <template>
   <button class="btn btn-ghost recovery-entry" :disabled="disabled" @click="show">
-    Transaction storage recovery
+    {{ t('Transaction storage recovery') }}
   </button>
   <Teleport to="body">
     <div v-if="open" class="recovery-mask" @click.self="close">
@@ -118,55 +127,67 @@ onScopeDispose(close)
         aria-labelledby="recovery-title"
       >
         <div class="row between">
-          <strong id="recovery-title">Transaction storage recovery</strong>
+          <strong id="recovery-title">{{ t('Transaction storage recovery') }}</strong>
           <button
             class="btn btn-ghost"
-            aria-label="Close recovery"
-            title="Close recovery"
+            :aria-label="t('Close recovery')"
+            :title="t('Close recovery')"
             @click="close"
           >
             ×
           </button>
         </div>
         <p>
-          Damaged records: {{ damaged }}. Mining stays blocked until transaction checks succeed.
+          {{
+            t('Damaged records: {count}. Mining stays blocked until transaction checks succeed.', {
+              count: damaged
+            })
+          }}
         </p>
         <ul v-if="issues.length" class="recovery-issues">
           <li v-for="issue in issues" :key="issue.key">
             <code>{{ issue.key }}</code
-            >: {{ damageLabels[issue.kind] }} ({{ issue.count }})
+            >: {{ localize(damageLabels[issue.kind]) }} ({{ issue.count }})
           </li>
         </ul>
         <p class="dim">
-          Keep the backup private. It contains wallet addresses and transaction history. Do not
-          clear site data or resend transactions.
+          {{
+            t(
+              'Keep the backup private. It contains wallet addresses and transaction history. Do not clear site data or resend transactions.'
+            )
+          }}
         </p>
         <p class="dim">
-          Only damaged records with a matching mined receipt from your connected wallet can be
-          repaired. Unreadable JSON, missing identity, pending transactions and other accounts
-          remain blocked.
+          {{
+            t(
+              'Only damaged records with a matching mined receipt from your connected wallet can be repaired. Unreadable JSON, missing identity, pending transactions and other accounts remain blocked.'
+            )
+          }}
         </p>
         <p class="dim">
-          Damaged records without a transaction hash cannot be verified here. Keep their exported
-          backup for manual investigation. While such records remain, mining stays blocked for this
-          site in this browser profile.
+          {{
+            t(
+              'Damaged records without a transaction hash cannot be verified here. Keep their exported backup for manual investigation. While such records remain, mining stays blocked for this site in this browser profile.'
+            )
+          }}
         </p>
         <label class="recovery-ack"
-          ><input v-model="acknowledged" type="checkbox" :disabled="working" />I have checked wallet
-          Activity and retained the downloaded backup.</label
+          ><input v-model="acknowledged" type="checkbox" :disabled="working" />{{
+            t('I have checked wallet Activity and retained the downloaded backup.')
+          }}</label
         >
         <p role="status" aria-live="polite" class="recovery-message">{{ message }}</p>
         <div class="row wrap recovery-actions">
-          <button class="btn" :disabled="working" @click="inspect">Inspect again</button>
+          <button class="btn" :disabled="working" @click="inspect">{{ t('Inspect again') }}</button>
           <button class="btn" :disabled="working || !snapshot" @click="download">
-            Export backup
+            {{ t('Export backup') }}
           </button>
           <button
             class="btn btn-primary"
             :disabled="working || !damaged || !exported || !acknowledged"
             @click="recover"
           >
-            {{ working ? 'Verifying...' : 'Verify and repair' }}
+            {{ working ? t('Verifying...') : t('Verify and repair') }}
           </button>
         </div>
       </section>

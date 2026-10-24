@@ -2,10 +2,11 @@
 import { computed } from 'vue'
 import { useWalletStore } from '@/stores/walletStore'
 import { shortenAddress } from '@/utils/format'
+import { t } from '@/i18n'
 
 const wallet = useWalletStore()
 const label = computed(() =>
-  wallet.isConnected ? shortenAddress(wallet.address as string) : 'Connect Wallet'
+  wallet.isConnected ? shortenAddress(wallet.address as string) : t('Connect Wallet')
 )
 
 async function connectWallet() {

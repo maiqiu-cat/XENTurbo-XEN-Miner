@@ -4,7 +4,9 @@ import { useWalletStore } from '@/stores/walletStore'
 import ChromeGuard from '@/components/ChromeGuard.vue'
 import MinerView from '@/views/MinerView.vue'
 import { loadCloudflareAnalytics } from '@/core/cloudflareAnalytics'
+import { useLanguageEnvironment } from '@/i18n'
 
+useLanguageEnvironment()
 const wallet = useWalletStore()
 
 onMounted(() => {

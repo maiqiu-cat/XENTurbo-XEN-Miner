@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
+import { t, message } from '@/i18n'
 import type { TxStepState } from '@/core/txManager'
 import { CHAINS, type ChainKey } from '@/config/chains'
 
@@ -23,9 +24,9 @@ const explorerTxUrl = computed(() => {
 const steps = computed(() => {
   const s = props.state
   return [
-    { label: 'Estimate gas', status: s?.estimate ?? 'wait' },
-    { label: 'Send transaction', status: s?.send ?? 'wait' },
-    { label: 'Confirm on-chain', status: s?.confirm ?? 'wait' }
+    { label: t('Estimate gas'), status: s?.estimate ?? 'wait' },
+    { label: t('Send transaction'), status: s?.send ?? 'wait' },
+    { label: t('Confirm on-chain'), status: s?.confirm ?? 'wait' }
   ]
 })
 
@@ -65,30 +66,30 @@ function formatLogTime(timestamp: number): string {
 
 function formatAffected(ids: number[], count: number): string {
   if (!count) return '0'
-  if (!ids.length) return `${count} (ids unavailable)`
+  if (!ids.length) return t('{count} (ids unavailable)', { count })
   const shown = ids.slice(0, 8)
   const remaining = count - shown.length
-  return `${count} (VMU${count === 1 ? '' : 's'} ${shown.join(', ')}${remaining > 0 ? `, +${remaining} more` : ''})`
+  return t('{count} ({unit} {ids}{more})', { count, unit: t(count === 1 ? 'VMU' : 'VMUs'), ids: shown.join(', '), more: remaining > 0 ? t(', +{count} more', { count: remaining }) : '' })
 }
 
 const outcomeMessage = computed(() => {
   const outcome = props.state?.outcome
   if (!outcome) return null
   if (outcome.classification === 'full') {
-    return `Verified full result: ${outcome.matchingCount}/${outcome.expectedCount} VMUs are ${outcome.expectedStatus}.`
+    return t('Verified full result: {matched}/{expected} VMUs are {status}.', { matched: outcome.matchingCount, expected: outcome.expectedCount, status: message(outcome.expectedStatus) })
   }
 
-  const details = [`${outcome.matchingCount}/${outcome.expectedCount} matched`]
+  const details = [t('{matched}/{expected} matched', { matched: outcome.matchingCount, expected: outcome.expectedCount })]
   if (outcome.unexpectedCount) {
-    details.push(`unexpected ${formatAffected(outcome.unexpectedIds, outcome.unexpectedCount)}`)
+    details.push(t('unexpected {details}', { details: formatAffected(outcome.unexpectedIds, outcome.unexpectedCount) }))
   }
   if (outcome.readErrorCount) {
-    details.push(`read failed for ${formatAffected(outcome.readErrorIds, outcome.readErrorCount)}`)
+    details.push(t('read failed for {details}', { details: formatAffected(outcome.readErrorIds, outcome.readErrorCount) }))
   }
   const prefix =
     outcome.classification === 'partial'
-      ? 'Confirmed with partial result'
-      : 'Confirmed, result uncertain'
+      ? t('Confirmed with partial result')
+      : t('Confirmed, result uncertain')
   return `${prefix}: ${details.join('; ')}.`
 })
 
@@ -109,10 +110,10 @@ function icon(status: string): string {
   <div v-if="visible" class="modal-mask">
     <div class="card modal-body">
       <div class="row between">
-        <strong>{{ title }}</strong>
+        <strong>{{ message(title) }}</strong>
         <button
           class="btn btn-ghost"
-          :title="waitingWallet ? 'Hide' : preparing || readyToSign ? 'Cancel' : 'Close'"
+          :title="waitingWallet ? t('Hide') : preparing || readyToSign ? t('Cancel') : t('Close')"
           @click="dismiss"
         >
           x
@@ -138,10 +139,10 @@ function icon(status: string): string {
         v-if="state?.logs?.length"
         data-testid="tx-log"
         class="tx-log"
-        aria-label="Transaction activity"
+        :aria-label="t('Transaction activity')"
         aria-live="polite"
       >
-        <div class="tx-log-title">Activity</div>
+        <div class="tx-log-title">{{ t('Activity') }}</div>
         <ol ref="logList">
           <li
             v-for="(entry, index) in state.logs"
@@ -151,19 +152,18 @@ function icon(status: string): string {
           >
             <time :datetime="new Date(entry.at).toISOString()">{{ formatLogTime(entry.at) }}</time>
             <span class="tx-log-marker">{{ icon(entry.status) }}</span>
-            <span>{{ entry.message }}</span>
+            <span>{{ message(entry.message) }}</span>
           </li>
         </ol>
       </section>
 
       <p v-if="readyToSign" class="hint-text">
-        Gas estimated. Click below to open MetaMask.
-        If the popup takes a long time, MetaMask is simulating the tx on its own RPC — open the fox icon, or disable Smart Transactions in MetaMask settings.
+        {{ t('Gas estimated. Click below to open MetaMask. If the popup takes a long time, MetaMask is simulating the tx on its own RPC — open the fox icon, or disable Smart Transactions in MetaMask settings.') }}
       </p>
       <p v-else-if="waitingWallet" class="hint-text">
-        Waiting for MetaMask… If no popup after ~10s, click the MetaMask extension icon (it may be simulating in the background).
+        {{ t('Waiting for MetaMask… If no popup after ~10s, click the MetaMask extension icon (it may be simulating in the background).') }}
       </p>
-      <p v-if="state?.error" class="err-text">{{ state.error }}</p>
+      <p v-if="state?.error" class="err-text">{{ message(state.error) }}</p>
       <p
         v-if="done && outcomeMessage"
         class="outcome-text"
@@ -171,15 +171,15 @@ function icon(status: string): string {
       >
         {{ outcomeMessage }}
       </p>
-      <p v-else-if="done" class="ok-text">Transaction confirmed.</p>
+      <p v-else-if="done" class="ok-text">{{ t('Transaction confirmed.') }}</p>
 
       <div class="row" style="margin-top: 14px">
-        <a v-if="explorerTxUrl" :href="explorerTxUrl" target="_blank" rel="noreferrer">View on explorer</a>
+        <a v-if="explorerTxUrl" :href="explorerTxUrl" target="_blank" rel="noreferrer">{{ t('View on explorer') }}</a>
         <span class="grow" />
-        <button v-if="readyToSign || preparing" class="btn" @click="emit('cancel')">Cancel</button>
-        <button v-else-if="waitingWallet" class="btn" @click="emit('close')">Hide</button>
-        <button v-if="readyToSign" class="btn btn-primary" @click="emit('sign')">Open MetaMask &amp; Sign</button>
-        <button v-if="done || failed" class="btn btn-primary" @click="emit('close')">Close</button>
+        <button v-if="readyToSign || preparing" class="btn" @click="emit('cancel')">{{ t('Cancel') }}</button>
+        <button v-else-if="waitingWallet" class="btn" @click="emit('close')">{{ t('Hide') }}</button>
+        <button v-if="readyToSign" class="btn btn-primary" @click="emit('sign')">{{ t('Open MetaMask & Sign') }}</button>
+        <button v-if="done || failed" class="btn btn-primary" @click="emit('close')">{{ t('Close') }}</button>
       </div>
     </div>
   </div>

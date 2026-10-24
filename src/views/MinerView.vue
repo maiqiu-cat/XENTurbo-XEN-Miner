@@ -27,6 +27,8 @@ import StorageRecovery from '@/components/StorageRecovery.vue'
 import { CONTRACTS } from '@/config/contracts'
 import { APP_VERSION } from '@/config/version'
 import { rpcConfigurationMessage } from '@/core/rpc'
+import LanguageSelect from '@/components/LanguageSelect.vue'
+import { t, message } from '@/i18n'
 
 const wallet = useWalletStore()
 const store = useVmuStore()
@@ -74,7 +76,9 @@ async function onChainSelect(ev: Event) {
   el.value = prev ?? ''
   if (!next || next === prev || wallet.switchingChain) return
   const name = CHAINS[next].name
-  if (!window.confirm(`Switch network to ${name}? Your wallet will ask for confirmation.`)) {
+  if (
+    !window.confirm(message(`Switch network to ${name}? Your wallet will ask for confirmation.`))
+  ) {
     return
   }
   try {
@@ -157,7 +161,9 @@ async function onTrackHash(payload: { hash: string; seenText?: string }) {
 
 async function onMarkPendingDropped(id: string) {
   const confirmed = window.confirm(
-    'WARNING: This does NOT cancel a blockchain transaction.\n\nOnly continue after checking MetaMask Activity and the block explorer and confirming that this transaction was never broadcast or is no longer pending. Marking a live transaction as dropped can allow a conflicting transaction.\n\nMark this record as dropped and unlock mining actions?'
+    message(
+      'WARNING: This does NOT cancel a blockchain transaction.\n\nOnly continue after checking MetaMask Activity and the block explorer and confirming that this transaction was never broadcast or is no longer pending. Marking a live transaction as dropped can allow a conflicting transaction.\n\nMark this record as dropped and unlock mining actions?'
+    )
   )
   if (!confirmed) return
 
@@ -502,28 +508,32 @@ const explorerAddrUrl = computed(() => {
           <h1>XENTurbo XEN Miner</h1>
           <span data-testid="app-version" class="app-version">{{ APP_VERSION }}</span>
         </div>
-        <span class="dim">Pure frontend. No backend, no database. All state read from chain.</span>
+        <span class="dim">{{
+          t('Pure frontend. No backend, no database. All state read from chain.')
+        }}</span>
       </div>
       <div class="row wrap">
-        <div class="gas-pill" :title="gweiLoading ? 'Fetching gas…' : 'Gas price'">
+        <div class="gas-pill" :title="gweiLoading ? t('Fetching gas…') : t('Gas price')">
           <span class="mono">{{ gweiLoading && gwei === '--' ? '…' : gwei }}</span>
           <span class="dim">Gwei</span>
         </div>
         <select
           v-if="wallet.isConnected"
           class="input chain-select"
+          :aria-label="t('Network')"
           :value="activeChain ?? ''"
           :disabled="wallet.switchingChain"
           @change="onChainSelect"
         >
           <option v-for="k in CHAIN_KEYS" :key="k" :value="k">{{ CHAINS[k].name }}</option>
         </select>
+        <LanguageSelect />
         <RpcSettings :chain="readChain" @saved="recheckRpc(true)" />
         <WalletButton />
       </div>
     </header>
     <p v-if="wallet.switchError" class="card warn-card" style="margin-bottom: 12px">
-      {{ wallet.switchError }}
+      {{ message(wallet.switchError) }}
     </p>
     <div
       v-if="rpcHealthMessage"
@@ -531,26 +541,34 @@ const explorerAddrUrl = computed(() => {
       :class="{ 'rpc-health-critical': rpcUnavailable }"
       role="status"
     >
-      <span>{{ rpcHealthMessage }}</span>
+      <span>{{ message(rpcHealthMessage) }}</span>
       <button class="btn" :disabled="rpcHealth.checking" @click="recheckRpc()">
-        {{ rpcHealth.checking ? 'Checking...' : 'Recheck RPC' }}
+        {{ rpcHealth.checking ? t('Checking...') : t('Recheck RPC') }}
       </button>
     </div>
     <div v-if="waitingWallet" class="card warn-card wallet-wait-banner">
       <span>
-        MetaMask is still processing this request. Mining actions remain locked until you approve or
-        reject it.
+        {{
+          t(
+            'MetaMask is still processing this request. Mining actions remain locked until you approve or reject it.'
+          )
+        }}
       </span>
-      <button v-if="!txVisible" class="btn" @click="txVisible = true">Show request</button>
+      <button v-if="!txVisible" class="btn" @click="txVisible = true">
+        {{ t('Show request') }}
+      </button>
     </div>
 
     <!-- warnings -->
     <div v-if="wallet.isConnected && !wallet.isSupportedChain" class="card warn-card">
-      Unsupported network. Switch to Ethereum or Polygon in your wallet.
+      {{ t('Unsupported network. Switch to Ethereum or Polygon in your wallet.') }}
     </div>
     <div v-else-if="wallet.isContractWallet" class="card warn-card">
-      This looks like a smart-contract wallet. The miner contract requires an EOA (tx.origin ==
-      msg.sender) and will reject contract wallets.
+      {{
+        t(
+          'This looks like a smart-contract wallet. The miner contract requires an EOA (tx.origin == msg.sender) and will reject contract wallets.'
+        )
+      }}
     </div>
     <div
       v-else-if="wallet.isConnected && !wallet.contractWalletChecked && !rpcUnavailable"
@@ -558,20 +576,22 @@ const explorerAddrUrl = computed(() => {
     >
       <span>
         {{
-          wallet.contractWalletChecking
-            ? 'Checking wallet type through the read RPC...'
-            : (wallet.contractWalletError ??
-              'Wallet type could not be verified. Recheck before starting a transaction.')
+          message(
+            wallet.contractWalletChecking
+              ? 'Checking wallet type through the read RPC...'
+              : (wallet.contractWalletError ??
+                  'Wallet type could not be verified. Recheck before starting a transaction.')
+          )
         }}
       </span>
       <button class="btn" :disabled="wallet.contractWalletChecking" @click="recheckRpc()">
-        Recheck wallet
+        {{ t('Recheck wallet') }}
       </button>
     </div>
     <div v-if="!wallet.isConnected" class="card connect-card">
-      <p>Connect an EOA wallet to start batch minting XEN.</p>
+      <p>{{ t('Connect an EOA wallet to start batch minting XEN.') }}</p>
       <WalletButton />
-      <p v-if="wallet.connectError" class="connect-err">{{ wallet.connectError }}</p>
+      <p v-if="wallet.connectError" class="connect-err">{{ message(wallet.connectError) }}</p>
     </div>
 
     <template v-else-if="wallet.isSupportedChain">
@@ -584,10 +604,15 @@ const explorerAddrUrl = computed(() => {
         @mark-dropped="onMarkPendingDropped"
       />
       <p v-if="pendingBlockedReason" class="dim" role="status">
-        {{ pendingBlockedReason }} <span v-if="pendingError">{{ pendingError }}</span>
+        {{ message(pendingBlockedReason) }}
+        <span v-if="pendingError">{{ message(pendingError) }}</span>
       </p>
       <p v-if="pendingQueued" class="dim" role="status">
-        A fresh pending check is queued behind the current check. Waiting for both checks to finish.
+        {{
+          t(
+            'A fresh pending check is queued behind the current check. Waiting for both checks to finish.'
+          )
+        }}
       </p>
       <StorageRecovery
         v-if="activeChain && wallet.address"
@@ -598,7 +623,7 @@ const explorerAddrUrl = computed(() => {
         @open="recoveryOpen = $event"
         @changed="checkPending({ reverifyResults: true })"
       />
-      <p v-if="trackError" class="card warn-card">{{ trackError }}</p>
+      <p v-if="trackError" class="card warn-card">{{ message(trackError) }}</p>
 
       <!-- operation tabs -->
       <div class="card" style="margin-bottom: 16px">
@@ -608,21 +633,21 @@ const explorerAddrUrl = computed(() => {
             :class="{ 'btn-primary': tab === 'GENERAL_MINT' }"
             @click="tab = 'GENERAL_MINT'"
           >
-            General Mint
+            {{ t('General Mint') }}
           </button>
           <button
             class="btn"
             :class="{ 'btn-primary': tab === 'MINT_EMPTY_SLOT' }"
             @click="tab = 'MINT_EMPTY_SLOT'"
           >
-            Empty Slots Mint
+            {{ t('Empty Slots Mint') }}
           </button>
           <button
             class="btn"
             :class="{ 'btn-primary': tab === 'CREATE_EMPTY_SLOT' }"
             @click="tab = 'CREATE_EMPTY_SLOT'"
           >
-            Slots Management
+            {{ t('Slots Management') }}
           </button>
         </div>
         <hr class="hr" />
@@ -630,7 +655,7 @@ const explorerAddrUrl = computed(() => {
         <!-- General Mint -->
         <div v-if="tab === 'GENERAL_MINT'" class="form-grid">
           <label>
-            <span class="dim">Mint VMUs (max {{ limits.generalMint }})</span>
+            <span class="dim">{{ t('Mint VMUs (max {max})', { max: limits.generalMint }) }}</span>
             <input
               class="input mono"
               type="number"
@@ -642,7 +667,7 @@ const explorerAddrUrl = computed(() => {
             />
           </label>
           <label>
-            <span class="dim">Term (days, max {{ DEFAULT_TERM_MAX }})</span>
+            <span class="dim">{{ t('Term (days, max {max})', { max: DEFAULT_TERM_MAX }) }}</span>
             <input
               class="input mono"
               type="number"
@@ -654,14 +679,16 @@ const explorerAddrUrl = computed(() => {
             />
           </label>
           <button class="btn btn-primary tall" :disabled="!canOperate" @click="doGeneralMint">
-            Confirm Mint
+            {{ t('Confirm Mint') }}
           </button>
         </div>
 
         <!-- Empty Slots Mint -->
         <div v-else-if="tab === 'MINT_EMPTY_SLOT'" class="form-grid">
           <label>
-            <span class="dim">Empty VMUs to mint (available {{ emptySlotIds.length }})</span>
+            <span class="dim">{{
+              t('Empty VMUs to mint (available {count})', { count: emptySlotIds.length })
+            }}</span>
             <input
               class="input mono"
               type="number"
@@ -672,7 +699,7 @@ const explorerAddrUrl = computed(() => {
             />
           </label>
           <label>
-            <span class="dim">Term (days)</span>
+            <span class="dim">{{ t('Term (days)') }}</span>
             <input
               class="input mono"
               type="number"
@@ -688,14 +715,16 @@ const explorerAddrUrl = computed(() => {
             :disabled="!canOperate || !emptySlotIds.length"
             @click="doMintEmpty"
           >
-            Re-Mint Empty Slots
+            {{ t('Re-Mint Empty Slots') }}
           </button>
         </div>
 
         <!-- Slots Management -->
         <div v-else class="form-grid">
           <label>
-            <span class="dim">Create Empty Slots (max {{ limits.createEmptySlot }})</span>
+            <span class="dim">{{
+              t('Create Empty Slots (max {max})', { max: limits.createEmptySlot })
+            }}</span>
             <input
               class="input mono"
               type="number"
@@ -708,16 +737,19 @@ const explorerAddrUrl = computed(() => {
           </label>
           <div />
           <button class="btn btn-primary tall" :disabled="!canOperate" @click="doCreateEmpty">
-            Create Slots
+            {{ t('Create Slots') }}
           </button>
           <p class="dim reuse-term-note" style="grid-column: 1 / -1; margin: 0">
-            Creates empty VMU proxies only (no mint term). Use Empty Slots Mint afterwards to start
-            a term.
+            {{
+              t(
+                'Creates empty VMU proxies only (no mint term). Use Empty Slots Mint afterwards to start a term.'
+              )
+            }}
           </p>
         </div>
 
         <p class="dim reuse-term-note">
-          Contract:
+          {{ t('Contract:') }}
           <a :href="explorerAddrUrl" target="_blank" rel="noreferrer">{{
             activeChain ? CONTRACTS[activeChain].factory : ''
           }}</a>
@@ -756,7 +788,7 @@ const explorerAddrUrl = computed(() => {
         </a>
       </p>
       <p class="site-footer-source">
-        All code is open source. GitHub:
+        {{ t('All code is open source. GitHub:') }}
         <a href="https://github.com/maiqiu-cat/XENTurbo-XEN-Miner" target="_blank" rel="noreferrer">
           maiqiu-cat/XENTurbo-XEN-Miner <span aria-hidden="true">↗</span>
         </a>

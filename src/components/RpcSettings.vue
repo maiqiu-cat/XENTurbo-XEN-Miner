@@ -11,6 +11,7 @@ import {
 } from '@/config/chains'
 import { resetProviders, validateRpcEndpoint } from '@/core/rpc'
 import { mapWithConcurrency } from '@/utils/concurrency'
+import { t, message } from '@/i18n'
 
 const props = defineProps<{ chain: ChainKey }>()
 const emit = defineEmits<{ (e: 'saved'): void }>()
@@ -83,10 +84,19 @@ function resetDefault() {
     <div v-if="open" class="modal-mask" @click.self="open = false">
       <div class="card modal-body">
         <div class="row between">
-          <strong>{{ CHAINS[chain].name }} RPC endpoints</strong>
-          <button class="btn btn-ghost" @click="open = false">x</button>
+          <strong>{{ t('{chain} RPC endpoints', { chain: CHAINS[chain].name }) }}</strong>
+          <button
+            class="btn btn-ghost"
+            :aria-label="t('Close')"
+            :title="t('Close')"
+            @click="open = false"
+          >
+            x
+          </button>
         </div>
-        <p class="dim">One URL per line. Leave empty to use defaults. Helps with -32603 errors.</p>
+        <p class="dim">
+          {{ t('One URL per line. Leave empty to use defaults. Helps with -32603 errors.') }}
+        </p>
         <textarea
           class="input"
           rows="4"
@@ -94,13 +104,13 @@ function resetDefault() {
           v-model="text"
           :placeholder="CHAINS[chain].defaultRpcUrls.join('\n')"
         />
-        <p v-if="error" class="rpc-error">{{ error }}</p>
+        <p v-if="error" class="rpc-error">{{ message(error) }}</p>
         <div class="row" style="margin-top: 12px">
           <button class="btn btn-primary" :disabled="saving" @click="save">
-            {{ saving ? 'Checking...' : 'Save' }}
+            {{ saving ? t('Checking...') : t('Save') }}
           </button>
           <button class="btn btn-ghost" :disabled="saving" @click="resetDefault">
-            Reset to default
+            {{ t('Reset to default') }}
           </button>
         </div>
       </div>
