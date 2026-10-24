@@ -1,6 +1,13 @@
 # XENTurbo XEN Miner
 
-Current release: **v1.1.7**. The page header displays the same version as the source package and Git release tag.
+Current release: **v1.1.8**. The page header displays the same version as the source package and Git release tag.
+
+### v1.1.8 Keyless RPC Defaults
+
+- Replaced the Ethereum and Polygon 1RPC defaults with `https://mainnet.gateway.tenderly.co` and `https://polygon.gateway.tenderly.co`, respectively. Other endpoints and their order are unchanged, and saved custom RPC lists are not overwritten.
+- Kept the JSON-RPC batch limit at three requests and Multicall limits at 400 entries for Ethereum and 300 for Polygon. Read-only CLI and browser default lists remain aligned.
+- Added regressions for Tenderly-only fallback, list refresh and Traditional Chinese language persistence. Contracts, wallet signing, transaction safety gates and language behavior are unchanged.
+- Keyless gateways remain subject to provider limits. Live frontend reads passed validation, but an additional Tenderly-specific CREATE2 CLI probe encountered HTTP 429; this is not evidence of contract verification failure or unlimited gateway capacity. The CLI's existing batch settings and strict failure exits are unchanged.
 
 ### v1.1.7 RPC Batch Compatibility
 

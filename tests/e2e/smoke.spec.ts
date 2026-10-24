@@ -274,17 +274,18 @@ const ETHEREUM_RPC_ROUTES = [
   /^https:\/\/ethereum\.publicnode\.com(?:\/.*)?$/,
   /^https:\/\/ethereum-rpc\.publicnode\.com(?:\/.*)?$/,
   /^https:\/\/rpc\.mevblocker\.io(?:\/.*)?$/,
-  /^https:\/\/public\.1rpc\.io\/eth(?:[/?].*)?$/
+  /^https:\/\/mainnet\.gateway\.tenderly\.co(?:\/.*)?$/
+]
+
+const POLYGON_RPC_ROUTES = [
+  /^https:\/\/polygon-bor-rpc\.publicnode\.com(?:\/.*)?$/,
+  /^https:\/\/polygon\.publicnode\.com(?:\/.*)?$/,
+  /^https:\/\/polygon\.drpc\.org(?:\/.*)?$/,
+  /^https:\/\/polygon\.gateway\.tenderly\.co(?:\/.*)?$/
 ]
 
 async function mockSameOriginRpc(page: Page, state?: RpcMockState): Promise<void> {
-  for (const endpoint of [
-    ...ETHEREUM_RPC_ROUTES,
-    'https://polygon-bor-rpc.publicnode.com/**',
-    'https://polygon.publicnode.com/**',
-    'https://polygon.drpc.org/**',
-    'https://1rpc.io/matic/**'
-  ]) {
+  for (const endpoint of [...ETHEREUM_RPC_ROUTES, ...POLYGON_RPC_ROUTES]) {
     if (state) await page.route(endpoint, (route) => handleRpcRouteWithState(route, state))
     else await page.route(endpoint, handleRpcRoute)
   }
@@ -1745,6 +1746,97 @@ test('two tabs serialize wallet sends with a shared Web Lock', async ({ page, co
 test.describe('Traditional Chinese interface', () => {
   test.use({ locale: 'zh-TW' })
 
+  for (const [chain, chainId, gateway, endpoints] of [
+    ['eth', '0x1', 'https://mainnet.gateway.tenderly.co', ETHEREUM_RPC_ROUTES],
+    ['polygon', '0x89', 'https://polygon.gateway.tenderly.co', POLYGON_RPC_ROUTES]
+  ] as const) {
+    test(`uses the ${chain} Tenderly default when the other defaults fail and preserves language on reload`, async ({
+      page
+    }) => {
+      await emulateDesktopGoogleChrome(page)
+      await mockSameOriginRpc(page)
+      await installInjectedWallet(page)
+      const errors: string[] = []
+      const failedDefaults = new Set<string>()
+      const gatewayMethods = new Set<string>()
+      const batchSizes: number[] = []
+      let multicallReads = 0
+      page.on('pageerror', (error) => errors.push(error.message))
+      for (const endpoint of endpoints) {
+        await page.route(endpoint, async (route) => {
+          const origin = new URL(route.request().url()).origin
+          if (origin !== gateway) {
+            failedDefaults.add(origin)
+            return route.fulfill({ status: 503, contentType: 'text/plain', body: 'offline' })
+          }
+          const payload = route.request().postDataJSON() as
+            { method: string; params: unknown[] } | Array<{ method: string; params: unknown[] }>
+          const requests = Array.isArray(payload) ? payload : [payload]
+          batchSizes.push(requests.length)
+          for (const { method, params } of requests) {
+            gatewayMethods.add(method)
+            if (
+              method === 'eth_call' &&
+              (params[0] as { to: string }).to.toLowerCase() === MULTICALL.toLowerCase()
+            )
+              multicallReads += 1
+          }
+          await handleRpcRouteWithState(route, { vmuCount: 2 })
+        })
+      }
+      await page.route('https://gasstation.polygon.technology/v2', (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ standard: { maxFee: 40, maxPriorityFee: 30 } })
+        })
+      )
+
+      await page.goto('/')
+      await expect(page.locator('html')).toHaveAttribute('lang', 'zh-Hant')
+      await expect(page.getByTestId('language-selector')).toHaveValue('auto')
+      await page.evaluate((id) => window.__walletMock.emitChain(id), chainId)
+      await page.getByRole('button', { name: '連接錢包' }).first().click()
+      await expect(page.getByRole('combobox', { name: '網路', exact: true })).toHaveValue(chain)
+      await expect(page.locator('.group-note')).toContainText('共 2 個 VMU')
+      await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeEnabled()
+      await page.getByTestId('language-selector').selectOption('en')
+      const beforeRefresh = multicallReads
+      await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+      await expect.poll(() => multicallReads).toBeGreaterThan(beforeRefresh)
+      await expect(page.getByRole('button', { name: 'Refresh', exact: true })).toBeEnabled()
+      await expect(page.locator('.group-note')).toContainText('2 VMUs total')
+      await page.getByTestId('language-selector').selectOption('zh-Hant')
+      expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(0)
+      await page.reload()
+      await expect(page.getByTestId('language-selector')).toHaveValue('zh-Hant')
+      await expect(page.locator('html')).toHaveAttribute('lang', 'zh-Hant')
+      await page.evaluate((id) => window.__walletMock.emitChain(id), chainId)
+      await page.getByRole('button', { name: '連接錢包' }).first().click()
+      await expect(page.locator('.group-note')).toContainText('共 2 個 VMU')
+      await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeEnabled()
+      await page.getByRole('button', { name: 'RPC', exact: true }).click()
+      await expect(page.locator('textarea')).toHaveValue('')
+      const defaultList = await page.locator('textarea').getAttribute('placeholder')
+      expect(defaultList?.split('\n')).toContain(gateway)
+      expect(defaultList).not.toContain('1rpc.io')
+      expect(failedDefaults.size).toBe(3)
+      expect([...gatewayMethods]).toEqual(
+        expect.arrayContaining(['eth_chainId', 'eth_getBlockByNumber', 'eth_call'])
+      )
+      expect(multicallReads).toBeGreaterThanOrEqual(2)
+      expect(batchSizes.length).toBeGreaterThan(0)
+      expect(batchSizes.every((size) => size >= 1 && size <= 3)).toBe(true)
+      expect(errors).toEqual([])
+      expect(await page.evaluate(() => localStorage.getItem('sm.customRpc'))).toBeNull()
+      expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+        sendAttempts: 0,
+        successfulBroadcasts: 0
+      })
+      await captureQaScreenshot(page, `rpc-tenderly-${chain}-zh`)
+    })
+  }
+
   test('loads and refreshes a large Polygon wallet through constrained RPCs while preserving language choice', async ({
     page
   }) => {
@@ -1757,12 +1849,7 @@ test.describe('Traditional Chinese interface', () => {
     const rejected: string[] = []
     const externalRequests: string[] = []
     page.on('pageerror', (error) => errors.push(error.message))
-    const polygonEndpoints = [
-      /^https:\/\/polygon-bor-rpc\.publicnode\.com(?:\/.*)?$/,
-      /^https:\/\/polygon\.publicnode\.com(?:\/.*)?$/,
-      /^https:\/\/polygon\.drpc\.org(?:\/.*)?$/,
-      /^https:\/\/1rpc\.io\/matic(?:[/?].*)?$/
-    ]
+    const polygonEndpoints = POLYGON_RPC_ROUTES
     for (const endpoint of polygonEndpoints) {
       await page.route(endpoint, async (route) => {
         const payload = route.request().postDataJSON() as

@@ -23,7 +23,7 @@ export const CHAINS: Record<ChainKey, ChainConfig> = {
       'https://ethereum.publicnode.com',
       'https://ethereum-rpc.publicnode.com',
       'https://rpc.mevblocker.io',
-      'https://public.1rpc.io/eth'
+      'https://mainnet.gateway.tenderly.co'
     ],
     blockExplorerUrl: 'https://etherscan.io'
   },
@@ -36,7 +36,7 @@ export const CHAINS: Record<ChainKey, ChainConfig> = {
       'https://polygon-bor-rpc.publicnode.com',
       'https://polygon.publicnode.com',
       'https://polygon.drpc.org',
-      'https://1rpc.io/matic'
+      'https://polygon.gateway.tenderly.co'
       // polygon-rpc.com often returns 401 without a key — omit from defaults
     ],
     blockExplorerUrl: 'https://polygonscan.com'
