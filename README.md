@@ -1,6 +1,13 @@
 # XENTurbo XEN Miner
 
-Current release: **v1.1.6**. The page header displays the same version as the source package and Git release tag.
+Current release: **v1.1.7**. The page header displays the same version as the source package and Git release tag.
+
+### v1.1.7 RPC Batch Compatibility
+
+- Limited Polygon Multicall reads to 300 entries per call to stay below public-node response limits; Ethereum retains 400. Full scans, targeted reads and failed-read retries use the same chain-specific limit.
+- Limited each read provider's JSON-RPC transport batch to three requests, including providers inside the fallback pool. Transport batches and Multicall entries are separate limits.
+- Added real ABI/transport regressions and a 601-VMU Polygon browser scenario covering refresh, English/Traditional Chinese switching and reload persistence. Failed reads remain errors, never empty slots.
+- Existing RPC lists, contracts, wallet signing, pending reconciliation and safety gates are unchanged. Damaged locks without a hash remain preserved; P2-C remains unproven with no gate relaxation.
 
 ### v1.1.6 Traditional Chinese And Test Dependency Security
 

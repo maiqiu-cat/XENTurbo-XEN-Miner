@@ -177,6 +177,15 @@ describe('custom RPC validation', () => {
     expect(new Set(CHAINS.eth.defaultRpcUrls).size).toBe(4)
   })
 
+  it('preserves every existing Polygon endpoint while changing batch compatibility', () => {
+    expect(CHAINS.polygon.defaultRpcUrls).toEqual([
+      'https://polygon-bor-rpc.publicnode.com',
+      'https://polygon.publicnode.com',
+      'https://polygon.drpc.org',
+      'https://1rpc.io/matic'
+    ])
+  })
+
   it.each(['http://rpc.example', 'ws://rpc.example', 'not-a-url'])(
     'rejects non-HTTPS endpoint %s',
     async (url) => {
@@ -376,20 +385,23 @@ describe('runtime RPC health selection', () => {
     })
   })
 
-  it('preserves the default RPC list when the client network blocks every probe', async () => {
-    const configuredUrls = [...getRpcUrls('eth')]
+  it.each(['eth', 'polygon'] as const)(
+    'preserves the %s default list when every probe fails',
+    async (chain) => {
+      const configuredUrls = [...getRpcUrls(chain)]
 
-    await expect(
-      ensureHealthyReadProvider(
-        'eth',
-        vi.fn(async () => Promise.reject(new Error('offline')))
-      )
-    ).rejects.toThrow(/local internet connection.*retry/i)
+      await expect(
+        ensureHealthyReadProvider(
+          chain,
+          vi.fn(async () => Promise.reject(new Error('offline')))
+        )
+      ).rejects.toThrow(/local internet connection.*retry/i)
 
-    expect(configuredUrls).toEqual(CHAINS.eth.defaultRpcUrls)
-    expect(getRpcUrls('eth')).toEqual(configuredUrls)
-    expect(readCustomRpc('eth')).toEqual([])
-  })
+      expect(configuredUrls).toEqual(CHAINS[chain].defaultRpcUrls)
+      expect(getRpcUrls(chain)).toEqual(configuredUrls)
+      expect(readCustomRpc(chain)).toEqual([])
+    }
+  )
 
   it('revalidates endpoints for each operation while coalescing concurrent checks', async () => {
     writeCustomRpc('eth', ['https://rpc.example'])
