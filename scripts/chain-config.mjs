@@ -8,7 +8,7 @@ export const CHAIN_CONFIG = Object.freeze({
       'https://ethereum.publicnode.com',
       'https://ethereum-rpc.publicnode.com',
       'https://rpc.mevblocker.io',
-      'https://public.1rpc.io/eth'
+      'https://mainnet.gateway.tenderly.co'
     ]),
     factory: '0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2',
     xenCrypto: '0x06450dEe7FD2Fb8E39061434BAbCFC05599a6Fb8',
@@ -21,7 +21,7 @@ export const CHAIN_CONFIG = Object.freeze({
       'https://polygon-bor-rpc.publicnode.com',
       'https://polygon.publicnode.com',
       'https://polygon.drpc.org',
-      'https://1rpc.io/matic'
+      'https://polygon.gateway.tenderly.co'
     ]),
     factory: '0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2',
     xenCrypto: '0x2AB0e9e4eE70FFf1fB9D67031E44F6410170d00e',

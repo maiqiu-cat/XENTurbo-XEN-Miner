@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { CHAIN_CONFIG } from '../scripts/chain-config.mjs'
 import {
   CHAINS,
   getRpcUrls,
@@ -167,23 +168,44 @@ describe('custom RPC validation', () => {
     expect(request).not.toHaveBeenCalled()
     expect(localStorage.getItem('sm.customRpc')).toBe(stored)
   })
-  it('keeps the diversified Ethereum defaults in the intended failover order', () => {
+  it('replaces only Ethereum 1RPC with the keyless Tenderly gateway in the same position', () => {
     expect(CHAINS.eth.defaultRpcUrls).toEqual([
       'https://ethereum.publicnode.com',
       'https://ethereum-rpc.publicnode.com',
       'https://rpc.mevblocker.io',
-      'https://public.1rpc.io/eth'
+      'https://mainnet.gateway.tenderly.co'
     ])
     expect(new Set(CHAINS.eth.defaultRpcUrls).size).toBe(4)
   })
 
-  it('preserves every existing Polygon endpoint while changing batch compatibility', () => {
+  it('replaces only Polygon 1RPC with the keyless Tenderly gateway in the same position', () => {
     expect(CHAINS.polygon.defaultRpcUrls).toEqual([
       'https://polygon-bor-rpc.publicnode.com',
       'https://polygon.publicnode.com',
       'https://polygon.drpc.org',
-      'https://1rpc.io/matic'
+      'https://polygon.gateway.tenderly.co'
     ])
+  })
+
+  it.each(['eth', 'polygon'] as const)(
+    'keeps the %s browser defaults and read-only script defaults aligned',
+    (chain) => {
+      expect(CHAIN_CONFIG[chain].rpcUrls).toEqual(CHAINS[chain].defaultRpcUrls)
+      expect(getRpcUrls(chain)).toEqual(CHAINS[chain].defaultRpcUrls)
+      expect(localStorage.getItem('sm.customRpc')).toBeNull()
+    }
+  )
+
+  it.each([
+    ['eth', 'https://public.1rpc.io/eth'],
+    ['polygon', 'https://1rpc.io/matic']
+  ] as const)('does not migrate or overwrite a saved %s custom RPC list', (chain, legacyUrl) => {
+    const urls = [legacyUrl, 'https://custom.example/']
+    writeCustomRpc(chain, urls)
+    const saved = localStorage.getItem('sm.customRpc')
+    expect(getRpcUrls(chain)).toEqual(urls)
+    expect(readCustomRpc(chain)).toEqual(urls)
+    expect(localStorage.getItem('sm.customRpc')).toBe(saved)
   })
 
   it.each(['http://rpc.example', 'ws://rpc.example', 'not-a-url'])(
@@ -221,6 +243,34 @@ describe('custom RPC validation', () => {
 })
 
 describe('runtime RPC health selection', () => {
+  it.each([
+    ['eth', 'https://mainnet.gateway.tenderly.co/'],
+    ['polygon', 'https://polygon.gateway.tenderly.co/']
+  ] as const)(
+    'can select the %s Tenderly default alone without deleting other configured nodes',
+    async (chain, gateway) => {
+      const defaults = [...CHAINS[chain].defaultRpcUrls]
+      const request = vi.fn(async (url: string) => {
+        if (url !== gateway) throw new Error('RPC returned HTTP 503')
+        return `0x${CHAINS[chain].chainId.toString(16)}`
+      })
+
+      await expect(ensureHealthyReadProvider(chain, request)).resolves.toBeDefined()
+      expect(request.mock.calls.map(([url]) => url)).toEqual(
+        defaults.map((url) => new URL(url).toString())
+      )
+      expect(getRpcHealthState(chain)).toMatchObject({
+        totalUrls: 4,
+        healthyUrls: [gateway],
+        error: null
+      })
+      expect(getRpcHealthState(chain).failures).toHaveLength(3)
+      expect(CHAINS[chain].defaultRpcUrls).toEqual(defaults)
+      expect(getRpcUrls(chain)).toEqual(defaults)
+      expect(localStorage.getItem('sm.customRpc')).toBeNull()
+    }
+  )
+
   it('does not dispatch remaining old probes after a synchronous configuration change', async () => {
     writeCustomRpc('eth', ['https://old-a.example/', 'https://old-b.example/'])
     const request = vi.fn(async (url: string) => {
