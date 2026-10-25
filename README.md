@@ -1,6 +1,15 @@
 # XENTurbo XEN Miner
 
-Current release: **v1.1.8**. The page header displays the same version as the source package and Git release tag.
+Current release: **v1.1.9**. The page header displays the same version as the source package and Git release tag.
+
+### v1.1.9 RPC Resilience And Safety Messages
+
+- Added bounded request-level RPC failover, a single application retry layer and structured rate-limit handling. Verified chain identity is still required; invalid requests, cancellations and contract reverts do not trigger broad retries.
+- Preserved in-flight transaction confirmation during background health changes, with bounded receipt polling and explicit do-not-resend guidance when confirmation remains unresolved.
+- Recovered full and selected VMU scans after a health-pool replacement through the existing bounded second pass. User cancellation still stops further reads; failed reads never become empty slots.
+- Completed Traditional Chinese safety messages and tested language persistence, transaction recovery and cross-tab behavior. Split ethers into a separate vendor asset without claiming a reduction in total download size.
+- Kept default RPC lists and order, Multicall limits of 400/300, transport batches of three and scan concurrency of two. Contracts, ABI, wallet signing and production analytics are unchanged.
+- Damaged locks without a hash remain preserved and blocking. P2-C remains unproven and its safety gate is not relaxed. Non-blocking review observations are deferred, not declared resolved.
 
 ### v1.1.8 Keyless RPC Defaults
 
