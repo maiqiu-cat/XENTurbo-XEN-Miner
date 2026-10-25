@@ -1813,6 +1813,154 @@ test.describe('Traditional Chinese interface', () => {
   test.use({ locale: 'zh-TW' })
 
   for (const chainId of [1, 137] as const) {
+    for (const method of [
+      'eth_getTransactionCount',
+      'eth_estimateGas',
+      'eth_getBlockByNumber'
+    ] as const) {
+      for (const failure of ['http-429', 'json-rate-limit'] as const) {
+        test(`explains a preflight RPC rate limit (${chainId}, ${method}, ${failure}) without signing or retaining a soft lock`, async ({
+          page
+        }) => {
+          await emulateDesktopGoogleChrome(page)
+          const state: RpcMockState = { vmuCount: 2 }
+          await mockSameOriginRpc(page, state)
+          await installInjectedWallet(page)
+          let limited = false
+          const healthyProbes: string[] = []
+          const failedCalls: Array<{ url: string; params: unknown[] }> = []
+          const errors: string[] = []
+          const unexpected: string[] = []
+          const endpoints = chainId === 1 ? ETHEREUM_RPC_ROUTES : POLYGON_RPC_ROUTES
+          page.on('pageerror', (error) => errors.push(error.message))
+          await page.route('https://**/*', async (route) => {
+            const url = route.request().url()
+            if (url === 'https://gasstation.polygon.technology/v2')
+              return route.fulfill({ json: { standard: { maxFee: 40, maxPriorityFee: 30 } } })
+            if (
+              ![...ETHEREUM_RPC_ROUTES, ...POLYGON_RPC_ROUTES].some((pattern) => pattern.test(url))
+            ) {
+              unexpected.push(url)
+              return route.abort()
+            }
+            const payload = route.request().postDataJSON() as
+              | { id: number; method: string; params: unknown[] }
+              | Array<{ id: number; method: string; params: unknown[] }>
+            const batch = Array.isArray(payload) ? payload : [payload]
+            if (limited && endpoints.some((pattern) => pattern.test(url))) {
+              const isHealthProbe =
+                batch.some((call) => call.method === 'eth_getBlockByNumber') &&
+                batch.some((call) => {
+                  const tx = call.params[0] as { to?: string; data?: string } | undefined
+                  return (
+                    call.method === 'eth_call' &&
+                    tx?.to?.toLowerCase() === FACTORY.toLowerCase() &&
+                    tx.data === factoryInterface.getFunction('FEE')!.selector
+                  )
+                })
+              // Keep availability probes healthy; fail the subsequent direct preflight read.
+              if (isHealthProbe) {
+                healthyProbes.push(url)
+                return route.fallback()
+              }
+              const targets = batch.filter((call) => call.method === method)
+              if (targets.length) {
+                for (const call of targets) failedCalls.push({ url, params: call.params })
+                if (failure === 'http-429')
+                  return route.fulfill({ status: 429, body: 'Fixture rate limit' })
+                const replies = batch.map((call) => ({
+                  jsonrpc: '2.0',
+                  id: call.id,
+                  ...(call.method === method
+                    ? { error: { code: -32005, message: 'project ID request rate exceeded' } }
+                    : { result: rpcResult(call.method, chainId, call.params, state) })
+                }))
+                return route.fulfill({ json: Array.isArray(payload) ? replies : replies[0] })
+              }
+            }
+            return route.fallback()
+          })
+
+          await page.goto('/')
+          await expect(page).toHaveTitle('XENTurbo XEN Miner')
+          await expect(page.locator('html')).toHaveAttribute('lang', 'zh-Hant')
+          await page.evaluate(
+            (id) => window.__walletMock.emitChain(id),
+            `0x${chainId.toString(16)}`
+          )
+          await page.getByRole('button', { name: '連接錢包' }).first().click()
+          await expect(page.locator('.group-note')).toContainText('共 2 個 VMU')
+          await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeEnabled()
+          // Mint has no selected-ID timestamp read, so its block failure targets gas preflight.
+          const isMint = method === 'eth_getBlockByNumber'
+          if (!isMint) await page.locator('tbody input[type="checkbox"]').first().check()
+          // Expire ethers' 250ms latest-block cache so the block case reaches the transport.
+          if (isMint) await page.waitForTimeout(300)
+          limited = true
+          await page
+            .getByRole('button', { name: isMint ? '確認鑄造' : '僅領取', exact: true })
+            .click()
+          const chinese = 'RPC 節點受到限流。請稍候再重試。RPC 清單已保留。'
+          const english =
+            'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
+          await expect(page.locator('.modal-body .err-text')).toHaveText(chinese)
+          await expect(page.getByTestId('tx-log')).toContainText(`準備失敗：${chinese}`)
+          await expect(page.getByRole('button', { name: '開啟 MetaMask 並簽署' })).toHaveCount(0)
+          await expect(page.locator('.modal-body')).not.toContainText('missing revert data')
+          await expect(page.locator('.modal-body')).not.toContainText('server response 429')
+          expect(
+            await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks') ?? '[]'))
+          ).toEqual([])
+          // Submit reconciliation, preparation, and failure reconciliation each probe the pool.
+          await expect.poll(() => healthyProbes.length).toBe(12)
+          for (const endpoint of endpoints) {
+            expect(healthyProbes.filter((url) => endpoint.test(url))).toHaveLength(3)
+            const calls = failedCalls.filter(({ url }) => endpoint.test(url))
+            if (method === 'eth_getTransactionCount') {
+              expect(calls.filter(({ params }) => params[1] === 'latest')).toHaveLength(1)
+              expect(calls.filter(({ params }) => params[1] === 'pending')).toHaveLength(1)
+            } else {
+              expect(calls).toHaveLength(1)
+            }
+          }
+          await captureQaScreenshot(page, `preflight-rate-${chainId}-${method}-${failure}-zh`)
+          await page.getByTestId('language-selector').selectOption('en')
+          await expect(page.locator('.modal-body .err-text')).toHaveText(english)
+          await expect(page.getByTestId('tx-log')).toContainText(`Preparation failed: ${english}`)
+          await page.getByRole('button', { name: 'Close', exact: true }).click()
+          limited = false
+          // A rejected direct read is also cached for 250ms; recovery must make a fresh read.
+          await page.waitForTimeout(300)
+          await page
+            .getByRole('button', { name: isMint ? 'Confirm Mint' : 'Claim only', exact: true })
+            .click()
+          await expect(page.getByRole('button', { name: 'Open MetaMask & Sign' })).toBeVisible()
+          expect(
+            await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks') ?? '[]'))
+          ).toHaveLength(isMint ? 0 : 1)
+          await page.getByRole('button', { name: 'Cancel', exact: true }).click()
+          await expect(page.locator('.modal-body .err-text')).toHaveText(
+            'Preparation cancelled. No transaction was submitted.'
+          )
+          await expect(page.getByRole('button', { name: 'Open MetaMask & Sign' })).toHaveCount(0)
+          expect(
+            await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks') ?? '[]'))
+          ).toEqual([])
+          await page.getByRole('button', { name: 'Close', exact: true }).click()
+          await expect(page.locator('.modal-mask')).toHaveCount(0)
+          expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+            sendAttempts: 0,
+            successfulBroadcasts: 0
+          })
+          expect(await page.evaluate(() => localStorage.getItem('sm.customRpc'))).toBeNull()
+          expect(errors).toEqual([])
+          expect(unexpected).toEqual([])
+        })
+      }
+    }
+  }
+
+  for (const chainId of [1, 137] as const) {
     for (const failure of [
       'no-retry-after',
       'hidden-retry-after',
@@ -1910,6 +2058,7 @@ test.describe('Traditional Chinese interface', () => {
             : 'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
         await expect(page.locator('.err-banner')).toHaveText(chinese, { timeout: 10_000 })
         await expect(page.getByRole('button', { name: '重新整理', exact: true })).toBeEnabled()
+        // Retry backoff >= pool cooldown (both 1s); equality is eligible, not a skipped attempt.
         expect(limitedPosts).toHaveLength(16)
         for (const endpoint of endpoints)
           expect(limitedPosts.filter((url) => endpoint.test(url))).toHaveLength(4)

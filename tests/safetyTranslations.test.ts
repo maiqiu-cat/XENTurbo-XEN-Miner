@@ -99,6 +99,71 @@ describe('Traditional Chinese safety instructions', () => {
     expect(i18n.message(source)).toBe(source)
   })
 
+  it.each([
+    {
+      shortMessage: 'server response 429 Too Many Requests',
+      code: 'SERVER_ERROR',
+      response: { statusCode: 429, headers: {} }
+    },
+    {
+      shortMessage: 'missing revert data',
+      code: 'CALL_EXCEPTION',
+      info: { error: { code: -32005, message: 'project ID request rate exceeded' } }
+    },
+    {
+      message: '-32603 Internal JSON-RPC error',
+      info: { error: { code: -32603, message: 'upstream rate limit reached' } }
+    }
+  ])('normalizes a preflight rate limit before SDK error wording: %j', (error) => {
+    const before = structuredClone(error)
+    const source = normalizeError(error)
+    expect(source).toBe(
+      'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
+    )
+    const i18n = translator()
+    expect(i18n.message(source)).toBe('RPC 節點受到限流。請稍候再重試。RPC 清單已保留。')
+    i18n.setPreference('en')
+    expect(i18n.message(source)).toBe(source)
+    expect(error).toEqual(before)
+  })
+
+  it('keeps a readable server delay in a preflight rate-limit message', () => {
+    const source = normalizeError({
+      shortMessage: 'server response 429 Too Many Requests',
+      response: { statusCode: 429, headers: { 'retry-after': '2' } }
+    })
+    expect(source).toBe('RPC endpoints are rate-limited. Retry in 2s. Your RPC list was preserved.')
+    expect(translator().message(source)).toBe('RPC 節點受到限流。請於 2 秒後重試。RPC 清單已保留。')
+  })
+
+  it.each([
+    {
+      shortMessage: 'missing revert data',
+      code: 'CALL_EXCEPTION',
+      info: { error: { code: -32005, message: 'rate limit', data: '0x08c379a0' } }
+    },
+    {
+      shortMessage: 'missing revert data',
+      code: 'CALL_EXCEPTION',
+      reason: 'rate limit in contract',
+      info: { error: { code: -32005, message: 'rate limit' } }
+    },
+    {
+      shortMessage: 'missing revert data',
+      code: 'CALL_EXCEPTION',
+      info: { error: { code: -32602, message: 'invalid params: rate limit' } }
+    },
+    {
+      shortMessage: 'missing revert data',
+      code: 'CALL_EXCEPTION',
+      info: { error: { code: -32005, message: 'query returned more than 1000 results' } }
+    }
+  ])('does not replace a semantic or capacity failure with rate-limit advice: %j', (error) => {
+    expect(normalizeError(error)).toBe(
+      'Estimation reverted. Check VMU count/term limits and that you have enough balance for the service fee.'
+    )
+  })
+
   it('translates nested configuration reasons and bounded local timeout diagnostics', () => {
     const i18n = translator()
     expect(

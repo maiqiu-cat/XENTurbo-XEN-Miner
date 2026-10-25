@@ -13,6 +13,7 @@ import { writeFactory, warmUpInjected } from './wallet'
 import { readFee, readVmuStatuses, readVmuStates } from './chainReader'
 import { readWalletEvidence, type WalletReceipt } from './walletEvidence'
 import { ReadTimeoutError } from './readDeadline'
+import { RpcRateLimitError, rpcFailureKind, rpcRetryAfterMs } from './rpcPolicy'
 import { mapWithConcurrency } from '@/utils/concurrency'
 import {
   ensureHealthyReadProvider,
@@ -1236,6 +1237,8 @@ export function normalizeError(
   if (/VMU state changed|already pending|limited to|Term must|count must|No .* selected/i.test(msg))
     return msg
   if (/user rejected|denied|rejected the request/i.test(msg)) return 'Transaction rejected'
+  if (rpcFailureKind(err) === 'rate-limit')
+    return new RpcRateLimitError(rpcRetryAfterMs(err) ?? undefined).message
   if (msg.includes('-32603'))
     return 'RPC node error (-32603). Try switching RPC / clear pending txs in MetaMask.'
   if (msg.includes('-32080') || /HTTP client error/i.test(msg))

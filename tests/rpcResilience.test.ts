@@ -11,7 +11,8 @@ import {
   withRetry
 } from '@/core/rpc'
 import { ReadTimeoutError } from '@/core/readDeadline'
-import { rpcFailureKind, rpcRetryAfterMs } from '@/core/rpcPolicy'
+import { RpcRateLimitError, rpcFailureKind, rpcRetryAfterMs } from '@/core/rpcPolicy'
+import { normalizeError } from '@/core/txManager'
 
 interface RpcCall {
   id: number
@@ -910,6 +911,53 @@ describe('one retry layer and structured errors', () => {
     expect(readRequests('eth_call')).toHaveLength(4)
     expect(sleep.mock.calls).toEqual([[1_000], [1_000], [1_600]])
   })
+
+  it.each([undefined, 'soon', '1'])(
+    'preserves server delay and cause when slow 429 exhausts the retry budget: %s',
+    async (retryAfter) => {
+      const provider = await ready(1)
+      failures.set(urls[0], { status: 429, delay: 9_000, retryAfter })
+      const originals: unknown[] = []
+      const operation = vi.fn(async (signal: AbortSignal) => {
+        try {
+          return await provider.withSignal(signal).getTransactionCount(address, 'pending')
+        } catch (error) {
+          originals.push(error)
+          throw error
+        }
+      })
+      const sleep = vi.fn(
+        (delay: number) => new Promise<void>((resolve) => setTimeout(resolve, delay))
+      )
+      const started = Date.now()
+      let settledAt = 0
+      const result = withRetry(operation, { sleep, jitterRatio: 0 }).catch((error: unknown) => {
+        settledAt = Date.now()
+        return error
+      })
+      await vi.advanceTimersByTimeAsync(30_000)
+      const error = await result
+      expect(error).toBeInstanceOf(RpcRateLimitError)
+      expect((error as Error).cause).toBe(originals.at(-1))
+      expect(originals.at(-1)).toMatchObject({
+        code: 'SERVER_ERROR',
+        response: { statusCode: 429 }
+      })
+      expect(rpcRetryAfterMs(error)).toBe(retryAfter === '1' ? 1_000 : null)
+      expect(normalizeError(error)).toBe(
+        retryAfter === '1'
+          ? 'RPC endpoints are rate-limited. Retry in 1s. Your RPC list was preserved.'
+          : 'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
+      )
+      expect(sleep.mock.calls).toEqual([[1_000], [1_000]])
+      expect(operation).toHaveBeenCalledTimes(3)
+      expect(readRequests()).toHaveLength(3)
+      expect(settledAt - started).toBeGreaterThanOrEqual(29_000)
+      expect(settledAt - started).toBeLessThan(30_000)
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(readRequests()).toHaveLength(3)
+    }
+  )
 
   it('normalizes an exhausted -32005 eth_call without exposing the generated revert diagnostic', async () => {
     const provider = await ready(2)

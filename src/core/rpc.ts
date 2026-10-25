@@ -482,7 +482,7 @@ export async function withRetry<T>(
       )
       const remaining = deadline - Date.now()
       if (delay >= remaining) {
-        if (rateLimited) throw new RpcRateLimitError(delay)
+        if (rateLimited) throw new RpcRateLimitError(serverDelay ?? undefined, { cause: err })
         throw err
       }
       await withReadDeadline(() => sleep(delay), 'RPC retry deadline', {

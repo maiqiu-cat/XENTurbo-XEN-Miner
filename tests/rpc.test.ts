@@ -61,6 +61,7 @@ describe('RPC retry policy', () => {
       )
       expect(error).toBeInstanceOf(RpcRateLimitError)
       expect(error).toMatchObject({ cause: original, code: 'RPC_RATE_LIMITED' })
+      expect((error as Error).cause).toBe(original)
       expect(normalizeError(error)).toBe(
         'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
       )
