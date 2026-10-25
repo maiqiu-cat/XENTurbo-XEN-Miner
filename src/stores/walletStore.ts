@@ -174,7 +174,7 @@ export const useWalletStore = defineStore('wallet', {
             async () => {
               const provider = await ensureHealthyReadProvider(key)
               assertReadActive(controller.signal)
-              return withRetry(() => provider.getCode(_address), {
+              return withRetry((signal) => provider.withSignal(signal).getCode(_address), {
                 retries: 1,
                 signal: controller.signal
               })

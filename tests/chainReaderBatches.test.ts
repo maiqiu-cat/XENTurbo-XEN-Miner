@@ -5,6 +5,7 @@ const batchState = vi.hoisted(() => ({
   peak: 0,
   calls: 0,
   failCalls: new Set<number>(),
+  endpointFailures: new Map<number, Error>(),
   ranges: [] as Array<{ fromId: number; toId: number }>,
   proxyIds: [] as number[],
   retryDerivedCounts: [] as number[],
@@ -36,6 +37,7 @@ vi.mock('ethers', async (importOriginal) => {
       batchState.peak = Math.max(batchState.peak, batchState.active)
       await new Promise((resolve) => setTimeout(resolve, 5))
       batchState.active -= 1
+      if (batchState.endpointFailures.has(call)) throw batchState.endpointFailures.get(call)
       if (batchState.failCalls.has(call)) throw new Error('batch unavailable')
       const results = calls.map(({ callData }) => {
         const [proxy] = resultInterface.decodeFunctionData('userMints', callData)
@@ -82,11 +84,17 @@ vi.mock('@/core/create2', () => ({
 }))
 
 vi.mock('@/core/rpc', () => ({
-  getReadProvider: () => ({ getBlock: batchState.block }),
+  getReadProvider: () => ({
+    getBlock: batchState.block,
+    withSignal() {
+      return this
+    }
+  }),
   withRetry: (operation: () => Promise<unknown>) => operation()
 }))
 
 import { readVmuStates, readWalletVmus } from '@/core/chainReader'
+import { RpcReadInvalidatedError } from '@/core/rpcPolicy'
 
 describe('wallet VMU batch reads', () => {
   beforeEach(() => {
@@ -94,6 +102,7 @@ describe('wallet VMU batch reads', () => {
     batchState.peak = 0
     batchState.calls = 0
     batchState.failCalls = new Set()
+    batchState.endpointFailures.clear()
     batchState.ranges = []
     batchState.proxyIds = []
     batchState.retryDerivedCounts = []
@@ -205,6 +214,44 @@ describe('wallet VMU batch reads', () => {
     expect(vmus.filter((vmu) => !vmu.readOk)).toHaveLength(400)
     expect(vmus.filter((vmu) => vmu.readOk)).toHaveLength(800)
   })
+
+  it('retries entry misses without replaying a non-retryable sibling batch', async () => {
+    batchState.endpointFailures.set(1, new Error('unknown endpoint error'))
+    batchState.unreadableIds.add(401)
+    const vmus = await readWalletVmus('eth', '0x0000000000000000000000000000000000000002', {
+      vmuCount: 801,
+      chainTimestampMs: 1_000
+    })
+
+    expect(batchState.sizes).toEqual([400, 400, 1, 1])
+    expect(batchState.proxyIds).toEqual([401])
+    expect(vmus.slice(0, 401).every((vmu) => !vmu.readOk && vmu.status === 'READ_ERROR')).toBe(true)
+    expect(vmus.slice(401).every((vmu) => vmu.readOk && vmu.status === 'MINTING')).toBe(true)
+    expect(vmus.map((vmu) => vmu.id)).toEqual(Array.from({ length: 801 }, (_, i) => i + 1))
+  })
+
+  for (const mode of ['wallet', 'selected'] as const) {
+    it.each([
+      new RpcReadInvalidatedError(),
+      Object.assign(new Error('Fixture retired read context'), { code: 'RPC_READ_INVALIDATED' })
+    ])(`allows one fresh-provider pass for an invalidated ${mode} scan: %s`, async (error) => {
+      batchState.endpointFailures.set(1, error)
+      const wallet = '0x0000000000000000000000000000000000000002'
+      const vmus =
+        mode === 'wallet'
+          ? await readWalletVmus('polygon', wallet, { vmuCount: 301, chainTimestampMs: 1_000 })
+          : await readVmuStates(
+              'polygon',
+              wallet,
+              Array.from({ length: 301 }, (_, i) => i + 1),
+              { blockTag: 42 }
+            )
+      expect(vmus).toHaveLength(301)
+      expect(vmus.every((vmu) => vmu.readOk && vmu.status === 'MINTING')).toBe(true)
+      expect(batchState.sizes).toEqual([300, 1, 300])
+      expect(vmus.map((vmu) => vmu.id)).toEqual(Array.from({ length: 301 }, (_, i) => i + 1))
+    })
+  }
 
   it.each(['eth', 'polygon'] as const)(
     'stops scheduling later %s batches when aborted',

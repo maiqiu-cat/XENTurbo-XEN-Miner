@@ -103,6 +103,7 @@ describe('language preferences', () => {
     expect(translator.locale.value).toBe('zh-Hant')
     expect(() => translator.setPreference('en')).not.toThrow()
     expect(translator.locale.value).toBe('en')
+    expect(translator.preferenceSaved.value).toBe(false)
     expect(() => translator.setPreference('auto')).not.toThrow()
     expect(translator.locale.value).toBe('zh-Hant')
   })
@@ -200,6 +201,19 @@ describe('presentation-only translation', () => {
 })
 
 describe('language environment and control', () => {
+  it('discloses a failed preference save while keeping the chosen language usable', async () => {
+    i18n.setPreference('en')
+    const wrapper = mount(LanguageHost)
+    const write = vi.spyOn(window, 'localStorage', 'get').mockImplementation(() => {
+      throw new Error('blocked')
+    })
+    await wrapper.get('select').setValue('zh-Hant')
+    expect(wrapper.get('[role="status"]').text()).toBe('無法儲存語言選擇，目前僅套用於此分頁。')
+    expect(document.documentElement.lang).toBe('zh-Hant')
+    write.mockRestore()
+    await wrapper.get('select').setValue('en')
+    expect(wrapper.find('[role="status"]').exists()).toBe(false)
+  })
   it('changes document language, handles browser/storage changes and removes listeners on unmount', async () => {
     const browserLanguages = vi.spyOn(navigator, 'languages', 'get').mockReturnValue(['zh-TW'])
     localStorage.removeItem(LANGUAGE_STORAGE_KEY)

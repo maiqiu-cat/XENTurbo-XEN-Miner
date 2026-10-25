@@ -16,7 +16,15 @@ vi.mock('ethers', async (importOriginal) => {
 })
 vi.mock('@/core/rpc', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/core/rpc')>()
-  return { ...actual, getReadProvider: () => ({ getBlock: reads.block }) }
+  return {
+    ...actual,
+    getReadProvider: () => ({
+      getBlock: reads.block,
+      withSignal() {
+        return this
+      }
+    })
+  }
 })
 
 import { readChainTimestamp, readGlobalRank, readVmuCount } from '@/core/chainReader'

@@ -161,6 +161,10 @@ const GAS_RATIO_SCALE = 10_000n
 const BLOCK_GAS_SAFETY_BPS = 9_000n
 export const PREPARED_OP_TTL_MS = 120_000
 export const WALLET_RESPONSE_TIMEOUT_MS = 120_000
+const UNCONFIRMED_BROADCAST_MESSAGE =
+  'Transaction submitted, but confirmation could not be completed. Do not resend. Check wallet Activity and the explorer, then recheck pending operations.'
+const BROADCAST_STORAGE_FAILURE_MESSAGE =
+  'Transaction submitted, but its local record could not be saved. Do not resend. Do not clear site data. Keep this page open, save the transaction hash from the explorer link, and check wallet Activity before rechecking pending operations.'
 
 const factoryIface = new Interface(XENFactoryABI as unknown as any[])
 
@@ -653,7 +657,7 @@ export async function prepareOperation(
       log('Reserving the selected VMUs for this operation...')
       if (!tryAcquireLock({ chain, wallet, ids: lockIds, batch, op, count, term })) {
         throw new Error(
-          'Some selected VMUs are already pending in another tab/window. Wait or refresh.'
+          'LOCK_CONFLICT: Some selected VMUs are already pending in another tab/window. Wait or refresh.'
         )
       }
       lockAcquired = true
@@ -816,6 +820,17 @@ export async function sendPreparedOperation(
     recordWalletDrop(true)
   }
 
+  const recordLateBroadcast = (txHash: string) => {
+    state.confirm = 'error'
+    state.error = UNCONFIRMED_BROADCAST_MESSAGE
+    try {
+      recordBroadcast(txHash)
+    } catch {
+      state.error = BROADCAST_STORAGE_FAILURE_MESSAGE
+    }
+    log(state.error, 'error')
+  }
+
   try {
     assertSending()
     log('Starting final checks before opening MetaMask...')
@@ -974,7 +989,7 @@ export async function sendPreparedOperation(
     const txHash = await awaitWalletResponse(
       walletSend,
       WALLET_RESPONSE_TIMEOUT_MS,
-      recordBroadcast,
+      recordLateBroadcast,
       settleLateWalletFailure
     )
     recordBroadcast(txHash)
@@ -991,7 +1006,7 @@ export async function sendPreparedOperation(
       if (err?.code === 'TIMEOUT' || /timed? out|timeout/i.test(err?.message || '')) {
         state.confirm = 'error'
         state.error =
-          'Confirmation timed out. The transaction may still be pending — do not retry the same VMUs. Refresh later or check the explorer.'
+          'Confirmation timed out. The transaction may still be pending. Do not resend. Check wallet Activity and the explorer, then recheck pending operations.'
         emit()
         throw err
       }
@@ -1085,8 +1100,10 @@ export async function sendPreparedOperation(
     if (!state.error)
       state.error =
         broadcasted && /PENDING_STORAGE_(?:READ|WRITE)_FAILED/i.test(err?.message || '')
-          ? 'Transaction submitted, but its local record could not be saved. Do not resend. Do not clear site data. Keep this page open, save the transaction hash from the explorer link, and check wallet Activity before rechecking pending operations.'
-          : normalizeError(err)
+          ? BROADCAST_STORAGE_FAILURE_MESSAGE
+          : broadcasted && !resolved
+            ? UNCONFIRMED_BROADCAST_MESSAGE
+            : normalizeError(err)
     log(`Transaction stopped: ${state.error}`, 'error')
     throw err
   } finally {
@@ -1166,6 +1183,11 @@ export function normalizeError(
 ): string {
   const msg: string = err?.shortMessage || err?.reason || err?.message || String(err)
   if (/OPERATION_CANCELLED/i.test(msg)) return 'Operation cancelled. No transaction was submitted.'
+  if (/^LOCK_CONFLICT:/i.test(msg))
+    return 'Some selected VMUs are already pending in another tab/window. Wait or refresh.'
+  if (err?.code === 'RPC_READ_INVALIDATED')
+    return 'The RPC read was cancelled because its context changed. No transaction was submitted by this read. Start a new read with the current settings.'
+  if (err?.code === 'RPC_RATE_LIMITED') return err.message
   if (/OPERATION_ALREADY_STARTED/i.test(msg))
     return 'This prepared operation has already started or finished. Check wallet Activity and recheck pending operations. Do not resend.'
   if (/Prepared transaction expired/i.test(msg))

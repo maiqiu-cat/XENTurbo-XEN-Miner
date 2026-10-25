@@ -475,8 +475,8 @@ function onClaim(ids: number[]) {
   operate('CLAIM', { ids }, 'Claim only')
 }
 function onClaimReuse(ids: number[], term: number) {
-  const t = clampTerm(term)
-  operate('CLAIM_REUSE', { ids, term: t }, `Claim & Re-Mint (${t} days)`)
+  const clampedTerm = clampTerm(term)
+  operate('CLAIM_REUSE', { ids, term: clampedTerm }, `Claim & Re-Mint (${clampedTerm} days)`)
 }
 
 function clampMint() {

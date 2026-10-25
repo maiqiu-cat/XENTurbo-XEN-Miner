@@ -24,14 +24,42 @@ function validPayload() {
   ].map((entry) => ({ jsonrpc: '2.0', ...entry }))
 }
 
+function responseFor(payload: Array<{ id: number }>) {
+  return vi.fn<typeof fetch>(async (_url, options) => {
+    const requested = JSON.parse(String(options?.body)) as Array<{ id: number }>
+    expect(requested.length).toBeLessThanOrEqual(3)
+    return Response.json(
+      payload.filter(({ id }) => requested.some((item) => item.id === id)).reverse()
+    )
+  })
+}
+
 describe('release chain probe', () => {
+  it.each(['TimeoutError', 'AbortError'] as const)(
+    'classifies a %s while reading the response body as a request failure',
+    async (name) => {
+      const fetchImpl = vi.fn<typeof fetch>(async () => {
+        const response = Response.json({})
+        vi.spyOn(response, 'json').mockRejectedValue(
+          new DOMException('Fixture response interrupted', name)
+        )
+        return response
+      })
+      expect(await probeReleaseEndpoint('https://rpc.example', config, fetchImpl)).toMatchObject({
+        healthy: false,
+        error: 'REQUEST_FAILED: Fixture response interrupted'
+      })
+      expect(fetchImpl).toHaveBeenCalledOnce()
+    }
+  )
+
   it.each([1, 2, 3, 4, 5, 6])('escapes remote error controls for RPC result %s', async (id) => {
     const payload = validPayload().map((entry) =>
       entry.id === id
         ? { jsonrpc: '2.0', id, error: { message: '\u001b]0;forged\u0007\r\nPASS forged\u009b2J' } }
         : entry
     )
-    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, json: async () => payload })
+    const fetchImpl = responseFor(payload)
     const result = await probeReleaseEndpoint('https://rpc.example', config, fetchImpl)
     expect(result.healthy).toBe(false)
     for (const control of ['\r', '\n', '\u001b', '\u0007', '\u009b'])
@@ -40,11 +68,7 @@ describe('release chain probe', () => {
   })
 
   it('requires the expected chain, all contract code, FEE and vmuCount reads', async () => {
-    const fetchImpl = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => validPayload()
-    })
+    const fetchImpl = responseFor(validPayload())
 
     const result = await probeReleaseEndpoint('https://rpc.example', config, fetchImpl)
 
@@ -54,8 +78,9 @@ describe('release chain probe', () => {
       fee: 18n,
       vmuCount: 0n
     })
-    const request = JSON.parse(fetchImpl.mock.calls[0][1].body)
-    expect(fetchImpl.mock.calls[0][1].redirect).toBe('error')
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    const request = fetchImpl.mock.calls.flatMap((call) => JSON.parse(String(call[1]?.body)))
+    expect(fetchImpl.mock.calls[0][1]?.redirect).toBe('error')
     expect(request.map((entry: { method: string }) => entry.method)).toEqual([
       'eth_chainId',
       'eth_getCode',
@@ -69,11 +94,7 @@ describe('release chain probe', () => {
   it('fails when any deployed contract has no bytecode', async () => {
     const payload = validPayload()
     payload[4 - 1] = { ...payload[4 - 1], result: '0x' }
-    const fetchImpl = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => payload
-    })
+    const fetchImpl = responseFor(payload)
 
     await expect(
       probeReleaseEndpoint('https://rpc.example', config, fetchImpl)
@@ -83,8 +104,22 @@ describe('release chain probe', () => {
     })
   })
 
+  it('rejects a reply for the next batch instead of accepting it as current evidence', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => Response.json(validPayload().slice(3)))
+    expect(await probeReleaseEndpoint('https://rpc.example', config, fetchImpl)).toMatchObject({
+      healthy: false,
+      error:
+        'INVALID_RESULT: INVALID_BATCH_MEMBER: expected a JSON-RPC 2.0 result with a requested ID.'
+    })
+    expect(fetchImpl).toHaveBeenCalledOnce()
+  })
+
   it.each([
-    ['duplicate IDs', () => [...validPayload().slice(0, 5), validPayload()[0]], 'DUPLICATE_ID'],
+    [
+      'duplicate IDs',
+      () => validPayload().map((item) => (item.id === 2 ? { ...item, id: 1 } : item)),
+      'DUPLICATE_ID'
+    ],
     [
       'wrong version',
       () => validPayload().map((item, index) => (index === 0 ? { ...item, jsonrpc: '1.0' } : item)),
@@ -105,7 +140,7 @@ describe('release chain probe', () => {
       'INVALID_RESULT: RPC result and error are mutually exclusive'
     ]
   ])('rejects malformed RPC batches: %s', async (_name, payload, error) => {
-    const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => payload() }))
+    const fetchImpl = responseFor(payload())
     expect(
       await probeReleaseEndpoint(
         'https://rpc.example',

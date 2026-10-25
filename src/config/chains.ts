@@ -77,8 +77,9 @@ export function parseRpcInput(text: string): string[] {
 export function getRpcUrls(key: ChainKey): string[] {
   const custom = readCustomRpc(key)
   if (custom.length) return custom
-  const envKey = key === 'eth' ? 'VITE_RPC_ETH' : 'VITE_RPC_POLYGON'
-  const envVal = (import.meta.env?.[envKey] as string | undefined)?.trim()
+  const envVal = (
+    key === 'eth' ? import.meta.env.VITE_RPC_ETH : import.meta.env.VITE_RPC_POLYGON
+  )?.trim()
   if (envVal) {
     return envVal
       .split(',')

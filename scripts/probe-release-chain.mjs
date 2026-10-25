@@ -26,42 +26,54 @@ export async function probeReleaseEndpoint(url, config, fetchImpl = fetch) {
     return { healthy: false, url, error: error.message }
   }
 
-  let response
+  const requests = [
+    rpcCall(1, 'eth_chainId', []),
+    rpcCall(2, 'eth_getCode', [config.factory, 'latest']),
+    rpcCall(3, 'eth_getCode', [config.xenCrypto, 'latest']),
+    rpcCall(4, 'eth_getCode', [config.vmuTemplate, 'latest']),
+    rpcCall(5, 'eth_call', [
+      { to: config.factory, data: factoryInterface.encodeFunctionData('FEE') },
+      'latest'
+    ]),
+    rpcCall(6, 'eth_call', [
+      { to: config.factory, data: factoryInterface.encodeFunctionData('vmuCount', [ZERO_ADDRESS]) },
+      'latest'
+    ])
+  ]
+  const payload = []
+  const signal = AbortSignal.timeout(10_000)
+  let readingResponse = false
   try {
-    response = await fetchImpl(url, {
-      method: 'POST',
-      redirect: 'error',
-      headers: { 'Content-Type': 'application/json' },
-      signal: AbortSignal.timeout(10_000),
-      body: JSON.stringify([
-        rpcCall(1, 'eth_chainId', []),
-        rpcCall(2, 'eth_getCode', [config.factory, 'latest']),
-        rpcCall(3, 'eth_getCode', [config.xenCrypto, 'latest']),
-        rpcCall(4, 'eth_getCode', [config.vmuTemplate, 'latest']),
-        rpcCall(5, 'eth_call', [
-          { to: config.factory, data: factoryInterface.encodeFunctionData('FEE') },
-          'latest'
-        ]),
-        rpcCall(6, 'eth_call', [
-          {
-            to: config.factory,
-            data: factoryInterface.encodeFunctionData('vmuCount', [ZERO_ADDRESS])
-          },
-          'latest'
-        ])
-      ])
-    })
+    // Match the browser's public endpoint wire limit; retain one total time budget.
+    for (let start = 0; start < requests.length; start += 3) {
+      const batch = requests.slice(start, start + 3)
+      readingResponse = false
+      const response = await fetchImpl(url, {
+        method: 'POST',
+        redirect: 'error',
+        headers: { 'Content-Type': 'application/json' },
+        signal,
+        body: JSON.stringify(batch)
+      })
+      if (!response.ok) return { healthy: false, url, error: `HTTP_STATUS: ${response.status}` }
+      readingResponse = true
+      const part = await response.json()
+      rpcBatchResults(
+        part,
+        batch.map(({ id }) => id)
+      )
+      payload.push(...part)
+    }
   } catch (error) {
+    const interrupted =
+      signal.aborted || error?.name === 'AbortError' || error?.name === 'TimeoutError'
     return {
       healthy: false,
       url,
-      error: `REQUEST_FAILED: ${diagnosticError(error)}`
+      error: `${readingResponse && !interrupted ? 'INVALID_RESULT' : 'REQUEST_FAILED'}: ${diagnosticError(error)}`
     }
   }
-  if (!response.ok) return { healthy: false, url, error: `HTTP_STATUS: ${response.status}` }
-
   try {
-    const payload = await response.json()
     const results = rpcBatchResults(payload, [1, 2, 3, 4, 5, 6])
     const chainId = rpcChainId(rpcStringResult(results, 1, 'eth_chainId'))
     if (chainId !== BigInt(config.chainId)) {

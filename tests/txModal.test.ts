@@ -7,6 +7,7 @@ import RpcSettings from '@/components/RpcSettings.vue'
 import TxModal from '@/components/TxModal.vue'
 import type { PendingOpView } from '@/core/pendingOps'
 import * as rpc from '@/core/rpc'
+import { i18n } from '@/i18n'
 
 enableAutoUnmount(afterEach)
 const restoreWindowFunctions: Array<() => void> = []
@@ -57,6 +58,46 @@ function observeDisplaySideEffects(): () => void {
 }
 
 describe('transaction modal cancellation', () => {
+  it('keeps step elements and distinct accessible controls when the language changes', async () => {
+    const preference = i18n.preference.value
+    try {
+      i18n.setPreference('en')
+      const wrapper = mount(TxModal, {
+        props: {
+          visible: true,
+          chain: 'eth',
+          title: 'Claim',
+          state: { estimate: 'process', send: 'wait', confirm: 'wait' }
+        }
+      })
+      const steps = wrapper.findAll('.steps > li').map((step) => step.element)
+      const close = wrapper.get('button.btn-ghost')
+      expect(close.attributes('aria-label')).toBe('Cancel transaction preparation')
+      i18n.setPreference('zh-Hant')
+      await flushPromises()
+      wrapper.findAll('.steps > li').forEach((step, index) => {
+        expect(step.element).toBe(steps[index])
+      })
+      expect(close.attributes('aria-label')).toBe('取消交易準備')
+      await close.trigger('click')
+      expect(wrapper.emitted('cancel')).toHaveLength(1)
+      expect(wrapper.emitted('close')).toBeUndefined()
+
+      await wrapper.setProps({
+        state: { estimate: 'done', send: 'process', confirm: 'wait', walletPrompted: true }
+      })
+      expect(close.attributes('aria-label')).toBe('隱藏交易對話框')
+      await close.trigger('click')
+      expect(wrapper.emitted('close')).toHaveLength(1)
+      expect(wrapper.emitted('cancel')).toHaveLength(1)
+
+      await wrapper.setProps({ state: { estimate: 'done', send: 'error', confirm: 'wait' } })
+      expect(close.attributes('aria-label')).toBe('關閉交易對話框')
+    } finally {
+      i18n.setPreference(preference)
+    }
+  })
+
   it('permits cancelling final send preflight before the wallet request opens', async () => {
     const wrapper = mount(TxModal, {
       props: {

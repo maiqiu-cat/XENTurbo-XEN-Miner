@@ -6,6 +6,7 @@ import { XENCryptoABI } from '@/abis/XENCryptoABI'
 import { Multicall3ABI } from '@/abis/Multicall3ABI'
 import { computeProxyAddress, computeProxyAddressRange, minimalProxyRuntimeCode } from './create2'
 import { getReadProvider, withRetry } from './rpc'
+import { isRetryableRpcError, isRpcReadInvalidated } from './rpcPolicy'
 import type { Vmu, VmuStatus } from './types'
 import { mapWithConcurrency } from '@/utils/concurrency'
 
@@ -68,14 +69,16 @@ export async function readVmuCount(
   context: ChainReadContext = {}
 ): Promise<number> {
   const provider = getReadProvider(chain)
-  const factory = new Contract(
-    CONTRACTS[chain].factory,
-    XENFactoryABI as unknown as any[],
-    provider
+  const count = await withRetry(
+    (signal) =>
+      new Contract(CONTRACTS[chain].factory, XENFactoryABI, provider.withSignal(signal)).vmuCount(
+        wallet,
+        blockOverrides(context)
+      ),
+    {
+      signal: context.signal
+    }
   )
-  const count = await withRetry(() => factory.vmuCount(wallet, blockOverrides(context)), {
-    signal: context.signal
-  })
   return assertVmuCount(count)
 }
 
@@ -85,10 +88,17 @@ export async function readGlobalRank(
   context: ChainReadContext = {}
 ): Promise<number> {
   const provider = getReadProvider(chain)
-  const xen = new Contract(CONTRACTS[chain].xenCrypto, XENCryptoABI as unknown as any[], provider)
-  const rank = await withRetry(() => xen.globalRank(blockOverrides(context)), {
-    signal: context.signal
-  })
+  const rank = await withRetry(
+    (signal) =>
+      new Contract(
+        CONTRACTS[chain].xenCrypto,
+        XENCryptoABI,
+        provider.withSignal(signal)
+      ).globalRank(blockOverrides(context)),
+    {
+      signal: context.signal
+    }
+  )
   const result = Number(rank)
   if (!Number.isSafeInteger(result) || result < 0)
     throw new Error('Invalid global rank returned by RPC')
@@ -98,12 +108,9 @@ export async function readGlobalRank(
 /** Read the per-VMU service fee (wei) charged by the factory. */
 export async function readFee(chain: ChainKey): Promise<bigint> {
   const provider = getReadProvider(chain)
-  const factory = new Contract(
-    CONTRACTS[chain].factory,
-    XENFactoryABI as unknown as any[],
-    provider
-  )
-  return (await withRetry(() => factory.FEE())) as bigint
+  return (await withRetry((signal) =>
+    new Contract(CONTRACTS[chain].factory, XENFactoryABI, provider.withSignal(signal)).FEE()
+  )) as bigint
 }
 
 export function timestampSecondsToMs(seconds: unknown, allowZero = false): number {
@@ -126,8 +133,9 @@ export async function readChainTimestamp(
   chain: ChainKey,
   context: ChainReadContext = {}
 ): Promise<number> {
+  const provider = getReadProvider(chain)
   const block = await withRetry(
-    () => getReadProvider(chain).getBlock(context.blockTag ?? 'latest'),
+    (signal) => provider.withSignal(signal).getBlock(context.blockTag ?? 'latest'),
     { signal: context.signal }
   )
   return timestampSecondsToMs(block?.timestamp)
@@ -208,12 +216,12 @@ async function readVmuIds(
   ids: number[],
   chainTimestampMs: number,
   signal?: AbortSignal,
-  blockTag?: number
+  blockTag?: number,
+  nonRetryableIds?: Set<number>
 ): Promise<Vmu[]> {
   if (!ids.length) return []
   const provider = getReadProvider(chain)
   const { factory, vmuTemplate, xenCrypto, multicall3 } = CONTRACTS[chain]
-  const multicall = new Contract(multicall3, Multicall3ABI as unknown as any[], provider)
   const vmus: Vmu[] = []
   const batchSize = MULTICALL_BATCH_SIZE[chain]
   for (let start = 0; start < ids.length; start += batchSize) {
@@ -230,7 +238,11 @@ async function readVmuIds(
     try {
       throwIfAborted(signal)
       const results = (await withRetry(
-        () => multicall.aggregate3(calls, blockOverrides({ blockTag })),
+        (attemptSignal) =>
+          new Contract(multicall3, Multicall3ABI, provider.withSignal(attemptSignal)).aggregate3(
+            calls,
+            blockOverrides({ blockTag })
+          ),
         { signal }
       )) as {
         success: boolean
@@ -240,8 +252,11 @@ async function readVmuIds(
       slice.forEach((proxy, index) => {
         vmus.push(decodeUserMint(proxy.id, proxy.address, results[index], chainTimestampMs))
       })
-    } catch {
+    } catch (error) {
       throwIfAborted(signal)
+      if (!isRpcReadInvalidated(error) && !isRetryableRpcError(error)) {
+        for (const proxy of slice) nonRetryableIds?.add(proxy.id)
+      }
       slice.forEach((proxy) => vmus.push(emptyVmu(proxy.id, proxy.address, false)))
     }
   }
@@ -267,19 +282,18 @@ export async function readWalletVmus(
   const { factory, vmuTemplate, xenCrypto, multicall3 } = CONTRACTS[chain]
 
   throwIfAborted(opts.signal)
-  const total = assertVmuCount(opts.vmuCount ?? (await readVmuCount(chain, wallet)))
+  const total = assertVmuCount(
+    opts.vmuCount ?? (await readVmuCount(chain, wallet, { signal: opts.signal }))
+  )
   if (total <= 0) {
     opts.onProgress?.({ loaded: 0, total: 0 })
     return []
   }
-  const chainTimestampMs = opts.chainTimestampMs ?? (await readChainTimestamp(chain))
+  const chainTimestampMs =
+    opts.chainTimestampMs ?? (await readChainTimestamp(chain, { signal: opts.signal }))
   throwIfAborted(opts.signal)
 
-  const multicall = new Contract(
-    multicall3,
-    Multicall3ABI as unknown as any[],
-    getReadProvider(chain)
-  )
+  const provider = getReadProvider(chain)
   const batchSize = MULTICALL_BATCH_SIZE[chain]
   const batches = Array.from({ length: Math.ceil(total / batchSize) }, (_, index) => ({
     fromId: index * batchSize + 1,
@@ -287,6 +301,7 @@ export async function readWalletVmus(
   }))
 
   let loaded = 0
+  const nonRetryableIds = new Set<number>()
   const vmuBatches = await mapWithConcurrency(batches, BATCH_CONCURRENCY, async (batch) => {
     throwIfAborted(opts.signal)
     const slice = computeProxyAddressRange({
@@ -304,16 +319,23 @@ export async function readWalletVmus(
 
     let decoded: Vmu[]
     try {
-      const results = (await withRetry(() => multicall.aggregate3(calls), {
-        signal: opts.signal
-      })) as {
+      const results = (await withRetry(
+        (signal) =>
+          new Contract(multicall3, Multicall3ABI, provider.withSignal(signal)).aggregate3(calls),
+        {
+          signal: opts.signal
+        }
+      )) as {
         success: boolean
         returnData: string
       }[]
       throwIfAborted(opts.signal)
       decoded = slice.map((p, i) => decodeUserMint(p.id, p.address, results[i], chainTimestampMs))
-    } catch {
+    } catch (error) {
       throwIfAborted(opts.signal)
+      if (!isRpcReadInvalidated(error) && !isRetryableRpcError(error)) {
+        for (const proxy of slice) nonRetryableIds.add(proxy.id)
+      }
       decoded = slice.map((proxy) => emptyVmu(proxy.id, proxy.address, false))
     }
     loaded += slice.length
@@ -324,8 +346,9 @@ export async function readWalletVmus(
   throwIfAborted(opts.signal)
   const vmus = vmuBatches.flat()
 
-  // Retry failed reads once in bounded batches so transient RPC blips don't stick.
-  const failedIds = vmus.filter((v) => !v.readOk).map((v) => v.id)
+  // A second pass reacquires the current pool, so retired-pool reads can recover
+  // without replaying semantic/endpoint failures or overriding caller cancellation.
+  const failedIds = vmus.filter((v) => !v.readOk && !nonRetryableIds.has(v.id)).map((v) => v.id)
   if (failedIds.length) {
     try {
       throwIfAborted(opts.signal)
@@ -369,15 +392,19 @@ export async function readVmuStates(
   if (ids.length > MAX_WALLET_VMU_COUNT || ids.some((id) => !Number.isSafeInteger(id) || id <= 0))
     throw new Error('Invalid VMU ids for bounded read')
   const chainTimestampMs = await readChainTimestamp(chain, context)
+  const nonRetryableIds = new Set<number>()
   const list = await readVmuIds(
     chain,
     wallet,
     ids,
     chainTimestampMs,
     context.signal,
-    context.blockTag
+    context.blockTag,
+    nonRetryableIds
   )
-  const failedIds = list.filter((vmu) => !vmu.readOk).map((vmu) => vmu.id)
+  const failedIds = list
+    .filter((vmu) => !vmu.readOk && !nonRetryableIds.has(vmu.id))
+    .map((vmu) => vmu.id)
   if (failedIds.length) {
     try {
       const retried = await readVmuIds(
@@ -422,21 +449,27 @@ export async function readVmuProxyDeployments(
   }))
 
   for (let start = 0; start < proxies.length; start += CODE_BATCH_SIZE) {
+    throwIfAborted(context.signal)
     const slice = proxies.slice(start, start + CODE_BATCH_SIZE)
     const codes = await Promise.all(
       slice.map(async ({ address }) => {
         try {
           return (
-            await withRetry(() => provider.getCode(address, context.blockTag), {
-              signal: context.signal
-            })
+            await withRetry(
+              (signal) => provider.withSignal(signal).getCode(address, context.blockTag),
+              {
+                signal: context.signal
+              }
+            )
           ).toLowerCase()
         } catch {
+          throwIfAborted(context.signal)
           return null
         }
       })
     )
 
+    throwIfAborted(context.signal)
     slice.forEach(({ id }, index) => {
       const code = codes[index]
       results.set(id, code === null ? 'READ_ERROR' : code === expectedCode ? 'DEPLOYED' : 'MISSING')

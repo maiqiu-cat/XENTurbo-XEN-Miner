@@ -29,6 +29,15 @@ export default defineConfig({
       '@': fileURLToPath(new URL('./src', import.meta.url))
     }
   },
+  build: {
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [{ name: 'vendor-ethers', test: /node_modules[\\/]ethers[\\/]/ }]
+        }
+      }
+    }
+  },
   server: {
     port: 5300,
     headers: {
@@ -48,17 +57,29 @@ export default defineConfig({
       // CLI subprocess tests complement the in-process utility and scan coverage.
       exclude: ['src/abis/**', 'src/env.d.ts'],
       thresholds: {
-        lines: 53,
-        functions: 47,
-        statements: 49,
-        branches: 46,
+        lines: 82,
+        functions: 80,
+        statements: 78,
+        branches: 72,
         'src/core/txManager.ts': {
-          lines: 57,
-          branches: 55
+          lines: 85,
+          branches: 75
         },
         'src/core/pendingOps.ts': {
-          lines: 69,
-          branches: 55
+          lines: 78,
+          branches: 70
+        },
+        'src/core/rpc.ts': {
+          lines: 80,
+          branches: 68
+        },
+        'src/core/rpcProvider.ts': {
+          lines: 90,
+          branches: 75
+        },
+        'src/core/rpcPolicy.ts': {
+          lines: 95,
+          branches: 85
         }
       }
     }

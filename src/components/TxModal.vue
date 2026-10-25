@@ -24,9 +24,9 @@ const explorerTxUrl = computed(() => {
 const steps = computed(() => {
   const s = props.state
   return [
-    { label: t('Estimate gas'), status: s?.estimate ?? 'wait' },
-    { label: t('Send transaction'), status: s?.send ?? 'wait' },
-    { label: t('Confirm on-chain'), status: s?.confirm ?? 'wait' }
+    { id: 'estimate', label: t('Estimate gas'), status: s?.estimate ?? 'wait' },
+    { id: 'send', label: t('Send transaction'), status: s?.send ?? 'wait' },
+    { id: 'confirm', label: t('Confirm on-chain'), status: s?.confirm ?? 'wait' }
   ]
 })
 
@@ -114,6 +114,7 @@ function icon(status: string): string {
         <button
           class="btn btn-ghost"
           :title="waitingWallet ? t('Hide') : preparing || readyToSign ? t('Cancel') : t('Close')"
+          :aria-label="waitingWallet ? t('Hide transaction dialog') : preparing || readyToSign ? t('Cancel transaction preparation') : t('Close transaction dialog')"
           @click="dismiss"
         >
           x
@@ -121,7 +122,7 @@ function icon(status: string): string {
       </div>
       <hr class="hr" />
       <ul class="steps">
-        <li v-for="step in steps" :key="step.label" class="row between">
+        <li v-for="step in steps" :key="step.id" class="row between">
           <span>{{ step.label }}</span>
           <span
             class="step-icon"

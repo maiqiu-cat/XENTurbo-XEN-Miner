@@ -20,6 +20,9 @@ describe('VMU proxy deployment evidence', () => {
       ])
     )
     const provider = {
+      withSignal() {
+        return this
+      },
       getCode: vi.fn(async (address: string) => {
         const normalized = address.toLowerCase()
         if (normalized === addresses.get(1)) return minimalProxyRuntimeCode(contracts.vmuTemplate)

@@ -175,8 +175,9 @@ export async function verifyOperationOutcome(
   try {
     assertReadActive(deps.signal)
     if (prepared.receipt) {
+      const provider = getReadProvider(prepared.chain)
       const block = await withRetry(
-        () => getReadProvider(prepared.chain).getBlock(prepared.receipt!.blockNumber),
+        (signal) => provider.withSignal(signal).getBlock(prepared.receipt!.blockNumber),
         { signal: deps.signal }
       )
       if (

@@ -1,6 +1,15 @@
 # XENTurbo XEN Miner
 
-Current release: **v1.1.8**. The page header displays the same version as the source package and Git release tag.
+Current release: **v1.1.9**. The page header displays the same version as the source package and Git release tag.
+
+### v1.1.9 RPC Resilience And Safety Messages
+
+- Added bounded request-level RPC failover, a single application retry layer and structured rate-limit handling. Verified chain identity is still required; invalid requests, cancellations and contract reverts do not trigger broad retries.
+- Preserved in-flight transaction confirmation during background health changes, with bounded receipt polling and explicit do-not-resend guidance when confirmation remains unresolved.
+- Recovered full and selected VMU scans after a health-pool replacement through the existing bounded second pass. User cancellation still stops further reads; failed reads never become empty slots.
+- Completed Traditional Chinese safety messages and tested language persistence, transaction recovery and cross-tab behavior. Split ethers into a separate vendor asset without claiming a reduction in total download size.
+- Kept default RPC lists and order, Multicall limits of 400/300, transport batches of three and scan concurrency of two. Contracts, ABI, wallet signing and production analytics are unchanged.
+- Damaged locks without a hash remain preserved and blocking. P2-C remains unproven and its safety gate is not relaxed. Non-blocking review observations are deferred, not declared resolved.
 
 ### v1.1.8 Keyless RPC Defaults
 
@@ -61,17 +70,15 @@ the wallet installed in your browser.
 
 ## Use XENTurbo Miner
 
-Both Miner addresses are currently available:
+Use the independent Miner at **https://miner.xenturbo.io**. Check the hostname before connecting a wallet.
 
-| Version      | Address                   | Status                     |
-| ------------ | ------------------------- | -------------------------- |
-| New Miner    | https://miner.xenturbo.io | Recommended                |
-| Legacy Miner | https://xenturbo.io/miner | Available during migration |
+| Version      | Address                   | Status                                                                            |
+| ------------ | ------------------------- | --------------------------------------------------------------------------------- |
+| New Miner    | https://miner.xenturbo.io | Recommended                                                                       |
+| Legacy entry | https://xenturbo.io/miner | Redirected to the dashboard in the 2026-10-24 check; not a guaranteed Miner entry |
 
-You may continue using either address for now. We recommend gradually switching
-to the new independent Miner at:
-
-https://miner.xenturbo.io
+Do not assume that a legacy redirect is the same application. Navigate to the recommended
+hostname directly and verify wallet prompts; never enter a seed phrase into a website.
 
 The new Miner is designed to operate independently from the legacy XENTurbo
 backend. It reads mining state directly from the blockchain and stores temporary
@@ -347,6 +354,11 @@ and estimates.
 - `npm run lint` - ESLint checks for Vue and TypeScript
 - `npm run format:check` - Prettier formatting check
 - `npm run check:bundle` - enforce gzip bundle budgets against `dist/`
+- `npm run check:public-safety` - scan public-source and commit privacy rules, plus version consistency
+- `node scripts/check-version.mjs` - validate the displayed/package version and release-tag consistency
+- `npm run audit:prod` - check production dependency advisories
+- `npm run audit:dependencies` - check all dependency advisories
+- `npm run probe:release` - read-only chain/contract release probe, at most three JSON-RPC items per POST
 - `npm run check:rpc-health` - check every script-configured default RPC for HTTPS, chain ID, and factory `FEE()`
 - `npm run verify` - run unit, type, build, bundle, audit, and browser release gates
 - `npm run verify:create2 -- --chain eth --wallet 0x...` - verify derivation against the selected live chain
