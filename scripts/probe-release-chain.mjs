@@ -65,10 +65,12 @@ export async function probeReleaseEndpoint(url, config, fetchImpl = fetch) {
       payload.push(...part)
     }
   } catch (error) {
+    const interrupted =
+      signal.aborted || error?.name === 'AbortError' || error?.name === 'TimeoutError'
     return {
       healthy: false,
       url,
-      error: `${readingResponse ? 'INVALID_RESULT' : 'REQUEST_FAILED'}: ${diagnosticError(error)}`
+      error: `${readingResponse && !interrupted ? 'INVALID_RESULT' : 'REQUEST_FAILED'}: ${diagnosticError(error)}`
     }
   }
   try {

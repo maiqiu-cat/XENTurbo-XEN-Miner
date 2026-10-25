@@ -61,21 +61,26 @@ describe('RPC retry policy', () => {
     expect(vi.getTimerCount()).toBe(0)
   })
 
-  it('stops before another RPC call when backoff consumes the total retry budget', async () => {
+  it('reports rate limiting immediately when backoff would consume the total retry budget', async () => {
     vi.useFakeTimers()
+    const startedAt = Date.now()
+    const sleep = vi.fn(async () => {})
     const operation = vi.fn(async () => {
       throw Object.assign(new Error('rate limit'), { status: 429, retryAfterMs: 100 })
     })
     const result = withRetry(operation, {
       totalTimeoutMs: 100,
-      jitterRatio: 0
+      baseDelayMs: 100,
+      jitterRatio: 0,
+      sleep
     }).catch((error: unknown) => error)
-    await vi.advanceTimersByTimeAsync(100)
     const error = await result
-    expect(error).toBeInstanceOf(ReadTimeoutError)
-    expect(error).toMatchObject({ label: 'RPC retry deadline', timeoutMs: 100 })
-    expect(normalizeError(error)).toContain('RPC retry deadline exceeded 100 ms.')
-    expect(normalizeError(error)).toContain('Do not resend.')
+    expect(error).toMatchObject({ code: 'RPC_RATE_LIMITED', retryAfterMs: 100 })
+    expect(normalizeError(error)).toBe(
+      'RPC endpoints are rate-limited. Retry in 1s. Your RPC list was preserved.'
+    )
+    expect(Date.now()).toBe(startedAt)
+    expect(sleep).not.toHaveBeenCalled()
     expect(operation).toHaveBeenCalledOnce()
     expect(vi.getTimerCount()).toBe(0)
   })
@@ -89,6 +94,48 @@ describe('RPC retry policy', () => {
     await expect(withRetry(operation, { retries: 3, sleep })).rejects.toThrow('execution reverted')
     expect(operation).toHaveBeenCalledOnce()
     expect(sleep).not.toHaveBeenCalled()
+  })
+
+  it('cancels the real backoff timer and never dispatches a later retry', async () => {
+    vi.useFakeTimers()
+    const controller = new AbortController()
+    const reason = new DOMException('Fixture caller cancelled', 'AbortError')
+    const operation = vi.fn(async () => {
+      throw new Error('rate limit')
+    })
+    const result = withRetry(operation, { signal: controller.signal, jitterRatio: 0 }).catch(
+      (error: unknown) => error
+    )
+    await vi.advanceTimersByTimeAsync(100)
+    expect(operation).toHaveBeenCalledOnce()
+    controller.abort(reason)
+    expect(await result).toBe(reason)
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(operation).toHaveBeenCalledOnce()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('preserves a transient diagnostic without sleeping when its next delay cannot fit', async () => {
+    const error = new Error('ETIMEDOUT')
+    const operation = vi.fn(async () => {
+      throw error
+    })
+    const sleep = vi.fn(async () => {})
+    await expect(
+      withRetry(operation, { totalTimeoutMs: 100, baseDelayMs: 400, jitterRatio: 0, sleep })
+    ).rejects.toBe(error)
+    expect(operation).toHaveBeenCalledOnce()
+    expect(sleep).not.toHaveBeenCalled()
+  })
+
+  it('does not call an RPC with an already exhausted total budget', async () => {
+    const operation = vi.fn(async () => 'unused')
+    await expect(withRetry(operation, { totalTimeoutMs: 0 })).rejects.toMatchObject({
+      name: 'ReadTimeoutError',
+      label: 'RPC retry deadline',
+      timeoutMs: 0
+    })
+    expect(operation).not.toHaveBeenCalled()
   })
 
   it('honors server retry timing and then applies bounded exponential backoff', async () => {

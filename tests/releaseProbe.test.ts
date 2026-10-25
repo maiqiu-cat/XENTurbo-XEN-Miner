@@ -35,6 +35,24 @@ function responseFor(payload: Array<{ id: number }>) {
 }
 
 describe('release chain probe', () => {
+  it.each(['TimeoutError', 'AbortError'] as const)(
+    'classifies a %s while reading the response body as a request failure',
+    async (name) => {
+      const fetchImpl = vi.fn<typeof fetch>(async () => {
+        const response = Response.json({})
+        vi.spyOn(response, 'json').mockRejectedValue(
+          new DOMException('Fixture response interrupted', name)
+        )
+        return response
+      })
+      expect(await probeReleaseEndpoint('https://rpc.example', config, fetchImpl)).toMatchObject({
+        healthy: false,
+        error: 'REQUEST_FAILED: Fixture response interrupted'
+      })
+      expect(fetchImpl).toHaveBeenCalledOnce()
+    }
+  )
+
   it.each([1, 2, 3, 4, 5, 6])('escapes remote error controls for RPC result %s', async (id) => {
     const payload = validPayload().map((entry) =>
       entry.id === id

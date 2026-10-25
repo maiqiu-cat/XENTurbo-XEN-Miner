@@ -11,7 +11,12 @@ import { CONTRACTS } from '@/config/contracts'
 import { ReadTimeoutError, withReadDeadline } from './readDeadline'
 import { mapWithConcurrency } from '@/utils/concurrency'
 import { ReadRpcProvider } from './rpcProvider'
-import { isRetryableRpcError, rpcRetryAfterMs } from './rpcPolicy'
+import {
+  isRetryableRpcError,
+  rpcRetryAfterMs,
+  rpcFailureKind,
+  RpcRateLimitError
+} from './rpcPolicy'
 
 export { isRetryableRpcError } from './rpcPolicy'
 export type ReadProvider = ReadRpcProvider
@@ -277,6 +282,7 @@ export function ensureHealthyReadProvider(
   if (existingFlight?.generation === generation) return existingFlight.promise
 
   const promise = (async () => {
+    const healthStartedAt = Date.now()
     let urls: string[]
     try {
       urls = normalizeRpcUrls(getRpcUrls(key))
@@ -290,7 +296,7 @@ export function ensureHealthyReadProvider(
         error: failure.message
       }
       if ((providerGenerations.get(key) ?? 0) === generation) {
-        evictProvider(key)
+        evictProvider(key, true)
         publishHealthState(key, state)
       }
       throw failure
@@ -329,7 +335,7 @@ export function ensureHealthyReadProvider(
     const failures = checks.flatMap((check) => (check.failure ? [check.failure] : []))
     const checkedAt = Date.now()
     if (healthyUrls.length === 0) {
-      evictProvider(key)
+      evictProvider(key, true)
       const error = `RPC_UNAVAILABLE: ${CHAINS[key].name} has 0/${urls.length} responsive configured RPC endpoints. The RPC list was preserved. This may be caused by the local internet connection, DNS, firewall, proxy/VPN, browser access policy, or the endpoints themselves. Check the network and retry, or open RPC settings to change endpoints.`
       publishHealthState(key, {
         chain: key,
@@ -352,6 +358,7 @@ export function ensureHealthyReadProvider(
       providerCache.set(key, provider)
       providerSignatures.set(key, signature)
     }
+    provider.refreshHealth(healthStartedAt)
     publishHealthState(key, {
       chain: key,
       checking: false,
@@ -468,15 +475,21 @@ export async function withRetry<T>(
       const exponential = Math.min(maxDelay, base * 2 ** attempt)
       const serverDelay = rpcRetryAfterMs(err)
       const jitter = 1 - jitterRatio + random() * jitterRatio * 2
-      const delay = Math.max(serverDelay ?? 0, Math.round(exponential * jitter))
+      const rateLimited = rpcFailureKind(err) === 'rate-limit'
+      const delay = Math.max(
+        serverDelay ?? (rateLimited ? 1_000 : 0),
+        Math.round(exponential * jitter)
+      )
       const remaining = deadline - Date.now()
-      await withReadDeadline(() => sleep(Math.min(delay, remaining)), 'RPC retry deadline', {
+      if (delay >= remaining) {
+        if (rateLimited) throw new RpcRateLimitError(delay)
+        throw err
+      }
+      await withReadDeadline(() => sleep(delay), 'RPC retry deadline', {
         timeoutMs: remaining,
         signal: opts.signal
       })
       if (opts.signal?.aborted) throw abortReason(opts.signal)
-      if (delay >= remaining)
-        throw new ReadTimeoutError('RPC retry deadline', opts.totalTimeoutMs ?? 30_000)
     } finally {
       controller.abort()
     }

@@ -1,6 +1,16 @@
 // Presentation-only translations of existing logs/errors; core error codes and persisted
 // transaction evidence remain in their original form.
 export const runtimeMessages = {
+  'Confirmation timed out. The transaction may still be pending. Do not resend. Check wallet Activity and the explorer, then recheck pending operations.':
+    '確認逾時。交易可能仍待確認。請勿重送。請檢查錢包 Activity 與區塊瀏覽器，再重新檢查待確認交易。',
+  'Transaction submitted, but confirmation could not be completed. Do not resend. Check wallet Activity and the explorer, then recheck pending operations.':
+    '交易已送出，但無法完成確認。請勿重送。請檢查錢包 Activity 與區塊瀏覽器，再重新檢查待確認交易。',
+  'The RPC read context is no longer active. Recheck transaction records before starting another operation. Do not resend.':
+    'RPC 讀取環境已失效。請先重新檢查交易記錄，再開始其他操作。請勿重送。',
+  'RPC endpoints are rate-limited. Retry in {seconds}s. Your RPC list was preserved.':
+    'RPC 節點受到限流。請於 {seconds} 秒後重試。RPC 清單已保留。',
+  'Some selected VMUs are already pending in another tab/window. Wait or refresh.':
+    '部分選取的 VMU 已在其他分頁或視窗中處理。請等待或重新整理。',
   'Confirmation timed out. The transaction may still be pending — do not retry the same VMUs. Refresh later or check the explorer.':
     '確認逾時。交易可能仍待確認；請勿對相同的 VMU 重送交易。請稍後重新整理或檢查區塊瀏覽器。',
   'Recovery stopped during a storage change. The original backup is retained. Inspect again; do not clear site data or resend.':

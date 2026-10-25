@@ -259,6 +259,74 @@ function mockRevertedReceipt(harness: Awaited<ReturnType<typeof installOfflineHa
 }
 
 describe('offline transaction safety integration (H-08)', () => {
+  it.each(['health', 'invalidated', 'receipt', 'timeout', 'missing'] as const)(
+    'preserves broadcast evidence and bilingual do-not-resend guidance after %s failure',
+    async (failure) => {
+      const harness = await installOfflineHarness()
+      const prepared = await harness.prepare()
+      const onStep = vi.fn()
+      const sending = harness.tx
+        .sendPreparedOperation(prepared, { onStep })
+        .catch((error: unknown) => error)
+      await vi.waitFor(() => expect(harness.sendRequests()).toHaveLength(1))
+      const { RpcReadInvalidatedError } = await import('@/core/rpcPolicy')
+      if (failure === 'health') {
+        const { ensureHealthyReadProvider } = await import('@/core/rpc')
+        vi.mocked(ensureHealthyReadProvider).mockRejectedValueOnce(
+          new Error('RPC_UNAVAILABLE: offline')
+        )
+      } else if (failure !== 'missing') {
+        harness.readProvider.waitForTransaction.mockRejectedValueOnce(
+          failure === 'invalidated'
+            ? new RpcReadInvalidatedError()
+            : failure === 'timeout'
+              ? Object.assign(new Error('timeout'), { code: 'TIMEOUT' })
+              : new Error('could not coalesce error')
+        )
+      }
+      harness.walletResponse.resolve(HASH)
+      expect(await sending).toBeInstanceOf(Error)
+      const state = onStep.mock.lastCall?.[0]
+      expect(state).toMatchObject({ send: 'done', confirm: 'error', txHash: HASH })
+      expect(state.error).toMatch(/do not resend/i)
+      const { createI18n } = await import('@/i18n')
+      const locale = createI18n({ languages: () => ['zh-TW'], storage: () => harness.storage })
+      locale.restore()
+      expect(locale.message(state.error)).toContain('請勿重送')
+      expect(locale.message(state.error)).not.toContain('could not coalesce')
+      expect(harness.pending.listPendingOps('eth', WALLET)).toEqual([
+        expect.objectContaining({ id: prepared.batch, phase: 'broadcast', txHash: HASH })
+      ])
+      expect(harness.locks.pendingLocks('eth', WALLET)).toEqual([
+        expect.objectContaining({ batch: prepared.batch, txHash: HASH, ids: [1] })
+      ])
+      await expect(harness.prepare()).rejects.toThrow('Some selected VMUs are already pending')
+      expect(harness.sendRequests()).toHaveLength(1)
+    }
+  )
+
+  it('distinguishes VMU lock conflicts from actual wallet pending prompts in both languages', async () => {
+    const harness = await installOfflineHarness()
+    await harness.prepare()
+    const conflict = await harness.prepare().catch((error: unknown) => error)
+    expect(conflict).toBeInstanceOf(Error)
+    expect((conflict as Error).message).toMatch(/^LOCK_CONFLICT:/)
+    const message = harness.tx.normalizeError(conflict)
+    expect(message).toBe(
+      'Some selected VMUs are already pending in another tab/window. Wait or refresh.'
+    )
+    expect(message).not.toContain('MetaMask has a pending request')
+    const { createI18n } = await import('@/i18n')
+    const locale = createI18n({ languages: () => ['zh-TW'], storage: () => harness.storage })
+    locale.restore()
+    expect(locale.message(message)).toBe(
+      '部分選取的 VMU 已在其他分頁或視窗中處理。請等待或重新整理。'
+    )
+    expect(
+      harness.tx.normalizeError(new Error('WALLET_PENDING: Request is already pending'))
+    ).toContain('MetaMask has a pending request')
+  })
+
   it.each([
     { late: false, cacheFails: false },
     { late: false, cacheFails: true },
@@ -268,10 +336,9 @@ describe('offline transaction safety integration (H-08)', () => {
     'recovers a hash after journal reads fail (late=$late, cacheFails=$cacheFails)',
     async ({ late, cacheFails }) => {
       const harness = await installOfflineHarness()
-      const prepared = late
-        ? (await detachAtWalletTimeout(harness)).prepared
-        : await harness.prepare()
-      const onStep = vi.fn()
+      const detached = late ? await detachAtWalletTimeout(harness) : null
+      const prepared = detached?.prepared ?? (await harness.prepare())
+      const onStep = detached?.onStep ?? vi.fn()
       const sending = late ? null : harness.tx.sendPreparedOperation(prepared, { onStep })
       const rejected = sending
         ? expect(sending).rejects.toThrow('PENDING_STORAGE_READ_FAILED')
@@ -292,14 +359,13 @@ describe('offline transaction safety integration (H-08)', () => {
       harness.walletResponse.resolve(HASH)
       await vi.advanceTimersByTimeAsync(0)
       if (rejected) await rejected
-      if (!late) {
-        expect(onStep.mock.lastCall?.[0]).toMatchObject({
-          send: 'done',
-          confirm: 'error',
-          txHash: HASH
-        })
-        expect(onStep.mock.lastCall?.[0].error).toContain('Do not resend')
-      }
+      expect(onStep.mock.lastCall?.[0]).toMatchObject({
+        send: 'done',
+        confirm: 'error',
+        txHash: HASH
+      })
+      expect(onStep.mock.lastCall?.[0].error).toContain('Do not resend')
+      expect(onStep.mock.lastCall?.[0].error).toContain('Do not clear site data')
       expect(() => harness.pending.listPendingOps('eth', WALLET)).toThrow(
         'PENDING_STORAGE_READ_FAILED'
       )
@@ -649,7 +715,17 @@ describe('offline transaction safety integration (H-08)', () => {
 
     expect(harness.sendRequests()).toHaveLength(1)
     expect(harness.readProvider.waitForTransaction).not.toHaveBeenCalled()
-    expect(onStep).toHaveBeenCalledTimes(notifications)
+    expect(onStep).toHaveBeenCalledTimes(notifications + 1)
+    expect(onStep.mock.lastCall?.[0]).toMatchObject({
+      send: 'done',
+      confirm: 'error',
+      txHash: HASH
+    })
+    expect(onStep.mock.lastCall?.[0].error).toContain('Do not resend')
+    const { createI18n } = await import('@/i18n')
+    const locale = createI18n({ languages: () => ['zh-TW'], storage: () => harness.storage })
+    locale.restore()
+    expect(locale.message(onStep.mock.lastCall?.[0].error)).toContain('請勿重送')
     expect(harness.activeLocks.size).toBe(0)
     expect(harness.locks.pendingLocks('eth', WALLET)).toEqual([
       expect.objectContaining({ batch: prepared.batch, txHash: HASH, ids: [1] })

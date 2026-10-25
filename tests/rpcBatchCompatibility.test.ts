@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { FetchRequest } from 'ethers'
+import { FetchRequest, Interface } from 'ethers'
+import { Multicall3ABI } from '@/abis/Multicall3ABI'
+import { XENCryptoABI } from '@/abis/XENCryptoABI'
+import { readVmuStates, readWalletVmus } from '@/core/chainReader'
 import { CHAINS, readCustomRpc, writeCustomRpc, type ChainKey } from '@/config/chains'
 import { ensureHealthyReadProvider, resetProviders } from '@/core/rpc'
 
@@ -14,6 +17,10 @@ const requests: Array<{ url: string; calls: RpcRequest[] }> = []
 let chainId = '0x1'
 const unavailableUrls = new Set<string>()
 const unavailableAddresses = new Set<string>()
+const multicall = new Interface(Multicall3ABI)
+const xen = new Interface(XENCryptoABI)
+const multicallSizes: number[] = []
+let multicallError: { code: number; message: string; data?: string } | undefined
 
 beforeEach(() => {
   const storage = new Map<string, string>()
@@ -25,6 +32,8 @@ beforeEach(() => {
   requests.length = 0
   unavailableUrls.clear()
   unavailableAddresses.clear()
+  multicallSizes.length = 0
+  multicallError = undefined
   // Intercept only the HTTP boundary; keep ethers serialization, batching and ID matching real.
   FetchRequest.registerGetUrl(async (request) => {
     if (!request.body) throw new Error('Missing JSON-RPC request body')
@@ -45,11 +54,42 @@ beforeEach(() => {
       ) {
         return { jsonrpc: '2.0', id, error: { code: -32000, message: 'temporary read failure' } }
       }
-      let result: string
+      if (method === 'eth_call' && multicallError)
+        return { jsonrpc: '2.0', id, error: multicallError }
+      let result: unknown
       if (method === 'eth_chainId') result = chainId
       else if (method === 'eth_blockNumber') result = '0x2a'
+      else if (method === 'eth_getBlockByNumber')
+        result = {
+          hash: `0x${'b'.repeat(64)}`,
+          parentHash: `0x${'a'.repeat(64)}`,
+          number: '0x2a',
+          timestamp: '0x6b49d200',
+          nonce: '0x0000000000000000',
+          difficulty: '0x0',
+          gasLimit: '0x1c9c380',
+          gasUsed: '0x0',
+          miner: '0x1111111111111111111111111111111111111111',
+          extraData: '0x',
+          transactions: []
+        }
       else if (method === 'eth_getCode') result = `0x60${String(params[0]).slice(-2)}`
-      else throw new Error(`Unexpected RPC method: ${method}`)
+      else if (method === 'eth_call') {
+        const data = (params[0] as { data: string }).data
+        const calls = multicall.decodeFunctionData('aggregate3', data)[0] as Array<{
+          callData: string
+        }>
+        multicallSizes.push(calls.length)
+        result = multicall.encodeFunctionResult('aggregate3', [
+          calls.map(({ callData }) => {
+            const [proxy] = xen.decodeFunctionData('userMints', callData)
+            return [
+              true,
+              xen.encodeFunctionResult('userMints', [proxy, 10n, 1_700_000_000n, 100n, 3_000n, 0n])
+            ]
+          })
+        ])
+      } else throw new Error(`Unexpected RPC method: ${method}`)
       return { jsonrpc: '2.0', id, result }
     })
     return {
@@ -70,6 +110,72 @@ afterEach(() => {
 })
 
 describe('public RPC wire batch compatibility', () => {
+  for (const mode of ['wallet', 'selected'] as const) {
+    it.each([
+      [{ code: -32000, message: 'result length 128064 exceeding limit 100000' }, 2],
+      [{ code: -32603, message: 'Internal error' }, 2],
+      [{ code: 3, message: 'execution reverted', data: '0xabcd' }, 1]
+    ] as const)(
+      `does not replay non-retryable failures during a ${mode} scan: %j`,
+      async (error, expectedPosts) => {
+        chainId = '0x1'
+        const endpoints = ['https://rpc-a.example/', 'https://rpc-b.example/']
+        writeCustomRpc('eth', endpoints)
+        const provider = await ensureHealthyReadProvider('eth', async () => chainId)
+        await provider.getBlockNumber()
+        requests.length = 0
+        multicallError = error
+        const wallet = '0x1111111111111111111111111111111111111111'
+        const vmus =
+          mode === 'wallet'
+            ? await readWalletVmus('eth', wallet, {
+                vmuCount: 400,
+                chainTimestampMs: 1_800_000_000_000
+              })
+            : await readVmuStates(
+                'eth',
+                wallet,
+                Array.from({ length: 400 }, (_, i) => i + 1),
+                { blockTag: 42 }
+              )
+        expect(vmus).toHaveLength(400)
+        expect(vmus.every((vmu) => !vmu.readOk && vmu.status === 'READ_ERROR')).toBe(true)
+        const posts = requests.filter(({ calls }) =>
+          calls.some(({ method }) => method === 'eth_call')
+        )
+        expect(posts.map(({ url }) => url)).toEqual(endpoints.slice(0, expectedPosts))
+        expect(posts.every(({ calls }) => calls.length <= 3)).toBe(true)
+      }
+    )
+  }
+
+  it.each([
+    ['eth', [400, 201], [3]],
+    ['polygon', [300, 300, 1], [3, 2]]
+  ] as const)(
+    'keeps a hot 601-VMU %s scan within the existing wire and multicall limits',
+    async (chain, sizes, postSizes) => {
+      chainId = `0x${CHAINS[chain].chainId.toString(16)}`
+      writeCustomRpc(chain, ['https://rpc.example/'])
+      const provider = await ensureHealthyReadProvider(chain, async () => chainId)
+      await provider.getBlockNumber()
+      requests.length = 0
+      const vmus = await readWalletVmus(chain, '0x1111111111111111111111111111111111111111', {
+        vmuCount: 601,
+        chainTimestampMs: 1_800_000_000_000
+      })
+      expect(vmus).toHaveLength(601)
+      expect(vmus.every((vmu) => vmu.readOk && vmu.status === 'CLAIMABLE')).toBe(true)
+      expect(vmus.map((vmu) => vmu.id)).toEqual(Array.from({ length: 601 }, (_, i) => i + 1))
+      expect(multicallSizes).toEqual(sizes)
+      expect(requests.map(({ calls }) => calls.length)).toEqual(postSizes)
+      expect(requests.map(({ calls }) => calls.map(({ method }) => method).sort())).toEqual(
+        postSizes.map((size) => ['eth_chainId', ...Array<string>(size - 1).fill('eth_call')].sort())
+      )
+      expect(new Set(requests.map(({ url }) => url))).toEqual(new Set(['https://rpc.example/']))
+    }
+  )
+
   it('preserves explicit RPC read errors instead of returning empty code or deleting nodes', async () => {
     chainId = '0x89'
     const urls = ['https://rpc0.example/', 'https://rpc1.example/']

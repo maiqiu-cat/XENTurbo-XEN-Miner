@@ -4,20 +4,23 @@ import {
   JsonRpcProvider,
   Network,
   assertArgument,
+  isHexString,
   makeError,
   type PerformActionRequest,
   type TransactionReceipt
 } from 'ethers'
 import { abortError, assertReadActive, ReadTimeoutError, withReadDeadline } from './readDeadline'
 import {
-  isRetryableRpcError,
+  isRpcReadCancelled,
   rpcFailureKind,
   rpcRetryAfterMs,
-  RpcReadInvalidatedError
+  RpcReadInvalidatedError,
+  RpcRateLimitError
 } from './rpcPolicy'
 
 const REQUEST_TIMEOUT_MS = 12_000
 const STALL_TIMEOUT_MS = 2_500
+const MAX_COOLDOWN_MS = 60_000
 const READ_METHODS = new Set([
   'eth_chainId',
   'eth_blockNumber',
@@ -35,6 +38,25 @@ const READ_METHODS = new Set([
   'eth_estimateGas',
   'eth_getLogs'
 ])
+
+async function readOnExpectedNetwork<T>(
+  provider: JsonRpcProvider,
+  read: () => Promise<T>,
+  signal: AbortSignal
+): Promise<T> {
+  // Start both together for batching, but a wrong-chain error must not define
+  // transaction semantics before the expected network has been validated.
+  const [, result] = await Promise.all([
+    provider.getNetwork(),
+    read().then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error })
+    )
+  ])
+  assertReadActive(signal)
+  if ('error' in result) throw result.error
+  return result.value
+}
 
 class EndpointProvider extends JsonRpcProvider {
   startupError: unknown
@@ -54,7 +76,7 @@ interface Endpoint {
   request: FetchRequest
   provider: EndpointProvider
   blockedUntil: number
-  lastError: unknown
+  blockedAt: number
 }
 
 class ReadEndpointPool {
@@ -76,7 +98,7 @@ class ReadEndpointPool {
       // Bounded application retries and confirmation polls own backoff, not the SDK.
       request.retryFunc = async () => false
       const provider = new EndpointProvider(request, network)
-      return { request, provider, blockedUntil: 0, lastError: null }
+      return { request, provider, blockedUntil: 0, blockedAt: 0 }
     })
   }
 
@@ -97,6 +119,13 @@ class ReadEndpointPool {
   private drainIfIdle(): void {
     if (this.retired && !this.destroyed && !this.active.size && !this.leases.size)
       this.onDrained?.()
+  }
+
+  refreshHealth(startedAt: number): void {
+    for (const endpoint of this.endpoints) {
+      if (endpoint.blockedAt <= startedAt) endpoint.blockedUntil = 0
+    }
+    this.preferred = 0
   }
 
   retain(): { signal: AbortSignal; release: () => void } {
@@ -131,7 +160,8 @@ class ReadEndpointPool {
       let next = 0
       let running = 0
       let lastError: unknown
-      let capacityError: unknown
+      let nonRetryableError: unknown
+      let skippedUntil = Infinity
       const stalls = new Set<ReturnType<typeof setTimeout>>()
       const finish = (result: () => void) => {
         if (settled) return
@@ -161,7 +191,7 @@ class ReadEndpointPool {
           const candidate = ordered[next++]
           const endpoint = this.endpoints[candidate]
           if (endpoint.blockedUntil > Date.now()) {
-            lastError = endpoint.lastError
+            skippedUntil = Math.min(skippedUntil, endpoint.blockedUntil)
             continue
           }
           index = candidate
@@ -170,7 +200,13 @@ class ReadEndpointPool {
         if (index === undefined) {
           if (!running)
             finish(() =>
-              reject(capacityError ?? lastError ?? new Error('RPC endpoints unavailable'))
+              reject(
+                nonRetryableError ??
+                  lastError ??
+                  (Number.isFinite(skippedUntil)
+                    ? new RpcRateLimitError(Math.max(0, skippedUntil - Date.now()))
+                    : new Error('RPC endpoints unavailable'))
+              )
             )
           return
         }
@@ -212,11 +248,11 @@ class ReadEndpointPool {
               const kind = rpcFailureKind(error)
               if (kind === 'permanent') return finish(() => reject(error))
               // Replaying the same oversized body cannot fix a capacity rejection.
-              if (kind === 'capacity') capacityError = error
+              if (kind === 'capacity' || kind === 'endpoint') nonRetryableError = error
               if (kind === 'rate-limit') {
                 const wait = rpcRetryAfterMs(error) ?? 1_000
-                endpoint.blockedUntil = Date.now() + wait
-                endpoint.lastError = error
+                endpoint.blockedAt = Date.now()
+                endpoint.blockedUntil = endpoint.blockedAt + Math.min(wait, MAX_COOLDOWN_MS)
               }
               launch()
             }
@@ -257,6 +293,11 @@ export class ReadRpcProvider extends AbstractProvider {
     )
   }
 
+  /** Clear temporary endpoint penalties only after a fresh successful health check. */
+  refreshHealth(startedAt: number): void {
+    this.pool.refreshHealth(startedAt)
+  }
+
   override _detectNetwork(): Promise<Network> {
     return this.pool.run((provider) => provider.getNetwork(), this.signal, false, this.lease)
   }
@@ -270,9 +311,17 @@ export class ReadRpcProvider extends AbstractProvider {
     return this.pool.run(
       async (provider, attempt) => {
         // Check the actual endpoint again, not just the pool's initial health result.
-        await provider.getNetwork()
         assertReadActive(attempt)
-        return provider._perform(req)
+        const result = await readOnExpectedNetwork(provider, () => provider._perform(req), attempt)
+        // Validate before promoting the endpoint; malformed receipts must also fail over.
+        if (req.method === 'getTransactionReceipt' && result !== null) {
+          try {
+            this._wrapTransactionReceipt(result, this.pool.network)
+          } catch {
+            throw makeError('Invalid RPC receipt response', 'BAD_DATA', { value: result })
+          }
+        }
+        return result
       },
       this.signal,
       true,
@@ -288,9 +337,8 @@ export class ReadRpcProvider extends AbstractProvider {
     }
     return this.pool.run(
       async (provider, attempt) => {
-        await provider.getNetwork()
         assertReadActive(attempt)
-        return provider.send(method, params)
+        return readOnExpectedNetwork(provider, () => provider.send(method, params), attempt)
       },
       this.signal,
       true,
@@ -303,6 +351,7 @@ export class ReadRpcProvider extends AbstractProvider {
     confirms = 1,
     timeout = 180_000
   ): Promise<TransactionReceipt | null> {
+    assertArgument(isHexString(hash, 32), 'invalid transaction hash', 'hash', hash)
     assertArgument(
       Number.isSafeInteger(confirms) && confirms >= 0,
       'invalid confirmations',
@@ -341,8 +390,10 @@ export class ReadRpcProvider extends AbstractProvider {
             return this._wrapTransactionReceipt(receipt, this.pool.network)
         } catch (error) {
           assertReadActive(signal)
-          if (!isRetryableRpcError(error)) throw error
-          delay = Math.max(delay, rpcRetryAfterMs(error) ?? 0)
+          if (isRpcReadCancelled(error)) throw error
+          // A read failure is not transaction evidence. Keep the bounded confirmation
+          // lease alive even if a node returns an unclassified receipt error.
+          delay = Math.max(delay, Math.min(rpcRetryAfterMs(error) ?? 0, MAX_COOLDOWN_MS))
         }
         let poll: ReturnType<typeof setTimeout> | undefined
         try {

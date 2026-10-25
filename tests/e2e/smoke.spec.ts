@@ -616,6 +616,35 @@ test('mobile Chrome is blocked by the PC Chrome guard', async ({ browser, baseUR
   await context.close()
 })
 
+test('the unsupported desktop guard keeps the language control centered in both languages', async ({
+  browser,
+  baseURL
+}) => {
+  const context = await browser.newContext({
+    baseURL,
+    viewport: { width: 1280, height: 900 },
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.0; rv:140.0) Gecko/20100101 Firefox/140.0'
+  })
+  try {
+    const page = await context.newPage()
+    await mockSameOriginRpc(page)
+    await page.goto('/')
+    const guard = page.getByRole('alertdialog')
+    await expect(guard).toBeVisible()
+    for (const language of ['en', 'zh-Hant']) {
+      await guard.getByTestId('language-selector').selectOption(language)
+      const panel = await guard.locator('.chrome-guard__panel').boundingBox()
+      const control = await guard.locator('.language-control').boundingBox()
+      expect(
+        Math.abs(control!.x + control!.width / 2 - panel!.x - panel!.width / 2)
+      ).toBeLessThanOrEqual(1)
+      await captureQaScreenshot(page, `desktop-guard-${language}`)
+    }
+  } finally {
+    await context.close()
+  }
+})
+
 test('wallet initialization, connect, account changes, and chain changes update the page', async ({
   page
 }) => {
@@ -1730,6 +1759,13 @@ test('a late wallet hash restores a broadcast lock after the UI timeout', async 
   expect(
     await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks') ?? '[]')[0])
   ).toMatchObject({ ids: [1], txHash: TX_HASH })
+  await expect(page.locator('.modal-body .err-text')).toHaveText(
+    'Transaction submitted, but confirmation could not be completed. Do not resend. Check wallet Activity and the explorer, then recheck pending operations.'
+  )
+  await page.getByTestId('language-selector').selectOption('zh-Hant')
+  await expect(page.locator('.modal-body .err-text')).toContainText('請勿重送')
+  await captureQaScreenshot(page, 'late-hash-do-not-resend-zh')
+  await page.getByTestId('language-selector').selectOption('en')
   await expect(page.getByText('No VMUs in this category.', { exact: true })).toBeVisible()
   expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
     sendAttempts: 1,
@@ -1891,15 +1927,100 @@ test.describe('Traditional Chinese interface', () => {
     // The injected wallet is a local fixture, not a real wallet or broadcast endpoint.
     await page.clock.fastForward(190_000)
     await expect(page.locator('.err-text')).toHaveText(
-      '確認逾時。交易可能仍待確認；請勿對相同的 VMU 重送交易。請稍後重新整理或檢查區塊瀏覽器。'
+      '確認逾時。交易可能仍待確認。請勿重送。請檢查錢包 Activity 與區塊瀏覽器，再重新檢查待確認交易。'
     )
     expect(await page.evaluate(() => localStorage.getItem('sm.vmuLocks'))).toContain(TX_HASH)
+    expect(
+      await page.evaluate(() =>
+        Object.keys(localStorage)
+          .filter((key) => key.startsWith('sm.pendingOps.event.'))
+          .map((key) => JSON.parse(localStorage.getItem(key)!).record)
+          .filter((record) => record?.txHash === `0x${'a'.repeat(64)}`)
+      )
+    ).toContainEqual(expect.objectContaining({ phase: 'broadcast', txHash: TX_HASH }))
     await page.getByTestId('language-selector').selectOption('en')
-    await expect(page.locator('.err-text')).toContainText('do not retry the same VMUs')
+    await expect(page.locator('.err-text')).toContainText('Do not resend')
     await page.getByTestId('language-selector').selectOption('zh-Hant')
     await captureQaScreenshot(page, 'confirmation-timeout-zh')
+    await page.getByRole('button', { name: '關閉交易對話框' }).click()
+    await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeDisabled()
     expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(1)
   })
+
+  for (const failure of ['health', 'receipt'] as const) {
+    test(`finishes a broadcast after background ${failure} failure without a resend`, async ({
+      page
+    }) => {
+      await page.clock.install()
+      await emulateDesktopGoogleChrome(page)
+      const state: RpcMockState = { operation: 'CLAIM', successfulTx: false }
+      await mockSameOriginRpc(page, state)
+      let failHealth = false
+      let failedProbes = 0
+      const receiptNodes: string[] = []
+      for (const endpoint of ETHEREUM_RPC_ROUTES) {
+        await page.route(endpoint, async (route) => {
+          const payload = route.request().postDataJSON()
+          const calls = (Array.isArray(payload) ? payload : [payload]) as Array<{
+            id: number
+            method: string
+            params: unknown[]
+          }>
+          if (failHealth && calls.every((call) => call.method === 'eth_chainId')) {
+            failedProbes += 1
+            return route.fulfill({ status: 503, body: 'Fixture health failure' })
+          }
+          const host = new URL(route.request().url()).hostname
+          if (calls.some((call) => call.method === 'eth_getTransactionReceipt')) {
+            receiptNodes.push(host)
+            if (failure === 'receipt' && host === 'ethereum.publicnode.com') {
+              const replies = calls.map(({ id, method, params }) =>
+                method === 'eth_getTransactionReceipt'
+                  ? { jsonrpc: '2.0', id, error: { code: -32000, message: 'header not found' } }
+                  : { jsonrpc: '2.0', id, result: rpcResult(method, 1, params, state) }
+              )
+              return route.fulfill({
+                contentType: 'application/json',
+                body: JSON.stringify(Array.isArray(payload) ? replies : replies[0])
+              })
+            }
+          }
+          return handleRpcRouteWithState(route, state)
+        })
+      }
+      await installInjectedWallet(page, { successfulSend: true })
+      await page.goto('/')
+      await page.getByRole('button', { name: '連接錢包' }).first().click()
+      await page.locator('tbody input[type="checkbox"]').first().check()
+      await page.getByRole('button', { name: '僅領取', exact: true }).click()
+      await expect(page.getByRole('button', { name: '開啟 MetaMask 並簽署' })).toBeVisible()
+      await page.evaluate(() => window.__walletMock.setMinedReceipt(false))
+      await page.getByRole('button', { name: '開啟 MetaMask 並簽署' }).click()
+      await expect(page.getByTestId('tx-log')).toContainText('正在等待鏈上確認交易')
+      await expect.poll(() => receiptNodes.length).toBeGreaterThan(0)
+      if (failure === 'health') {
+        failHealth = true
+        await page.clock.fastForward(35_000)
+        await expect.poll(() => failedProbes).toBeGreaterThanOrEqual(4)
+        await expect(page.locator('.modal-body .err-text')).toHaveCount(0)
+        await expect(page.getByText(/沒有可用的 Ethereum RPC 節點（0\/4）/)).toBeVisible()
+        await captureQaScreenshot(page, 'confirmation-health-unavailable-zh')
+        failHealth = false
+      } else {
+        await expect.poll(() => receiptNodes.includes('ethereum-rpc.publicnode.com')).toBe(true)
+      }
+      state.successfulTx = true
+      await page.evaluate(() => window.__walletMock.setMinedReceipt(true))
+      await page.clock.fastForward(5_000)
+      await expect(page.getByText('交易結果已驗證。', { exact: true })).toBeVisible()
+      await expect(page.locator('.outcome-text')).toContainText('完整結果已驗證：1/1 個 VMU')
+      expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+        sendAttempts: 1,
+        successfulBroadcasts: 1
+      })
+      await captureQaScreenshot(page, `confirmation-${failure}-recovered-zh`)
+    })
+  }
 
   for (const [chain, chainId, gateway, endpoints] of [
     ['eth', '0x1', 'https://mainnet.gateway.tenderly.co', ETHEREUM_RPC_ROUTES],
@@ -2277,6 +2398,10 @@ test.describe('Traditional Chinese interface', () => {
       await guard.getByTestId('language-selector').selectOption('zh-Hant')
       await expect(guard).toContainText('不支援行動裝置瀏覽器')
       const bounds = await guard.locator('.chrome-guard__panel').boundingBox()
+      const control = await guard.locator('.language-control').boundingBox()
+      expect(
+        Math.abs(control!.x + control!.width / 2 - bounds!.x - bounds!.width / 2)
+      ).toBeLessThanOrEqual(1)
       expect(bounds!.x).toBeGreaterThanOrEqual(0)
       expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(390)
       expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390)

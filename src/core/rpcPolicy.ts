@@ -7,27 +7,48 @@ function record(value: unknown): ErrorRecord | undefined {
 }
 
 export class RpcReadInvalidatedError extends Error {
+  readonly code = 'RPC_READ_INVALIDATED'
+
   constructor() {
     super('RPC configuration changed. Start a new read with the current settings.')
     this.name = 'RpcReadInvalidatedError'
   }
 }
 
-export type RpcFailureKind = 'rate-limit' | 'transient' | 'capacity' | 'permanent'
+export class RpcRateLimitError extends Error {
+  readonly code = 'RPC_RATE_LIMITED'
+
+  constructor(readonly retryAfterMs: number) {
+    super(
+      `RPC endpoints are rate-limited. Retry in ${Math.ceil(retryAfterMs / 1_000)}s. Your RPC list was preserved.`
+    )
+    this.name = 'RpcRateLimitError'
+  }
+}
+
+export function isRpcReadCancelled(error: unknown): boolean {
+  const value = record(error)
+  return (
+    error instanceof RpcReadInvalidatedError ||
+    value?.code === 'RPC_READ_INVALIDATED' ||
+    value?.name === 'AbortError' ||
+    value?.code === 'CANCELLED'
+  )
+}
+
+// Endpoint failures may fail over once, but only transient/rate-limit failures may replay.
+export type RpcFailureKind = 'rate-limit' | 'transient' | 'capacity' | 'endpoint' | 'permanent'
 
 /** Inspect the original RPC error, not CALL_EXCEPTION's generated "missing revert data" text. */
 export function rpcFailureKind(error: unknown): RpcFailureKind {
   const value = record(error)
-  if (
-    error instanceof RpcReadInvalidatedError ||
-    value?.name === 'AbortError' ||
-    value?.code === 'CANCELLED'
-  ) {
-    return 'permanent'
-  }
+  if (isRpcReadCancelled(error)) return 'permanent'
   if (error instanceof ReadTimeoutError) return 'transient'
 
-  const rpc = record(record(value?.info)?.error) ?? record(value?.error)
+  const rpc =
+    record(record(value?.info)?.error) ??
+    record(value?.error) ??
+    (typeof value?.code === 'number' ? value : undefined)
   const message = typeof rpc?.message === 'string' ? rpc.message : ''
   const outer = [value?.message, value?.shortMessage, value?.code]
     .filter((part): part is string => typeof part === 'string')
@@ -36,15 +57,19 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
   if (
     data.some((part) => typeof part === 'string' && /^0x[0-9a-f]+$/i.test(part)) ||
     /execution reverted|\brevert(?:ed)?\b/i.test(message) ||
-    /INVALID_ARGUMENT|invalid (?:argument|params?)|insufficient funds|user (?:rejected|denied)|ACTION_REJECTED|network changed|NONCE_EXPIRED/i.test(
+    /INVALID_ARGUMENT|invalid (?:argument|params?)|insufficient funds|user (?:rejected|denied)|ACTION_REJECTED|NONCE_EXPIRED|execution reverted/i.test(
       outer
     ) ||
+    rpc?.code === -32600 ||
     rpc?.code === -32602 ||
     (value?.code === 'CALL_EXCEPTION' && typeof value.reason === 'string' && value.reason !== '')
   ) {
     return 'permanent'
   }
+  const response = record(value?.response)
+  const status = Number(response?.statusCode ?? value?.status)
   if (
+    status === 413 ||
     /(?:result|response|returndata|payload|batch|query|logs?).{0,100}(?:exceed|limit|maximum|too (?:large|big|many)|more than)|(?:limit|maximum).{0,60}(?:bytes|items|results|response|payload|batch)/i.test(
       message
     )
@@ -52,23 +77,30 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
     return 'capacity'
   }
 
-  const response = record(value?.response)
-  const status = Number(response?.statusCode ?? value?.status)
   const diagnostic = rpc ? message : outer || String(error)
-  if (status === 429 || /too many requests|rate[ -]?limit|throttl/i.test(diagnostic)) {
+  if (
+    value?.code === 'RPC_RATE_LIMITED' ||
+    status === 429 ||
+    rpc?.code === -32005 ||
+    rpc?.code === -32007 ||
+    rpc?.code === 429 ||
+    /too many requests|rate[ -]?limit|throttl|request rate|rate exceeded|quota|capacity|requests? limit|limit(?:ed)? reached/i.test(
+      diagnostic
+    )
+  ) {
     return 'rate-limit'
   }
   if (
     status === 408 ||
     (status >= 500 && status <= 599) ||
-    /temporar(?:y|ily)|unavailable|overloaded|server busy|\btimeout\b|\btimed out\b|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENETUNREACH|failed to fetch|network error|network request failed|offline/i.test(
+    /temporar(?:y|ily)|unavailable|overloaded|server busy|header not found|unknown block|block not found|missing trie node|state (?:is )?not available|\btimeout\b|\btimed out\b|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENETUNREACH|failed to fetch|network error|network request failed|offline/i.test(
       diagnostic
     ) ||
     value?.code === 'TIMEOUT'
   ) {
     return 'transient'
   }
-  return 'permanent'
+  return 'endpoint'
 }
 
 export function isRetryableRpcError(error: unknown): boolean {

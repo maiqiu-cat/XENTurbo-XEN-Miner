@@ -6,6 +6,7 @@ import { XENCryptoABI } from '@/abis/XENCryptoABI'
 import { Multicall3ABI } from '@/abis/Multicall3ABI'
 import { computeProxyAddress, computeProxyAddressRange, minimalProxyRuntimeCode } from './create2'
 import { getReadProvider, withRetry } from './rpc'
+import { isRetryableRpcError } from './rpcPolicy'
 import type { Vmu, VmuStatus } from './types'
 import { mapWithConcurrency } from '@/utils/concurrency'
 
@@ -215,7 +216,8 @@ async function readVmuIds(
   ids: number[],
   chainTimestampMs: number,
   signal?: AbortSignal,
-  blockTag?: number
+  blockTag?: number,
+  nonRetryableIds?: Set<number>
 ): Promise<Vmu[]> {
   if (!ids.length) return []
   const provider = getReadProvider(chain)
@@ -250,8 +252,11 @@ async function readVmuIds(
       slice.forEach((proxy, index) => {
         vmus.push(decodeUserMint(proxy.id, proxy.address, results[index], chainTimestampMs))
       })
-    } catch {
+    } catch (error) {
       throwIfAborted(signal)
+      if (!isRetryableRpcError(error)) {
+        for (const proxy of slice) nonRetryableIds?.add(proxy.id)
+      }
       slice.forEach((proxy) => vmus.push(emptyVmu(proxy.id, proxy.address, false)))
     }
   }
@@ -296,6 +301,7 @@ export async function readWalletVmus(
   }))
 
   let loaded = 0
+  const nonRetryableIds = new Set<number>()
   const vmuBatches = await mapWithConcurrency(batches, BATCH_CONCURRENCY, async (batch) => {
     throwIfAborted(opts.signal)
     const slice = computeProxyAddressRange({
@@ -325,8 +331,11 @@ export async function readWalletVmus(
       }[]
       throwIfAborted(opts.signal)
       decoded = slice.map((p, i) => decodeUserMint(p.id, p.address, results[i], chainTimestampMs))
-    } catch {
+    } catch (error) {
       throwIfAborted(opts.signal)
+      if (!isRetryableRpcError(error)) {
+        for (const proxy of slice) nonRetryableIds.add(proxy.id)
+      }
       decoded = slice.map((proxy) => emptyVmu(proxy.id, proxy.address, false))
     }
     loaded += slice.length
@@ -337,8 +346,8 @@ export async function readWalletVmus(
   throwIfAborted(opts.signal)
   const vmus = vmuBatches.flat()
 
-  // Retry failed reads once in bounded batches so transient RPC blips don't stick.
-  const failedIds = vmus.filter((v) => !v.readOk).map((v) => v.id)
+  // Retry entry-level misses and transient reads, never replay semantic/endpoint failures.
+  const failedIds = vmus.filter((v) => !v.readOk && !nonRetryableIds.has(v.id)).map((v) => v.id)
   if (failedIds.length) {
     try {
       throwIfAborted(opts.signal)
@@ -382,15 +391,19 @@ export async function readVmuStates(
   if (ids.length > MAX_WALLET_VMU_COUNT || ids.some((id) => !Number.isSafeInteger(id) || id <= 0))
     throw new Error('Invalid VMU ids for bounded read')
   const chainTimestampMs = await readChainTimestamp(chain, context)
+  const nonRetryableIds = new Set<number>()
   const list = await readVmuIds(
     chain,
     wallet,
     ids,
     chainTimestampMs,
     context.signal,
-    context.blockTag
+    context.blockTag,
+    nonRetryableIds
   )
-  const failedIds = list.filter((vmu) => !vmu.readOk).map((vmu) => vmu.id)
+  const failedIds = list
+    .filter((vmu) => !vmu.readOk && !nonRetryableIds.has(vmu.id))
+    .map((vmu) => vmu.id)
   if (failedIds.length) {
     try {
       const retried = await readVmuIds(

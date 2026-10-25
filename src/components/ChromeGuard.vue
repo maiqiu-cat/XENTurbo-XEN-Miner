@@ -84,4 +84,7 @@ onMounted(() => {
 .chrome-guard__language {
   margin-top: 18px;
 }
+.chrome-guard__language :deep(.language-control) {
+  margin-inline: auto;
+}
 </style>
