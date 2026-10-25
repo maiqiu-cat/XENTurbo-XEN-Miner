@@ -67,6 +67,24 @@ describe('Traditional Chinese safety instructions', () => {
     expect(i18n.message(source)).toBe(source)
   })
 
+  it('translates an unknown rate-limit wait without guessing a duration or leaking the cause', () => {
+    const error = new RpcRateLimitError(undefined, {
+      cause: Object.assign(new Error('missing revert data'), {
+        info: { error: { code: -32005, message: 'project ID request rate exceeded' } }
+      })
+    })
+    const source = normalizeError(error)
+    expect(source).toBe(
+      'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
+    )
+    expect(error.retryAfterMs).toBeUndefined()
+    const i18n = translator()
+    expect(i18n.message(source)).toBe('RPC 節點受到限流。請稍候再重試。RPC 清單已保留。')
+    i18n.setPreference('en')
+    expect(i18n.message(source)).toBe(source)
+    expect(source).not.toMatch(/missing revert data|CALL_EXCEPTION|32005|\d/)
+  })
+
   it('explains an invalidated read without claiming a transaction was submitted', () => {
     const source = normalizeError(new RpcReadInvalidatedError())
     expect(source).toBe(

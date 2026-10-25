@@ -817,7 +817,12 @@ describe('one retry layer and structured errors', () => {
       jitterRatio: 0
     }).catch((error: unknown) => error)
     await vi.advanceTimersByTimeAsync(5_000)
-    expect(await result).toMatchObject({ code: 'SERVER_ERROR' })
+    expect(await result).toMatchObject({
+      code: 'RPC_RATE_LIMITED',
+      retryAfterMs: 1_000,
+      message: 'RPC endpoints are rate-limited. Retry in 1s. Your RPC list was preserved.',
+      cause: { code: 'SERVER_ERROR', response: { statusCode: 429 } }
+    })
     expect(readRequests('eth_call')).toHaveLength(4)
     expect(sleep.mock.calls).toEqual([[1_000], [1_000], [1_600]])
   })
@@ -881,7 +886,7 @@ describe('one retry layer and structured errors', () => {
     expect(vi.getTimerCount()).toBe(0)
   })
 
-  it('does not burn a zero-request retry when 429 has no Retry-After', async () => {
+  it('reports exhausted 429 without inventing a wait or burning a zero-request retry', async () => {
     const provider = await ready(1)
     failures.set(urls[0], { status: 429 })
     const sleep = vi.fn(
@@ -895,9 +900,35 @@ describe('one retry layer and structured errors', () => {
       }
     ).catch((error: unknown) => error)
     await vi.advanceTimersByTimeAsync(5_000)
-    expect(await result).toMatchObject({ code: 'SERVER_ERROR' })
+    expect(await result).toMatchObject({
+      code: 'RPC_RATE_LIMITED',
+      message:
+        'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.',
+      cause: { code: 'SERVER_ERROR', response: { statusCode: 429 } }
+    })
+    expect(rpcRetryAfterMs(await result)).toBeNull()
     expect(readRequests('eth_call')).toHaveLength(4)
     expect(sleep.mock.calls).toEqual([[1_000], [1_000], [1_600]])
+  })
+
+  it('normalizes an exhausted -32005 eth_call without exposing the generated revert diagnostic', async () => {
+    const provider = await ready(2)
+    const rpcError = { code: -32005, message: 'project ID request rate exceeded' }
+    for (const url of urls.slice(0, 2)) failures.set(url, { error: rpcError })
+    const result = withRetry((signal) =>
+      new Contract(address, Multicall3ABI, provider.withSignal(signal)).aggregate3(calls)
+    ).catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(await result).toMatchObject({
+      code: 'RPC_RATE_LIMITED',
+      message:
+        'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.',
+      cause: { code: 'CALL_EXCEPTION', info: { error: rpcError } }
+    })
+    expect(rpcRetryAfterMs(await result)).toBeNull()
+    for (const url of urls.slice(0, 2))
+      expect(readRequests('eth_call').filter((request) => request.url === url)).toHaveLength(4)
+    expect(readCustomRpc('eth')).toEqual(urls.slice(0, 2))
   })
 
   it('reports current cooldown without stale errors and caps it at sixty seconds', async () => {

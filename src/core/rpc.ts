@@ -494,5 +494,9 @@ export async function withRetry<T>(
       controller.abort()
     }
   }
+  // Normalize only the exhausted rate limit; semantic failures and cancellation keep their identity.
+  if (!(lastErr instanceof RpcRateLimitError) && rpcFailureKind(lastErr) === 'rate-limit') {
+    throw new RpcRateLimitError(rpcRetryAfterMs(lastErr) ?? undefined, { cause: lastErr })
+  }
   throw lastErr
 }
