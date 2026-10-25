@@ -1240,6 +1240,10 @@ export function normalizeError(
   const hasRpcErrorDetails =
     typeof err?.response?.statusCode === 'number' ||
     (err?.info?.error !== null && typeof err?.info?.error === 'object') ||
+    (err?.code === 'UNKNOWN_ERROR' &&
+      typeof err?.error?.code === 'number' &&
+      typeof err?.error?.message === 'string' &&
+      typeof err?.payload?.method === 'string') ||
     err?.code === 'SERVER_ERROR'
   if (hasRpcErrorDetails && rpcFailureKind(err) === 'rate-limit')
     return new RpcRateLimitError(rpcRetryAfterMs(err) ?? undefined).message

@@ -959,6 +959,31 @@ describe('one retry layer and structured errors', () => {
     }
   )
 
+  it.each(['eth_getTransactionCount', 'eth_getBlockByNumber'])(
+    'normalizes a direct %s rate limit from the ethers top-level error shape',
+    async (method) => {
+      const provider = await ready(2)
+      const rpcError = { code: -32005, message: 'project ID request rate exceeded' }
+      for (const url of urls.slice(0, 2)) failures.set(url, { error: rpcError })
+      const result = (
+        method === 'eth_getTransactionCount'
+          ? provider.getTransactionCount(address, 'pending')
+          : provider.getBlock('latest')
+      ).catch((error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(200)
+      const error = await result
+      expect(error).toMatchObject({
+        code: 'UNKNOWN_ERROR',
+        error: rpcError,
+        payload: { method }
+      })
+      expect(normalizeError(error)).toBe(
+        'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
+      )
+      expect(readRequests(method).map(({ url }) => url)).toEqual(urls.slice(0, 2))
+    }
+  )
+
   it('normalizes an exhausted -32005 eth_call without exposing the generated revert diagnostic', async () => {
     const provider = await ready(2)
     const rpcError = { code: -32005, message: 'project ID request rate exceeded' }
