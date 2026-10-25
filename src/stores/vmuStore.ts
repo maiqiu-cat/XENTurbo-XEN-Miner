@@ -422,7 +422,7 @@ export const useVmuStore = defineStore('vmu', {
             const value = updates.get(vmu.id) ?? vmu
             return value.readOk
               ? { ...value, status: classifyVmuStatus(value.rank, value.maturityTs, timestamp) }
-              : value
+              : { ...value }
           })
           for (const id of newIds) vmus.push(updates.get(id)!)
           this.vmus = vmus

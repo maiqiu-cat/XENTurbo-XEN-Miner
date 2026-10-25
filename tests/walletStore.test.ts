@@ -49,7 +49,12 @@ describe('wallet store request invalidation', () => {
     walletApi.switchToChain.mockResolvedValue(undefined)
     walletApi.currentAccount.mockReturnValue({})
     rpc.getCode.mockResolvedValue('0x')
-    rpc.ensureHealthyReadProvider.mockResolvedValue({ getCode: rpc.getCode })
+    rpc.ensureHealthyReadProvider.mockResolvedValue({
+      getCode: rpc.getCode,
+      withSignal() {
+        return this
+      }
+    })
     stateListener = undefined
     walletApi.onAccountChange.mockImplementation((listener) => {
       stateListener = listener
@@ -191,7 +196,12 @@ describe('wallet store request invalidation', () => {
     'rechecks a replacement RPC without applying a late old-provider %s',
     async (outcome) => {
       const oldDetection = deferred<string>()
-      const replacement = { getCode: vi.fn().mockResolvedValue('0x') }
+      const replacement = {
+        getCode: vi.fn().mockResolvedValue('0x'),
+        withSignal() {
+          return this
+        }
+      }
       rpc.getCode.mockReturnValueOnce(oldDetection.promise)
       const store = useWalletStore()
       const first = store.applyAccount(walletA, 1)

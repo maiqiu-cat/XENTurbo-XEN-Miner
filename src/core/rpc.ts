@@ -1,4 +1,4 @@
-import { JsonRpcProvider, FallbackProvider, FetchRequest, Network } from 'ethers'
+import { Network } from 'ethers'
 import {
   CHAINS,
   getRpcUrls,
@@ -10,8 +10,11 @@ import {
 import { CONTRACTS } from '@/config/contracts'
 import { ReadTimeoutError, withReadDeadline } from './readDeadline'
 import { mapWithConcurrency } from '@/utils/concurrency'
+import { ReadRpcProvider } from './rpcProvider'
+import { isRetryableRpcError, rpcRetryAfterMs } from './rpcPolicy'
 
-export type ReadProvider = JsonRpcProvider | FallbackProvider
+export { isRetryableRpcError } from './rpcPolicy'
+export type ReadProvider = ReadRpcProvider
 
 export class RpcConfigurationError extends Error {
   constructor(chain: ChainKey, reason: string) {
@@ -50,6 +53,7 @@ export type RpcHealthListener = (chain: ChainKey, state: RpcHealthState) => void
 // A provider is published only after every configured endpoint has been
 // probed. The provider itself contains only endpoints that passed that probe.
 const providerCache = new Map<ChainKey, ReadProvider>()
+const drainingProviders = new Map<ChainKey, Set<ReadProvider>>()
 const providerSignatures = new Map<ChainKey, string>()
 const providerGenerations = new Map<ChainKey, number>()
 const healthStates = new Map<ChainKey, RpcHealthState>()
@@ -58,13 +62,27 @@ const healthFlights = new Map<ChainKey, { generation: number; promise: Promise<R
 
 const RPC_HEALTH_TIMEOUT_MS = 2_500
 
-function evictProvider(chain: ChainKey): ReadProvider | undefined {
+function evictProvider(chain: ChainKey, drain = false): ReadProvider | undefined {
   const provider = providerCache.get(chain)
   providerCache.delete(chain)
   providerSignatures.delete(chain)
+  if (!drain) {
+    const draining = drainingProviders.get(chain)
+    drainingProviders.delete(chain)
+    for (const previous of draining ?? []) previous.destroy()
+  }
   if (provider) {
     try {
-      provider.destroy()
+      if (drain) {
+        const draining = drainingProviders.get(chain) ?? new Set<ReadProvider>()
+        draining.add(provider)
+        drainingProviders.set(chain, draining)
+        provider.retire(() => {
+          draining.delete(provider)
+          if (!draining.size && drainingProviders.get(chain) === draining)
+            drainingProviders.delete(chain)
+        })
+      } else provider.destroy()
     } catch {
       // Cache invalidation must succeed even if provider cleanup fails.
     }
@@ -115,28 +133,12 @@ export function onRpcHealthChange(listener: RpcHealthListener): () => void {
 }
 
 function buildReadProvider(key: ChainKey, urls: string[]): ReadProvider {
-  const network = Network.from(CHAINS[key].chainId)
-  const endpoint = (url: string) => {
-    const request = new FetchRequest(url)
-    request.timeout = 12_000
-    // Public endpoints such as dRPC limit a JSON-RPC batch to three items.
-    // This transport limit is separate from the calls inside a Multicall eth_call.
-    return new JsonRpcProvider(request, network, { batchMaxCount: 3 })
-  }
-  if (urls.length === 1) return endpoint(urls[0])
-
-  const configs = urls.map((url, index) => ({
-    provider: endpoint(url),
-    priority: index + 1,
-    stallTimeout: 2500,
-    weight: 1
-  }))
-  return new FallbackProvider(configs, network, { quorum: 1 })
+  return new ReadRpcProvider(Network.from(CHAINS[key].chainId), urls)
 }
 
-export function getReadProvider(key: ChainKey): ReadProvider {
+export function getReadProvider(key: ChainKey, signal?: AbortSignal): ReadProvider {
   const cached = providerCache.get(key)
-  if (cached) return cached
+  if (cached) return signal ? cached.withSignal(signal) : cached
   throw new Error(
     `RPC_NOT_VALIDATED: ${CHAINS[key].name} RPC endpoints must pass a health check before use.`
   )
@@ -345,7 +347,7 @@ export function ensureHealthyReadProvider(
     const signature = healthyUrls.join('\n')
     let provider = providerCache.get(key)
     if (!provider || providerSignatures.get(key) !== signature) {
-      if (provider) evictProvider(key)
+      if (provider) evictProvider(key, true)
       provider = buildReadProvider(key, healthyUrls)
       providerCache.set(key, provider)
       providerSignatures.set(key, signature)
@@ -400,50 +402,6 @@ export function ensureRecentReadProvider(
   return ensureHealthyReadProvider(key, request)
 }
 
-interface RetryErrorLike {
-  code?: unknown
-  status?: unknown
-  message?: unknown
-  shortMessage?: unknown
-  retryAfterMs?: unknown
-  info?: unknown
-}
-
-function retryErrorText(error: unknown): string {
-  if (!error || typeof error !== 'object') return String(error)
-  const value = error as RetryErrorLike
-  return [value.code, value.status, value.message, value.shortMessage, value.info]
-    .map((part) => {
-      try {
-        return typeof part === 'string' ? part : JSON.stringify(part)
-      } catch {
-        return String(part)
-      }
-    })
-    .join(' ')
-}
-
-export function isRetryableRpcError(error: unknown): boolean {
-  if (error && typeof error === 'object' && (error as { name?: string }).name === 'AbortError') {
-    return false
-  }
-  const text = retryErrorText(error)
-  if (
-    /CALL_EXCEPTION|execution reverted|\brevert(?:ed)?\b|INVALID_ARGUMENT|invalid (?:argument|params?)|insufficient funds|user (?:rejected|denied)|ACTION_REJECTED/i.test(
-      text
-    )
-  ) {
-    return false
-  }
-  return true
-}
-
-function retryAfterMs(error: unknown): number | null {
-  if (!error || typeof error !== 'object') return null
-  const value = Number((error as RetryErrorLike).retryAfterMs)
-  return Number.isFinite(value) && value >= 0 ? value : null
-}
-
 function abortReason(signal: AbortSignal): unknown {
   return signal.reason ?? new DOMException('The RPC operation was aborted', 'AbortError')
 }
@@ -467,7 +425,7 @@ function retryDelay(ms: number, signal?: AbortSignal): Promise<void> {
 
 /** Retry transient RPC failures with bounded exponential backoff and jitter. */
 export async function withRetry<T>(
-  fn: () => Promise<T>,
+  fn: (signal: AbortSignal) => Promise<T>,
   opts: {
     retries?: number
     baseDelayMs?: number
@@ -490,24 +448,37 @@ export async function withRetry<T>(
   const deadline = Date.now() + (opts.totalTimeoutMs ?? 30_000)
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (opts.signal?.aborted) throw abortReason(opts.signal)
+    const controller = new AbortController()
+    const signal = opts.signal
+      ? AbortSignal.any([opts.signal, controller.signal])
+      : controller.signal
     try {
       const remaining = deadline - Date.now()
       if (remaining <= 0)
         throw new ReadTimeoutError('RPC retry deadline', opts.totalTimeoutMs ?? 30_000)
-      return await withReadDeadline(fn, 'RPC read', {
+      return await withReadDeadline(() => fn(signal), 'RPC read', {
         timeoutMs: Math.min(opts.timeoutMs ?? 12_000, remaining),
-        signal: opts.signal
+        signal
       })
     } catch (err) {
+      controller.abort()
       lastErr = err
       if (attempt === retries || !isRetryableRpcError(err)) break
       if (Date.now() >= deadline) break
       const exponential = Math.min(maxDelay, base * 2 ** attempt)
-      const serverDelay = retryAfterMs(err)
-      const nominal = serverDelay === null ? exponential : Math.min(maxDelay, serverDelay)
+      const serverDelay = rpcRetryAfterMs(err)
       const jitter = 1 - jitterRatio + random() * jitterRatio * 2
-      await sleep(Math.max(0, Math.round(nominal * jitter)))
+      const delay = Math.max(serverDelay ?? 0, Math.round(exponential * jitter))
+      const remaining = deadline - Date.now()
+      await withReadDeadline(() => sleep(Math.min(delay, remaining)), 'RPC retry deadline', {
+        timeoutMs: remaining,
+        signal: opts.signal
+      })
       if (opts.signal?.aborted) throw abortReason(opts.signal)
+      if (delay >= remaining)
+        throw new ReadTimeoutError('RPC retry deadline', opts.totalTimeoutMs ?? 30_000)
+    } finally {
+      controller.abort()
     }
   }
   throw lastErr

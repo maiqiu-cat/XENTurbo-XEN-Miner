@@ -82,7 +82,12 @@ describe('operation postconditions', () => {
   it.each([null, { hash: `0x${'c'.repeat(64)}`, number: 42, timestamp }])(
     'does not classify a lagging or reorganized receipt block as partial success',
     async (block) => {
-      rpcHealth.getReadProvider.mockReturnValue({ getBlock: vi.fn(async () => block) })
+      rpcHealth.getReadProvider.mockReturnValue({
+        getBlock: vi.fn(async () => block),
+        withSignal() {
+          return this
+        }
+      })
       const readStatuses = vi.fn()
       const result = await verifyOperationOutcome(operation({ op: 'CLAIM', ids: [1], receipt }), {
         readStatuses
@@ -99,6 +104,9 @@ describe('operation postconditions', () => {
     { term: 10, rank: 200, maturityTs: (timestamp + 9 * 86_400) * 1000, expected: 'partial' }
   ])('checks the new remint term, rank and maturity at the receipt block', async (mint) => {
     rpcHealth.getReadProvider.mockReturnValue({
+      withSignal() {
+        return this
+      },
       getBlock: vi.fn(async () => ({ hash: blockHash, number: 42, timestamp }))
     })
     const readStatuses = vi.fn(async () => new Map([[1, 'MINTING' as const]]))

@@ -292,6 +292,35 @@ describe('vmu store request invalidation', () => {
     }
   )
 
+  it('persists a plain DTO when a targeted refresh leaves an unreadable reactive row untouched', async () => {
+    const store = useVmuStore()
+    const damaged = { ...mintingVmu(2), status: 'READ_ERROR' as const, readOk: false }
+    store.$patch({
+      chain: 'eth',
+      wallet: walletA,
+      vmus: [mintingVmu(1), damaged],
+      vmuCount: 2,
+      syncedAt: Date.now()
+    })
+    chainReader.readVmuCount.mockResolvedValue(2)
+    chainReader.readVmuStates.mockResolvedValue([
+      { ...mintingVmu(1), status: 'EMPTY', rank: 0, maturityTs: 0 }
+    ])
+    let cloned: unknown
+    snapshots.saveSnapshot.mockImplementation(async (snapshot) => {
+      cloned = structuredClone(snapshot)
+    })
+    await store.refreshAffected([1])
+    expect(snapshots.saveSnapshot).toHaveBeenCalledOnce()
+    expect(cloned).toMatchObject({
+      vmus: [expect.objectContaining({ id: 1, status: 'EMPTY' }), damaged]
+    })
+    expect(store.vmus[1]).toEqual(damaged)
+    expect(store.readErrors).toBe(1)
+    expect(chainReader.readWalletVmus).not.toHaveBeenCalled()
+    store.detach()
+  })
+
   it('falls back to a full scan when an external transaction changes the inventory', async () => {
     const store = useVmuStore()
     store.$patch({

@@ -38,6 +38,8 @@ function createStorage(): Storage {
 }
 
 beforeEach(() => {
+  vi.stubEnv('VITE_RPC_ETH', '')
+  vi.stubEnv('VITE_RPC_POLYGON', '')
   vi.stubGlobal('localStorage', createStorage())
   resetProviders()
 })
@@ -130,6 +132,7 @@ describe('RPC retry policy', () => {
 })
 
 afterEach(() => {
+  vi.unstubAllEnvs()
   resetProviders()
   vi.useRealTimers()
   vi.unstubAllGlobals()

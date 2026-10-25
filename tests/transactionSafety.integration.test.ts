@@ -68,6 +68,9 @@ async function installOfflineHarness(storageFailure?: 'QuotaExceededError' | 'Se
   // Only chain-read boundaries and browser facilities are replaced. The real
   // prepare/send, writeFactory, wallet gas validation, pending journal and VMU locks are retained.
   const readProvider = {
+    withSignal() {
+      return this
+    },
     getTransactionCount: vi.fn(async () => NONCE),
     estimateGas: vi.fn(async () => 100_000n),
     getBlock: vi.fn(async () => ({ gasLimit: 30_000_000n })),

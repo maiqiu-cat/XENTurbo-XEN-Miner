@@ -13,6 +13,7 @@ const originalTransport = new FetchRequest('https://rpc.example/').getUrlFunc
 const requests: Array<{ url: string; calls: RpcRequest[] }> = []
 let chainId = '0x1'
 const unavailableUrls = new Set<string>()
+const unavailableAddresses = new Set<string>()
 
 beforeEach(() => {
   const storage = new Map<string, string>()
@@ -23,6 +24,7 @@ beforeEach(() => {
   resetProviders()
   requests.length = 0
   unavailableUrls.clear()
+  unavailableAddresses.clear()
   // Intercept only the HTTP boundary; keep ethers serialization, batching and ID matching real.
   FetchRequest.registerGetUrl(async (request) => {
     if (!request.body) throw new Error('Missing JSON-RPC request body')
@@ -37,7 +39,10 @@ beforeEach(() => {
           error: { code: 31, message: 'Batch of more than 3 requests are not allowed' }
         }
       }
-      if (method === 'eth_getCode' && unavailableUrls.has(request.url)) {
+      if (
+        method === 'eth_getCode' &&
+        (unavailableUrls.has(request.url) || unavailableAddresses.has(String(params[0])))
+      ) {
         return { jsonrpc: '2.0', id, error: { code: -32000, message: 'temporary read failure' } }
       }
       let result: string
@@ -70,7 +75,7 @@ describe('public RPC wire batch compatibility', () => {
     const urls = ['https://rpc0.example/', 'https://rpc1.example/']
     writeCustomRpc('polygon', urls)
     const provider = await ensureHealthyReadProvider('polygon', async () => chainId)
-    unavailableUrls.add(urls[0])
+    urls.forEach((url) => unavailableUrls.add(url))
     await expect(
       provider.getCode('0x0000000000000000000000000000000000000001', 42)
     ).rejects.toMatchObject({
@@ -117,13 +122,39 @@ describe('public RPC wire batch compatibility', () => {
       expect(requests.length).toBeGreaterThan(0)
       expect(requests.every(({ calls }) => calls.length >= 1 && calls.length <= 3)).toBe(true)
       expect(requests.some(({ calls }) => calls.length === 3)).toBe(true)
-      expect(new Set(requests.map(({ url }) => url))).toEqual(new Set(urls))
+      expect(new Set(requests.map(({ url }) => url))).toEqual(new Set([urls[0]]))
       const codeCalls = requests
         .flatMap(({ calls }) => calls)
         .filter(({ method }) => method === 'eth_getCode')
-      expect(codeCalls.length).toBeGreaterThanOrEqual(32)
+      expect(codeCalls).toHaveLength(32)
       expect(codeCalls.every(({ params }) => params[1] === '0x2a')).toBe(true)
       expect(readCustomRpc(chain)).toEqual(urls)
     }
   )
+
+  it('isolates a failed item from successful siblings in the same reversed batch', async () => {
+    chainId = '0x89'
+    writeCustomRpc('polygon', ['https://rpc.example/'])
+    const provider = await ensureHealthyReadProvider('polygon', async () => chainId)
+    await provider.getBlockNumber()
+    requests.length = 0
+    const addresses = [1, 2, 3].map((id) => `0x${id.toString(16).padStart(40, '0')}`)
+    unavailableAddresses.add(addresses[1])
+    const results = await Promise.allSettled(
+      addresses.map((address) => provider.getCode(address, 42))
+    )
+    expect(results).toEqual([
+      { status: 'fulfilled', value: '0x6001' },
+      { status: 'rejected', reason: expect.objectContaining({ code: 'UNKNOWN_ERROR' }) },
+      { status: 'fulfilled', value: '0x6003' }
+    ])
+    expect(
+      requests.some(
+        ({ calls }) =>
+          calls.some(({ params }) => params[0] === addresses[0]) &&
+          calls.some(({ params }) => params[0] === addresses[1])
+      )
+    ).toBe(true)
+    expect(requests.every(({ calls }) => calls.length <= 3)).toBe(true)
+  })
 })

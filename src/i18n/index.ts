@@ -24,7 +24,8 @@ const numericParameters = new Set([
   'pages',
   'matched',
   'expected',
-  'actual'
+  'actual',
+  'milliseconds'
 ])
 
 export function browserLocale(languages: readonly string[]): Locale {
@@ -70,6 +71,7 @@ export function createI18n(environment: {
   storage: () => Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
 }) {
   const preference = ref<LanguagePreference>('auto')
+  const preferenceSaved = ref(true)
   const detected = ref<Locale>('en')
   const locale = computed<Locale>(() =>
     preference.value === 'auto' ? detected.value : preference.value
@@ -89,15 +91,20 @@ export function createI18n(environment: {
   function setPreference(value: LanguagePreference) {
     preference.value = preferenceFrom(value)
     syncBrowser()
+    preferenceSaved.value = true
     try {
       if (preference.value === 'auto') environment.storage().removeItem(LANGUAGE_STORAGE_KEY)
       else environment.storage().setItem(LANGUAGE_STORAGE_KEY, preference.value)
     } catch {
       // Language stays usable for this tab even when browser storage is blocked.
+      preferenceSaved.value = false
     }
   }
   function t(key: MessageKey, params: Params = {}): string {
-    return interpolate(locale.value === 'en' ? key : messages[key], params)
+    return interpolate(
+      locale.value === 'en' || !Object.hasOwn(messages, key) ? key : messages[key],
+      params
+    )
   }
   function message(source: string | null | undefined, depth = 0): string {
     if (!source || locale.value === 'en') return source ?? ''
@@ -107,8 +114,12 @@ export function createI18n(environment: {
       const match = regex.exec(source)
       if (!match) continue
       const params = Object.fromEntries(keys.map((key, index) => [key, match[index + 1]]))
-      for (const key of ['error', 'detail', 'status', 'action']) {
-        if (params[key]) params[key] = message(params[key], depth + 1)
+      for (const key of ['error', 'detail', 'status', 'action', 'browser', 'label']) {
+        if (params[key]) {
+          const trimmed = params[key].trim()
+          const localized = message(trimmed, depth + 1)
+          if (localized !== trimmed) params[key] = localized
+        }
       }
       return interpolate(translated, params)
     }
@@ -116,6 +127,7 @@ export function createI18n(environment: {
   }
   return {
     preference: readonly(preference),
+    preferenceSaved: readonly(preferenceSaved),
     locale,
     setPreference,
     syncBrowser,

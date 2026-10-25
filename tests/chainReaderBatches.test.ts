@@ -82,7 +82,12 @@ vi.mock('@/core/create2', () => ({
 }))
 
 vi.mock('@/core/rpc', () => ({
-  getReadProvider: () => ({ getBlock: batchState.block }),
+  getReadProvider: () => ({
+    getBlock: batchState.block,
+    withSignal() {
+      return this
+    }
+  }),
   withRetry: (operation: () => Promise<unknown>) => operation()
 }))
 

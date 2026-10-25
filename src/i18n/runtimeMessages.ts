@@ -1,6 +1,26 @@
 // Presentation-only translations of existing logs/errors; core error codes and persisted
 // transaction evidence remain in their original form.
 export const runtimeMessages = {
+  'Confirmation timed out. The transaction may still be pending — do not retry the same VMUs. Refresh later or check the explorer.':
+    '確認逾時。交易可能仍待確認；請勿對相同的 VMU 重送交易。請稍後重新整理或檢查區塊瀏覽器。',
+  'Recovery stopped during a storage change. The original backup is retained. Inspect again; do not clear site data or resend.':
+    '儲存資料變更期間恢復已停止。原始備份已保留。請重新檢查；請勿清除網站資料或重送交易。',
+  '{detail} · Result partially verified ({matched}/{expected} VMUs). Recheck before repeating this operation.':
+    '{detail} · 結果僅部分驗證（{matched}/{expected} 個 VMU）。請重新檢查後，才可重複此操作。',
+  '{detail} · Transaction confirmed; result verification incomplete. Recheck or inspect the explorer before repeating this operation.':
+    '{detail} · 交易已確認，但結果尚未完整驗證。請重新檢查或查看區塊瀏覽器後，才可重複此操作。',
+  'RPC configuration changed. Start a new read with the current settings.':
+    'RPC 設定已變更。請使用目前設定重新讀取。',
+  'this browser': '此瀏覽器',
+  '{chain} RPC configuration is invalid: {error}': '{chain} RPC 設定無效：{error}',
+  'The wallet confirms this nonce was consumed by another transaction. Check wallet Activity before preparing again.':
+    '錢包確認此 nonce 已被另一筆交易使用。請先檢查錢包 Activity，再重新準備操作。',
+  '{label} exceeded {milliseconds} ms.': '{label} 超過 {milliseconds} 毫秒時限。',
+  '{label} exceeded its time limit.': '{label} 已超過時限。',
+  'RPC read': 'RPC 讀取',
+  'RPC retry deadline': 'RPC 重試總時限',
+  'RPC health check': 'RPC 健康檢查',
+  'Read operation': '讀取操作',
   'XENTurbo XEN Miner requires PC Google Chrome. You are currently using {browser}.':
     'XENTurbo XEN Miner 需要使用電腦版 Google Chrome。您目前使用的是 {browser}。',
   'Claim & Re-Mint ({days} days)': '領取並重新鑄造（{days} 天）',
@@ -171,7 +191,6 @@ export const runtimeMessages = {
   'Wallet connection read timed out.{detail} Open your wallet extension, check network access, then retry Connect Wallet.':
     '錢包連接讀取逾時。{detail}請開啟錢包擴充功能並檢查網路連線，再重新連接錢包。',
   'Connection request rejected.': '連接請求已被拒絕。',
-  'No injected wallet detected. Install MetaMask.': '未偵測到注入式錢包。請安裝 MetaMask。',
   'No injected wallet detected. Open this page in desktop Chrome with MetaMask (or another injected extension wallet) installed.':
     '未偵測到注入式錢包。請使用已安裝 MetaMask（或其他注入式錢包擴充功能）的電腦版 Chrome 開啟此頁面。',
   'Chain switch rejected in wallet.': '錢包已拒絕切換網路。',

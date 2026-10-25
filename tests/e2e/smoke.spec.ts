@@ -526,6 +526,37 @@ test('production preview renders in desktop Chrome without console errors and se
   expect(headers['x-frame-options']).toBe('DENY')
 })
 
+test('loads both production chunks on a cold visit and a Chinese reload without missing assets', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  const assets: Array<{ path: string; status: number }> = []
+  const errors: string[] = []
+  page.on('pageerror', (error) => errors.push(error.message))
+  page.on('response', (response) => {
+    const url = new URL(response.url())
+    if (url.pathname.startsWith('/assets/') && url.pathname.endsWith('.js'))
+      assets.push({ path: url.pathname, status: response.status() })
+  })
+  await page.goto('/')
+  await expect(
+    page.getByRole('button', { name: 'Connect Wallet', exact: true }).first()
+  ).toBeVisible()
+  expect(assets).toHaveLength(2)
+  const paths = assets.map(({ path }) => path).sort()
+  expect(paths.some((path) => /vendor-ethers-[\w-]+\.js$/.test(path))).toBe(true)
+  expect(assets.every(({ status }) => status === 200)).toBe(true)
+  await expect(page.locator('link[rel="modulepreload"][href*="vendor-ethers-"]')).toHaveCount(1)
+  await page.getByTestId('language-selector').selectOption('zh-Hant')
+  assets.length = 0
+  await page.reload()
+  await expect(page.getByRole('button', { name: '連接錢包', exact: true }).first()).toBeVisible()
+  expect(assets.map(({ path }) => path).sort()).toEqual(paths)
+  expect(assets.every(({ status }) => status === 200)).toBe(true)
+  expect(errors).toEqual([])
+})
+
 test('all unavailable RPC endpoints block chain actions and can be rechecked', async ({ page }) => {
   await emulateDesktopGoogleChrome(page)
   await installInjectedWallet(page)
@@ -689,7 +720,7 @@ test('a stalled wallet nonce read times out without opening a transaction reques
   await expect(page.getByText('Estimate gas')).toBeVisible()
   await expect(page.locator('.steps .step-icon.run')).toHaveText('...')
   await expect(page.getByText('Checking pending transactions through the wallet...')).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Cancel' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Cancel', exact: true })).toBeVisible()
   const timeoutMessage =
     'Wallet or network read timed out. Wallet eth_getTransactionCount exceeded 15000 ms. Check your connection and wallet, then recheck transaction records. Do not resend.'
   await expect(page.locator('.modal-body .err-text')).toHaveText(timeoutMessage, {
@@ -704,7 +735,7 @@ test('a stalled wallet nonce read times out without opening a transaction reques
     sendAttempts: 0,
     successfulBroadcasts: 0
   })
-  await expect(page.getByRole('button', { name: 'Close' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Close', exact: true })).toBeVisible()
   await captureQaScreenshot(page, 'nonce-timeout-detail')
 })
 
@@ -1099,10 +1130,13 @@ test('prepared signing stays blocked if a shared pending check fails during a tr
   await expectEnabledWithClock(page, page.getByRole('button', { name: 'Confirm Mint' }))
   await page.getByRole('button', { name: 'Confirm Mint' }).click()
   await expect
-    .poll(async () => {
-      await page.clock.runFor(50)
-      return page.getByRole('button', { name: 'Open MetaMask & Sign' }).isVisible()
-    })
+    .poll(
+      async () => {
+        await page.clock.runFor(50)
+        return page.getByRole('button', { name: 'Open MetaMask & Sign' }).isVisible()
+      },
+      { timeout: 15_000, intervals: [100] }
+    )
     .toBe(true)
   await page.evaluate(() => {
     const provider = (
@@ -1147,12 +1181,7 @@ test('prepared signing stays blocked if a shared pending check fails during a tr
   })
   await page.evaluate(() => window.__pendingCheckGate.release())
   await page.getByRole('button', { name: 'Close', exact: true }).click()
-  await expect
-    .poll(async () => {
-      await page.clock.runFor(50)
-      return page.getByRole('button', { name: 'Confirm Mint' }).isEnabled()
-    })
-    .toBe(true)
+  await expectEnabledWithClock(page, page.getByRole('button', { name: 'Confirm Mint' }))
   expect(await page.evaluate(() => window.__pendingCheckGate.reads)).toBe(4)
   expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
     sendAttempts: 0,
@@ -1277,7 +1306,7 @@ test('cancel during the final pending check never opens a wallet request', async
 
   await page.getByRole('button', { name: 'Open MetaMask & Sign' }).click()
   await expect.poll(() => blockedPendingChecks).toBeGreaterThan(0)
-  await page.getByRole('button', { name: 'Cancel' }).click()
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click()
   releasePendingCheck()
 
   await expect(page.getByRole('button', { name: 'Open MetaMask & Sign' })).toHaveCount(0)
@@ -1746,6 +1775,132 @@ test('two tabs serialize wallet sends with a shared Web Lock', async ({ page, co
 test.describe('Traditional Chinese interface', () => {
   test.use({ locale: 'zh-TW' })
 
+  for (const failure of ['stalled', 'http-503', 'http-429', 'json-rate-limit'] as const) {
+    test(`recovers a list read from ${failure} after a successful health check without signing`, async ({
+      page
+    }) => {
+      await emulateDesktopGoogleChrome(page)
+      await mockSameOriginRpc(page, { vmuCount: 2 })
+      await installInjectedWallet(page)
+      const unexpected: string[] = []
+      const errors: string[] = []
+      const batchSizes: number[] = []
+      const used = new Set<string>()
+      let firstFailures = 0
+      let release!: () => void
+      const stalled = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      page.on('pageerror', (error) => errors.push(error.message))
+      await page.route('https://**/*', async (route) => {
+        const url = route.request().url()
+        if (![...ETHEREUM_RPC_ROUTES, ...POLYGON_RPC_ROUTES].some((pattern) => pattern.test(url))) {
+          unexpected.push(url)
+          return route.abort()
+        }
+        const payload = route.request().postDataJSON() as
+          | { id: number; method: string; params: unknown[] }
+          | Array<{ id: number; method: string; params: unknown[] }>
+        const batch = Array.isArray(payload) ? payload : [payload]
+        const isMulticall = (call: (typeof batch)[number]) =>
+          call.method === 'eth_call' &&
+          (call.params[0] as { to: string }).to.toLowerCase() === MULTICALL.toLowerCase()
+        batchSizes.push(batch.length)
+        if (batch.some(isMulticall)) {
+          used.add(new URL(url).hostname)
+          if (ETHEREUM_RPC_ROUTES[0].test(url)) {
+            firstFailures += 1
+            if (failure === 'stalled') await stalled
+            if (failure === 'http-503' || failure === 'http-429')
+              return route.fulfill({
+                status: failure === 'http-503' ? 503 : 429,
+                headers: { 'Retry-After': '1' },
+                body: 'temporary failure'
+              })
+            if (failure === 'json-rate-limit') {
+              const replies = batch.map((call) =>
+                isMulticall(call)
+                  ? {
+                      jsonrpc: '2.0',
+                      id: call.id,
+                      error: { code: -32005, message: 'Too Many Requests' }
+                    }
+                  : {
+                      jsonrpc: '2.0',
+                      id: call.id,
+                      result: rpcResult(call.method, 1, call.params, { vmuCount: 2 })
+                    }
+              )
+              return route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify(Array.isArray(payload) ? replies.reverse() : replies[0])
+              })
+            }
+          }
+        }
+        return route.fallback()
+      })
+      try {
+        await page.goto('/')
+        await expect(page).toHaveTitle('XENTurbo XEN Miner')
+        await page.getByRole('button', { name: '連接錢包' }).first().click()
+        await expect(page.locator('.group-note')).toContainText('共 2 個 VMU', { timeout: 8_000 })
+        expect(firstFailures).toBe(1)
+        expect(used.has('ethereum-rpc.publicnode.com')).toBe(true)
+        await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeEnabled()
+        release()
+        await page.getByTestId('language-selector').selectOption('en')
+        await expect(page.locator('.group-note')).toContainText('2 VMUs total')
+        await page.getByTestId('language-selector').selectOption('zh-Hant')
+        await page.getByRole('button', { name: '重新整理', exact: true }).click()
+        await expect(page.getByRole('button', { name: '重新整理', exact: true })).toBeEnabled()
+        await expect(page.locator('.group-note')).toContainText('共 2 個 VMU')
+        expect(batchSizes.every((size) => size <= 3)).toBe(true)
+        expect(await page.evaluate(() => localStorage.getItem('sm.customRpc'))).toBeNull()
+        expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+          sendAttempts: 0,
+          successfulBroadcasts: 0
+        })
+        expect(unexpected).toEqual([])
+        expect(errors).toEqual([])
+        await captureQaScreenshot(page, `rpc-failover-${failure}-zh`)
+      } finally {
+        release()
+      }
+    })
+  }
+
+  test('shows the complete Chinese confirmation-timeout warning and retains the broadcast record', async ({
+    page
+  }) => {
+    await page.clock.install()
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await installInjectedWallet(page, { successfulSend: true })
+    await page.goto('/')
+    await page.getByRole('button', { name: '連接錢包' }).first().click()
+    await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeEnabled()
+    await page.locator('tbody input[type="checkbox"]').first().check()
+    await page.getByRole('button', { name: '僅領取', exact: true }).click()
+    await expect(page.getByRole('button', { name: '開啟 MetaMask 並簽署' })).toBeVisible()
+    await page.evaluate(() => window.__walletMock.setMinedReceipt(false))
+    await page.getByRole('button', { name: '開啟 MetaMask 並簽署' }).click()
+    await expect(page.locator('.modal-body a')).toHaveAttribute('href', new RegExp(TX_HASH))
+    await expect(page.getByTestId('tx-log')).toContainText('正在等待鏈上確認交易')
+    // The injected wallet is a local fixture, not a real wallet or broadcast endpoint.
+    await page.clock.fastForward(190_000)
+    await expect(page.locator('.err-text')).toHaveText(
+      '確認逾時。交易可能仍待確認；請勿對相同的 VMU 重送交易。請稍後重新整理或檢查區塊瀏覽器。'
+    )
+    expect(await page.evaluate(() => localStorage.getItem('sm.vmuLocks'))).toContain(TX_HASH)
+    await page.getByTestId('language-selector').selectOption('en')
+    await expect(page.locator('.err-text')).toContainText('do not retry the same VMUs')
+    await page.getByTestId('language-selector').selectOption('zh-Hant')
+    await captureQaScreenshot(page, 'confirmation-timeout-zh')
+    expect(await page.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(1)
+  })
+
   for (const [chain, chainId, gateway, endpoints] of [
     ['eth', '0x1', 'https://mainnet.gateway.tenderly.co', ETHEREUM_RPC_ROUTES],
     ['polygon', '0x89', 'https://polygon.gateway.tenderly.co', POLYGON_RPC_ROUTES]
@@ -1760,6 +1915,17 @@ test.describe('Traditional Chinese interface', () => {
       const failedDefaults = new Set<string>()
       const gatewayMethods = new Set<string>()
       const batchSizes: number[] = []
+      const unexpectedRequests: string[] = []
+      await page.route('https://**/*', async (route) => {
+        const url = route.request().url()
+        if (
+          [...ETHEREUM_RPC_ROUTES, ...POLYGON_RPC_ROUTES].some((pattern) => pattern.test(url)) ||
+          url === 'https://gasstation.polygon.technology/v2'
+        )
+          return route.fallback()
+        unexpectedRequests.push(url)
+        await route.abort()
+      })
       let multicallReads = 0
       page.on('pageerror', (error) => errors.push(error.message))
       for (const endpoint of endpoints) {
@@ -1834,6 +2000,7 @@ test.describe('Traditional Chinese interface', () => {
         successfulBroadcasts: 0
       })
       await captureQaScreenshot(page, `rpc-tenderly-${chain}-zh`)
+      expect(unexpectedRequests).toEqual([])
     })
   }
 

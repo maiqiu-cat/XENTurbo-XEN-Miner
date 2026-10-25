@@ -843,17 +843,10 @@ async function discoverPendingFactoryTxs(
   wallet: string,
   signal?: AbortSignal
 ): Promise<void> {
-  const read = getReadProvider(chain) as ReturnType<typeof getReadProvider> & {
-    send?: (method: string, params: unknown[]) => Promise<unknown>
-    providerConfigs?: Array<{
-      provider: { send: (method: string, params: unknown[]) => Promise<unknown> }
-    }>
-  }
-  const rpc = typeof read.send === 'function' ? read : read.providerConfigs?.[0]?.provider
-  if (!rpc?.send) return
+  const rpc = getReadProvider(chain, signal)
   try {
     const block = await withReadDeadline(
-      () => rpc.send!('eth_getBlockByNumber', ['pending', true]),
+      () => rpc.send('eth_getBlockByNumber', ['pending', true]),
       'Pending block',
       { signal }
     )

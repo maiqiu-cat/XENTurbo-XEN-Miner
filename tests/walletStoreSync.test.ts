@@ -65,7 +65,12 @@ describe('wallet store injected state synchronization', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     rpc.getCode.mockReset().mockResolvedValue('0x')
-    rpc.ensureHealthyReadProvider.mockReset().mockResolvedValue({ getCode: rpc.getCode })
+    rpc.ensureHealthyReadProvider.mockReset().mockResolvedValue({
+      getCode: rpc.getCode,
+      withSignal() {
+        return this
+      }
+    })
   })
 
   afterEach(() => {

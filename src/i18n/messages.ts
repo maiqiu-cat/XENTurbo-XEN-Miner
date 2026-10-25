@@ -1,5 +1,7 @@
 // English is the fallback and the stable source text. Values are plain text, never HTML.
 export const messages = {
+  'Language choice could not be saved. It applies only to this tab.':
+    '無法儲存語言選擇，目前僅套用於此分頁。',
   Language: '語言',
   'Browser language': '跟隨瀏覽器',
   'Connect Wallet': '連接錢包',
@@ -124,6 +126,9 @@ export const messages = {
   Save: '儲存',
   'Reset to default': '重設為預設值',
   Close: '關閉',
+  'Hide transaction dialog': '隱藏交易對話框',
+  'Cancel transaction preparation': '取消交易準備',
+  'Close transaction dialog': '關閉交易對話框',
   'Transaction storage recovery': '交易記錄恢復',
   'Close recovery': '關閉交易記錄恢復',
   'Unreadable JSON': '無法讀取 JSON',
