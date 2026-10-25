@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Vmu, WalletSnapshot } from '@/core/types'
 import { READ_TIMEOUT_MS } from '@/core/readDeadline'
 import { RpcConfigurationError } from '@/core/rpc'
+import { watch } from 'vue'
 
 const chainReader = vi.hoisted(() => ({
   readVmuCount: vi.fn(),
@@ -101,12 +102,243 @@ describe('vmu store request invalidation', () => {
     )
   })
 
+  it('retains the last successful snapshot and cache when manual refresh fails', async () => {
+    const store = useVmuStore()
+    const vmu = mintingVmu()
+    snapshots.loadSnapshot.mockResolvedValue(null)
+    chainReader.readVmuCount.mockResolvedValue(1)
+    chainReader.readGlobalRank.mockResolvedValue(100)
+    chainReader.readWalletVmus.mockResolvedValue([vmu])
+    await store.load('eth', walletA)
+    const syncedAt = store.syncedAt
+    const chainTimestampMs = store.chainTimestampMs
+    snapshots.saveSnapshot.mockClear()
+    const health = deferred<never>()
+    rpcHealth.ensureHealthyReadProvider.mockReturnValueOnce(health.promise)
+
+    const refresh = store.hardRefresh()
+    expect(store.vmus).toEqual([vmu])
+    expect(store.syncedAt).toBe(syncedAt)
+    health.reject(new Error('Refresh RPC unavailable'))
+    await refresh
+
+    expect(store.vmus).toEqual([vmu])
+    expect(store.vmuCount).toBe(1)
+    expect(store.globalRank).toBe(100)
+    expect(store.rankAvailable).toBe(true)
+    expect(store.chainTimestampMs).toBe(chainTimestampMs)
+    expect(store.syncedAt).toBe(syncedAt)
+    expect(store.loading).toBe(false)
+    expect(store.error).toBe('Refresh RPC unavailable')
+    expect(snapshots.clearSnapshot).not.toHaveBeenCalled()
+    expect(snapshots.saveSnapshot).not.toHaveBeenCalled()
+    store.detach()
+  })
+
+  it('keeps retained data non-operable until a complete refresh succeeds', async () => {
+    const store = useVmuStore()
+    snapshots.loadSnapshot.mockResolvedValue(null)
+    chainReader.readVmuCount.mockResolvedValue(1)
+    chainReader.readGlobalRank.mockResolvedValue(100)
+    chainReader.readWalletVmus.mockResolvedValue([mintingVmu()])
+    await store.load('eth', walletA)
+    expect(store.transactionReady).toBe(true)
+
+    const scan = deferred<Vmu[]>()
+    chainReader.readWalletVmus.mockReturnValueOnce(scan.promise)
+    const refresh = store.hardRefresh()
+    expect(store.stale).toBe(true)
+    expect(store.transactionReady).toBe(false)
+    await vi.waitFor(() => expect(chainReader.readWalletVmus).toHaveBeenCalledTimes(2))
+    scan.reject(new Error('scan timed out'))
+    await refresh
+    expect(store.stale).toBe(true)
+    expect(store.transactionReady).toBe(false)
+    await store.refreshChainTime()
+    expect(store.transactionReady).toBe(false)
+
+    // A targeted update cannot validate the rest of a stale inventory.
+    await store.refreshAffected([1])
+    expect(chainReader.readWalletVmus).toHaveBeenCalledTimes(3)
+    expect(chainReader.readVmuStates).not.toHaveBeenCalled()
+    expect(store.stale).toBe(false)
+    expect(store.transactionReady).toBe(true)
+    expect(store.error).toBeNull()
+    store.detach()
+  })
+
+  it.each(['scan', 'partial'] as const)(
+    'does not replace the last good inventory, rewards or cache after a %s failure',
+    async (failure) => {
+      const store = useVmuStore()
+      const vmu = mintingVmu()
+      snapshots.loadSnapshot.mockResolvedValue(null)
+      chainReader.readVmuCount.mockResolvedValue(1)
+      chainReader.readGlobalRank.mockResolvedValue(100)
+      chainReader.readWalletVmus.mockResolvedValue([vmu])
+      await store.load('eth', walletA)
+      const syncedAt = store.syncedAt
+      snapshots.saveSnapshot.mockClear()
+      chainReader.readVmuCount.mockResolvedValueOnce(2)
+      chainReader.readGlobalRank.mockResolvedValueOnce(999)
+      if (failure === 'scan')
+        chainReader.readWalletVmus.mockRejectedValueOnce(new Error('scan failed'))
+      else
+        chainReader.readWalletVmus.mockResolvedValueOnce([
+          { ...vmu, term: 200 },
+          { ...mintingVmu(2), status: 'READ_ERROR', readOk: false }
+        ])
+
+      await store.hardRefresh()
+      expect(store.vmus).toEqual([vmu])
+      expect(store.vmuCount).toBe(1)
+      expect(store.globalRank).toBe(100)
+      expect(store.syncedAt).toBe(syncedAt)
+      expect(store.stale).toBe(true)
+      expect(store.transactionReady).toBe(false)
+      expect(store.error).toContain(failure === 'scan' ? 'scan failed' : 'failed to read')
+      expect(snapshots.saveSnapshot).not.toHaveBeenCalled()
+      expect(snapshots.clearSnapshot).not.toHaveBeenCalled()
+      store.detach()
+    }
+  )
+
+  it('shows an IndexedDB snapshot as display-only after reload until a full read succeeds', async () => {
+    const store = useVmuStore()
+    const cached = snapshot(walletA)
+    snapshots.loadSnapshot.mockResolvedValueOnce(cached)
+    rpcHealth.ensureHealthyReadProvider.mockRejectedValueOnce(new Error('offline'))
+    await store.load('eth', walletA)
+    expect(store.vmus).toEqual(cached.vmus)
+    expect(store.syncedAt).toBe(cached.syncedAt)
+    expect(store.stale).toBe(true)
+    expect(store.transactionReady).toBe(false)
+    expect(snapshots.clearSnapshot).not.toHaveBeenCalled()
+    chainReader.readVmuCount.mockResolvedValue(0)
+    chainReader.readGlobalRank.mockResolvedValue(200)
+    chainReader.readWalletVmus.mockResolvedValue([])
+    await store.hardRefresh()
+    expect(store.vmus).toEqual([])
+    expect(store.vmuCount).toBe(0)
+    expect(store.transactionReady).toBe(true)
+    expect(snapshots.saveSnapshot).toHaveBeenLastCalledWith(
+      expect.objectContaining({ vmuCount: 0, vmus: [] })
+    )
+    store.detach()
+  })
+
+  it.each(['account', 'chain', 'disconnect'] as const)(
+    'clears retained rows on %s change and ignores the old manual refresh result',
+    async (change) => {
+      const store = useVmuStore()
+      snapshots.loadSnapshot.mockResolvedValue(null)
+      chainReader.readVmuCount.mockResolvedValue(1)
+      chainReader.readGlobalRank.mockResolvedValue(100)
+      chainReader.readWalletVmus.mockResolvedValue([mintingVmu()])
+      await store.load('eth', walletA)
+      snapshots.saveSnapshot.mockClear()
+      const oldRead = deferred<Vmu[]>()
+      let signal!: AbortSignal
+      chainReader.readWalletVmus.mockImplementationOnce(async (_chain, _wallet, options) => {
+        signal = options.signal
+        return oldRead.promise
+      })
+      const manual = store.hardRefresh()
+      await vi.waitFor(() => expect(chainReader.readWalletVmus).toHaveBeenCalledTimes(2))
+      expect(store.vmus).toHaveLength(1)
+      expect(store.transactionReady).toBe(false)
+      if (change === 'disconnect') store.detach()
+      else {
+        rpcHealth.ensureHealthyReadProvider.mockRejectedValueOnce(new Error('new context offline'))
+        const loading = store.load(
+          change === 'chain' ? 'polygon' : 'eth',
+          change === 'account' ? walletB : walletA
+        )
+        expect(store.vmus).toEqual([])
+        expect(store.syncedAt).toBeNull()
+        expect(store.transactionReady).toBe(false)
+        await loading
+      }
+      expect(signal.aborted).toBe(true)
+      oldRead.resolve([mintingVmu()])
+      await manual
+      expect(store.vmus).toEqual([])
+      expect(store.vmuCount).toBe(0)
+      expect(store.syncedAt).toBeNull()
+      expect(store.transactionReady).toBe(false)
+      expect(store.loading).toBe(false)
+      expect(store.error).toBe(change === 'disconnect' ? null : 'new context offline')
+      expect(snapshots.saveSnapshot).not.toHaveBeenCalled()
+      expect(snapshots.clearSnapshot).not.toHaveBeenCalled()
+      store.detach()
+    }
+  )
+
+  it('keeps an initial partial inventory visible but non-operable until a complete scan', async () => {
+    const store = useVmuStore()
+    snapshots.loadSnapshot.mockResolvedValue(null)
+    chainReader.readVmuCount.mockResolvedValue(2)
+    chainReader.readGlobalRank.mockResolvedValue(100)
+    chainReader.readWalletVmus.mockResolvedValueOnce([
+      mintingVmu(1),
+      { ...mintingVmu(2), readOk: false, status: 'READ_ERROR' }
+    ])
+    await store.load('eth', walletA)
+    expect(store.vmus).toHaveLength(2)
+    expect(store.readErrors).toBe(1)
+    expect(store.groups).toHaveLength(1)
+    expect(store.emptyIds).toEqual([])
+    expect(store.transactionReady).toBe(false)
+    chainReader.readWalletVmus.mockResolvedValueOnce([mintingVmu(1), mintingVmu(2)])
+    await store.hardRefresh()
+    expect(store.readErrors).toBe(0)
+    expect(store.transactionReady).toBe(true)
+    store.detach()
+  })
+
+  it.each(['throw', 'partial'] as const)(
+    'retains a complete snapshot but closes the gate after an affected refresh %s failure',
+    async (failure) => {
+      const store = useVmuStore()
+      const vmu = mintingVmu()
+      snapshots.loadSnapshot.mockResolvedValue(null)
+      chainReader.readVmuCount.mockResolvedValue(1)
+      chainReader.readGlobalRank.mockResolvedValue(100)
+      chainReader.readWalletVmus.mockResolvedValue([vmu])
+      await store.load('eth', walletA)
+      const syncedAt = store.syncedAt
+      snapshots.saveSnapshot.mockClear()
+      if (failure === 'throw') chainReader.readVmuStates.mockRejectedValueOnce(new Error('offline'))
+      else
+        chainReader.readVmuStates.mockResolvedValueOnce([
+          { ...vmu, readOk: false, status: 'READ_ERROR' }
+        ])
+      await store.refreshAffected([1])
+      expect(store.vmus).toEqual([vmu])
+      expect(store.syncedAt).toBe(syncedAt)
+      expect(store.error).not.toBeNull()
+      expect(store.transactionReady).toBe(false)
+      expect(snapshots.saveSnapshot).not.toHaveBeenCalled()
+      await store.refreshAffected([1])
+      expect(chainReader.readWalletVmus).toHaveBeenCalledTimes(2)
+      expect(store.transactionReady).toBe(true)
+      store.detach()
+    }
+  )
+
   it.each(['full', 'affected'] as const)(
     'explains an RPC configuration failure during a %s refresh and recovers without losing inventory',
     async (kind) => {
       const store = useVmuStore()
       const vmu = mintingVmu()
-      store.$patch({ chain: 'eth', wallet: walletA, vmuCount: 1, vmus: [vmu], syncedAt: 123 })
+      store.$patch({
+        chain: 'eth',
+        wallet: walletA,
+        vmuCount: 1,
+        vmus: [vmu],
+        syncedAt: 123,
+        stale: false
+      })
       rpcHealth.ensureHealthyReadProvider.mockRejectedValueOnce(
         new RpcConfigurationError('eth', 'Use at most 16 RPC endpoints')
       )
@@ -151,7 +383,14 @@ describe('vmu store request invalidation', () => {
       async (chain, message) => {
         const store = useVmuStore()
         const vmu = mintingVmu()
-        store.$patch({ chain, wallet: walletA, vmuCount: 1, vmus: [vmu], syncedAt: 123 })
+        store.$patch({
+          chain,
+          wallet: walletA,
+          vmuCount: 1,
+          vmus: [vmu],
+          syncedAt: 123,
+          stale: false
+        })
         rpcHealth.ensureHealthyReadProvider.mockRejectedValueOnce(
           Object.assign(new Error(message), { name: 'RpcConfigurationError' })
         )
@@ -192,7 +431,8 @@ describe('vmu store request invalidation', () => {
         wallet: walletA,
         vmuCount: 1,
         vmus: [mintingVmu()],
-        syncedAt: 123
+        syncedAt: 123,
+        stale: false
       })
       rpcHealth.ensureHealthyReadProvider.mockRejectedValueOnce(new Error('Unrelated read fixture'))
       try {
@@ -261,6 +501,82 @@ describe('vmu store request invalidation', () => {
     expect(chainReader.readWalletVmus).toHaveBeenCalledTimes(2)
   })
 
+  it.each(['full', 'affected'] as const)(
+    'does not reopen the gate when a superseded %s snapshot save finishes after restart failure',
+    async (kind) => {
+      const store = useVmuStore()
+      const vmu = mintingVmu()
+      snapshots.loadSnapshot.mockResolvedValue(null)
+      chainReader.readVmuCount.mockResolvedValue(1)
+      chainReader.readGlobalRank.mockResolvedValue(100)
+      chainReader.readWalletVmus.mockResolvedValue([vmu])
+      chainReader.readVmuStates.mockResolvedValue([vmu])
+      await store.load('eth', walletA)
+      expect(store.transactionReady).toBe(true)
+      const save = deferred<void>()
+      snapshots.saveSnapshot.mockClear().mockReturnValueOnce(save.promise)
+      const schedule = vi.spyOn(store, 'scheduleMaturityRefresh')
+      const first = kind === 'full' ? store.refresh() : store.refreshAffected([1])
+      await vi.waitFor(() => expect(snapshots.saveSnapshot).toHaveBeenCalledOnce())
+      expect(store.transactionReady).toBe(false)
+      rpcHealth.ensureHealthyReadProvider.mockRejectedValueOnce(new Error('restarted read offline'))
+      try {
+        await store.hardRefresh()
+        expect(store.loading).toBe(false)
+        expect(store.stale).toBe(true)
+        expect(store.transactionReady).toBe(false)
+        expect(store.error).toBe('restarted read offline')
+        save.resolve()
+        await first
+        expect(store.stale).toBe(true)
+        expect(store.transactionReady).toBe(false)
+        expect(store.error).toBe('restarted read offline')
+        expect(schedule).not.toHaveBeenCalled()
+      } finally {
+        save.resolve()
+        await first
+        store.detach()
+        schedule.mockRestore()
+      }
+    }
+  )
+
+  it.each(['reset', 'load', 'detach'] as const)(
+    'closes the readiness gate before %s changes its snapshot or context',
+    async (action) => {
+      const store = useVmuStore()
+      store.$patch({
+        chain: 'eth',
+        wallet: walletA,
+        vmus: [mintingVmu()],
+        vmuCount: 1,
+        syncedAt: 123,
+        stale: false
+      })
+      snapshots.loadSnapshot.mockResolvedValue(null)
+      if (action === 'load')
+        rpcHealth.ensureHealthyReadProvider.mockRejectedValueOnce(new Error('offline'))
+      const observed: boolean[] = []
+      const stop = watch(
+        [() => store.vmus, () => store.chain, () => store.wallet],
+        () => {
+          observed.push(store.transactionReady)
+        },
+        { flush: 'sync' }
+      )
+      try {
+        if (action === 'load') await store.load('polygon', walletB)
+        else store[action]()
+        expect(observed.length).toBeGreaterThan(0)
+        expect(observed.every((ready) => !ready)).toBe(true)
+        expect(store.transactionReady).toBe(false)
+      } finally {
+        stop()
+        store.detach()
+      }
+    }
+  )
+
   it.each([100, 1_000, 10_000])(
     'refreshes one VMU without rescanning a complete %i-VMU wallet',
     async (size) => {
@@ -271,7 +587,8 @@ describe('vmu store request invalidation', () => {
         wallet: walletA,
         vmus,
         vmuCount: vmus.length,
-        syncedAt: Date.now()
+        syncedAt: Date.now(),
+        stale: false
       })
       chainReader.readVmuCount.mockResolvedValue(vmus.length)
       chainReader.readGlobalRank.mockResolvedValue(200)
@@ -292,15 +609,16 @@ describe('vmu store request invalidation', () => {
     }
   )
 
-  it('persists a plain DTO when a targeted refresh leaves an unreadable reactive row untouched', async () => {
+  it('persists a plain DTO when a targeted refresh leaves a readable reactive row untouched', async () => {
     const store = useVmuStore()
-    const damaged = { ...mintingVmu(2), status: 'READ_ERROR' as const, readOk: false }
+    const untouched = mintingVmu(2)
     store.$patch({
       chain: 'eth',
       wallet: walletA,
-      vmus: [mintingVmu(1), damaged],
+      vmus: [mintingVmu(1), untouched],
       vmuCount: 2,
-      syncedAt: Date.now()
+      syncedAt: Date.now(),
+      stale: false
     })
     chainReader.readVmuCount.mockResolvedValue(2)
     chainReader.readVmuStates.mockResolvedValue([
@@ -313,10 +631,11 @@ describe('vmu store request invalidation', () => {
     await store.refreshAffected([1])
     expect(snapshots.saveSnapshot).toHaveBeenCalledOnce()
     expect(cloned).toMatchObject({
-      vmus: [expect.objectContaining({ id: 1, status: 'EMPTY' }), damaged]
+      vmus: [expect.objectContaining({ id: 1, status: 'EMPTY' }), untouched]
     })
-    expect(store.vmus[1]).toEqual(damaged)
-    expect(store.readErrors).toBe(1)
+    expect(store.vmus[1]).toEqual(untouched)
+    expect(store.readErrors).toBe(0)
+    expect(store.transactionReady).toBe(true)
     expect(chainReader.readWalletVmus).not.toHaveBeenCalled()
     store.detach()
   })
@@ -328,7 +647,8 @@ describe('vmu store request invalidation', () => {
       wallet: walletA,
       vmus: [mintingVmu()],
       vmuCount: 1,
-      syncedAt: Date.now()
+      syncedAt: Date.now(),
+      stale: false
     })
     chainReader.readVmuCount.mockResolvedValue(2)
     chainReader.readGlobalRank.mockResolvedValue(200)
@@ -346,7 +666,8 @@ describe('vmu store request invalidation', () => {
       wallet: walletA,
       vmus: [mintingVmu(1), mintingVmu(2)],
       vmuCount: 2,
-      syncedAt: Date.now()
+      syncedAt: Date.now(),
+      stale: false
     })
     chainReader.readVmuCount.mockResolvedValue(2)
     chainReader.readGlobalRank.mockResolvedValue(200)
@@ -398,7 +719,8 @@ describe('vmu store request invalidation', () => {
       wallet: walletA,
       vmus: [mintingVmu()],
       vmuCount: 1,
-      syncedAt: Date.now()
+      syncedAt: Date.now(),
+      stale: false
     })
     chainReader.readVmuCount.mockResolvedValueOnce(1).mockResolvedValue(2)
     chainReader.readGlobalRank.mockResolvedValue(100)

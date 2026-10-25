@@ -11,6 +11,8 @@ import {
   type PendingOpView
 } from '@/core/pendingOps'
 import { ReadTimeoutError } from '@/core/readDeadline'
+import { lockedIds, releaseLock, tryAcquireLock } from '@/core/localLock'
+import { i18n } from '@/i18n'
 import { ensureHealthyReadProvider, resetProviders } from '@/core/rpc'
 import { useWalletStore } from '@/stores/walletStore'
 import { useVmuStore } from '@/stores/vmuStore'
@@ -19,7 +21,8 @@ import {
   abortPrepared,
   prepareOperation,
   sendPreparedOperation,
-  type PreparedOp
+  type PreparedOp,
+  type TxStepState
 } from '@/core/txManager'
 import MinerView from '@/views/MinerView.vue'
 import StorageRecovery from '@/components/StorageRecovery.vue'
@@ -52,6 +55,7 @@ const empty = { views: [], pendingNonceGap: 0, unresolvedCount: 0, confirmedOps:
 beforeEach(() => {
   vi.clearAllMocks()
   localStorage.clear()
+  i18n.setPreference('en')
   resetProviders()
   setActivePinia(createPinia())
   vi.mocked(refreshPendingOps).mockReset().mockResolvedValue(empty)
@@ -59,8 +63,12 @@ beforeEach(() => {
   vi.mocked(markPendingOpDropped).mockReset()
   vi.mocked(canMarkPendingOpDropped).mockReset().mockReturnValue(false)
   vi.mocked(recoverTransactionStorage).mockReset()
+  vi.mocked(prepareOperation).mockReset()
+  vi.mocked(sendPreparedOperation).mockReset()
   const store = useVmuStore()
-  vi.spyOn(store, 'load').mockResolvedValue()
+  vi.spyOn(store, 'load').mockImplementation(async (chain, wallet) => {
+    store.$patch({ chain, wallet, syncedAt: Date.now(), stale: false })
+  })
   vi.spyOn(store, 'refresh').mockResolvedValue()
   vi.spyOn(store, 'detach').mockImplementation(() => {})
   useWalletStore().$patch({
@@ -77,6 +85,7 @@ afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
+  i18n.setPreference('en')
 })
 function render(realPendingPanel = false) {
   wrapper = mount(MinerView, {
@@ -86,6 +95,7 @@ function render(realPendingPanel = false) {
         RpcSettings: true,
         PendingOpsPanel: !realPendingPanel,
         MintList: {
+          name: 'MintList',
           props: ['busy', 'blockedReason'],
           template: '<div data-testid="mint-list" :data-busy="busy">{{ blockedReason }}</div>'
         }
@@ -103,6 +113,378 @@ async function submitTrackedHash(view: ReturnType<typeof render>, hash: string, 
     .trigger('click')
   await flushPromises()
 }
+
+it('blocks all transaction entry points for a retained stale snapshot, including emitted claims', async () => {
+  const view = render()
+  await flushPromises()
+  const button = (name: string) => view.findAll('button').find((entry) => entry.text() === name)!
+  expect(button('Confirm Mint').attributes('disabled')).toBeUndefined()
+  useVmuStore().stale = true
+  await nextTick()
+  expect(button('Confirm Mint').attributes('disabled')).toBeDefined()
+  await button('Empty Slots Mint').trigger('click')
+  expect(button('Re-Mint Empty Slots').attributes('disabled')).toBeDefined()
+  await button('Slots Management').trigger('click')
+  expect(button('Create Slots').attributes('disabled')).toBeDefined()
+  view.getComponent({ name: 'MintList' }).vm.$emit('claim', [1])
+  view.getComponent({ name: 'MintList' }).vm.$emit('claim-reuse', [1], 100)
+  await flushPromises()
+  expect(prepareOperation).not.toHaveBeenCalled()
+  expect(sendPreparedOperation).not.toHaveBeenCalled()
+  useVmuStore().stale = false
+  await nextTick()
+  expect(button('Create Slots').attributes('disabled')).toBeUndefined()
+})
+
+function preparedFixture(): PreparedOp {
+  return {
+    chain: 'eth',
+    wallet: useWalletStore().address!,
+    op: 'GENERAL_MINT',
+    ids: [],
+    count: 1,
+    term: 100,
+    chainId: 1,
+    factoryAddress: '0xfEF2359e77Df8B769760D62cbB5eE676FE78f6C2',
+    contextKey: 'stale-ui-test',
+    preparedAt: Date.now(),
+    expiresAt: Date.now() + 120_000,
+    gasLimit: 100_000n,
+    fnName: 'bulkClaimRank',
+    args: [100n, 1n],
+    batch: 'stale-ui-test',
+    lockIds: [],
+    lifecycle: { phase: 'prepared' },
+    state: { estimate: 'done', send: 'wait', confirm: 'wait', readyToSign: true }
+  }
+}
+
+it.each(['pending-check', 'preparing', 'prepared', 'sign-check'] as const)(
+  'invalidates the %s operation across a list refresh, even if the refresh already recovered',
+  async (stage) => {
+    const prep = preparedFixture()
+    let release!: () => void
+    const delayed = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    vi.mocked(prepareOperation).mockImplementation(async (_params, callbacks) => {
+      if (stage === 'preparing') await delayed
+      callbacks?.onStep?.(prep.state)
+      return prep
+    })
+    const view = render()
+    await flushPromises()
+    const button = (name: string) => view.findAll('button').find((entry) => entry.text() === name)!
+    if (stage === 'pending-check')
+      vi.mocked(refreshPendingOps).mockImplementationOnce(async () => {
+        await delayed
+        return empty
+      })
+    await button('Confirm Mint').trigger('click')
+    await flushPromises()
+    if (stage === 'prepared' || stage === 'sign-check') {
+      expect(button('Open MetaMask & Sign')).toBeDefined()
+      if (stage === 'sign-check') {
+        vi.mocked(refreshPendingOps).mockImplementationOnce(async () => {
+          await delayed
+          return empty
+        })
+        await button('Open MetaMask & Sign').trigger('click')
+        await flushPromises()
+      }
+    }
+    const store = useVmuStore()
+    store.refreshGen += 1
+    store.stale = true
+    store.stale = false
+    release()
+    await flushPromises()
+    expect(sendPreparedOperation).not.toHaveBeenCalled()
+    if (stage === 'pending-check') expect(prepareOperation).not.toHaveBeenCalled()
+    else expect(abortPrepared).toHaveBeenCalledWith(prep)
+    expect(view.get('.modal-body .err-text').text()).toContain('VMU data')
+    expect(view.get('.modal-body .err-text').text()).toContain('No transaction was submitted.')
+    expect(view.findAll('button').some((entry) => entry.text() === 'Open MetaMask & Sign')).toBe(
+      false
+    )
+  }
+)
+
+it.each(['send-preflight', 'wallet-prompted', 'broadcast'] as const)(
+  'cancels only unprompted work when the list becomes stale during %s',
+  async (stage) => {
+    const prep = preparedFixture()
+    let release!: () => void
+    const delayed = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let isCancelled!: () => boolean
+    vi.mocked(prepareOperation).mockImplementationOnce(async (_params, callbacks) => {
+      callbacks?.onStep?.(prep.state)
+      return prep
+    })
+    vi.mocked(sendPreparedOperation).mockImplementationOnce(async (_prep, callbacks) => {
+      isCancelled = callbacks!.isCancelled!
+      callbacks?.onStep?.({
+        estimate: 'done',
+        send: stage === 'broadcast' ? 'done' : 'process',
+        confirm: stage === 'broadcast' ? 'process' : 'wait',
+        walletPrompted: stage === 'wallet-prompted',
+        txHash: stage === 'broadcast' ? `0x${'a'.repeat(64)}` : undefined
+      })
+      await delayed
+      if (callbacks?.isCancelled?.()) throw new Error('OPERATION_CANCELLED')
+      const state = { estimate: 'done', send: 'done', confirm: 'done' } as const
+      callbacks?.onStep?.(state)
+      return state
+    })
+    const view = render()
+    await flushPromises()
+    const button = (name: string) => view.findAll('button').find((entry) => entry.text() === name)!
+    await button('Confirm Mint').trigger('click')
+    await flushPromises()
+    await button('Open MetaMask & Sign').trigger('click')
+    await flushPromises()
+    expect(sendPreparedOperation).toHaveBeenCalledOnce()
+    useVmuStore().refreshGen += 1
+    useVmuStore().stale = true
+    await nextTick()
+    if (stage === 'send-preflight') {
+      expect(isCancelled()).toBe(true)
+      expect(view.get('.modal-body .err-text').text()).toContain('No transaction was submitted.')
+    } else {
+      expect(isCancelled()).toBe(false)
+      expect(abortPrepared).not.toHaveBeenCalled()
+      expect(view.text()).not.toContain('No transaction was submitted.')
+      expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('true')
+    }
+    release()
+    await flushPromises()
+    expect(isCancelled()).toBe(stage === 'send-preflight')
+    if (stage === 'send-preflight') {
+      expect(view.get('.modal-body .err-text').text()).toContain('No transaction was submitted.')
+      expect(view.findAll('button').some((entry) => entry.text() === 'Open MetaMask & Sign')).toBe(
+        false
+      )
+    } else expect(abortPrepared).not.toHaveBeenCalled()
+    expect(button('Confirm Mint').attributes('disabled')).toBeDefined()
+  }
+)
+
+for (const stage of ['preparing', 'send-preflight'] as const) {
+  it.each(['CLAIM', 'GENERAL_MINT'] as const)(
+    `keeps an invalidated ${stage} blocked until %s cleanup finishes, then permits retry`,
+    async (op) => {
+      const prep = preparedFixture()
+      prep.op = op
+      prep.ids = prep.lockIds = op === 'CLAIM' ? [1] : []
+      let release!: () => void
+      const delayed = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const reserve = () => {
+        if (prep.lockIds.length)
+          expect(
+            tryAcquireLock({
+              chain: prep.chain,
+              wallet: prep.wallet,
+              batch: prep.batch,
+              ids: prep.lockIds
+            })
+          ).toBe(true)
+      }
+      const cleanUp = async (isCancelled: () => boolean) => {
+        await delayed
+        expect(isCancelled()).toBe(true)
+        releaseLock(prep.batch)
+        throw new Error('OPERATION_CANCELLED')
+      }
+      vi.mocked(prepareOperation).mockImplementationOnce(async (_params, callbacks) => {
+        reserve()
+        if (stage === 'preparing') await cleanUp(callbacks!.isCancelled!)
+        callbacks?.onStep?.(prep.state)
+        return prep
+      })
+      vi.mocked(sendPreparedOperation).mockImplementationOnce(async (_prep, callbacks) => {
+        callbacks?.onStep?.({ estimate: 'done', send: 'process', confirm: 'wait' })
+        await cleanUp(callbacks!.isCancelled!)
+        return prep.state
+      })
+      const view = render()
+      await flushPromises()
+      const mint = () => view.findAll('button').find((button) => button.text() === 'Confirm Mint')!
+      const start = async () => {
+        if (op === 'CLAIM') view.getComponent({ name: 'MintList' }).vm.$emit('claim', [1])
+        else await mint().trigger('click')
+        await flushPromises()
+      }
+      try {
+        await start()
+        if (stage === 'send-preflight') {
+          await view
+            .findAll('button')
+            .find((button) => button.text() === 'Open MetaMask & Sign')!
+            .trigger('click')
+          await flushPromises()
+        }
+        const store = useVmuStore()
+        store.refreshGen += 1
+        store.stale = true
+        store.stale = false
+        await nextTick()
+        expect(mint().attributes('disabled')).toBeDefined()
+        expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('true')
+        expect(view.get('[data-testid="operation-blocked-reason"]').text()).toContain(
+          'previous operation to finish cancelling'
+        )
+        if (op === 'CLAIM') expect(lockedIds(prep.chain, prep.wallet)).toEqual(new Set([1]))
+        await start()
+        expect(prepareOperation).toHaveBeenCalledOnce()
+        release()
+        await flushPromises()
+        expect(lockedIds(prep.chain, prep.wallet).size).toBe(0)
+        expect(mint().attributes('disabled')).toBeUndefined()
+        expect(view.find('[data-testid="operation-blocked-reason"]').exists()).toBe(false)
+        vi.mocked(prepareOperation).mockImplementationOnce(async (_params, callbacks) => {
+          reserve()
+          callbacks?.onStep?.(prep.state)
+          return prep
+        })
+        await start()
+        expect(prepareOperation).toHaveBeenCalledTimes(2)
+        expect(view.text()).not.toContain('already pending in another tab')
+        expect(
+          view.findAll('button').some((button) => button.text() === 'Open MetaMask & Sign')
+        ).toBe(true)
+      } finally {
+        release()
+        await flushPromises()
+        releaseLock(prep.batch)
+      }
+    }
+  )
+}
+
+it.each(['account', 'chain', 'disconnect', 'invalidated-then-account'] as const)(
+  'closes the old preparing modal after %s and ignores its late callbacks',
+  async (change) => {
+    const prep = preparedFixture()
+    let release!: () => void
+    const delayed = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    vi.mocked(prepareOperation).mockImplementationOnce(async (_params, callbacks) => {
+      await delayed
+      callbacks?.onStep?.(prep.state)
+      return prep
+    })
+    const view = render()
+    await flushPromises()
+    await view
+      .findAll('button')
+      .find((button) => button.text() === 'Confirm Mint')!
+      .trigger('click')
+    await flushPromises()
+    expect(view.find('.modal-body').exists()).toBe(true)
+    if (change === 'invalidated-then-account') useVmuStore().refreshGen += 1
+    const wallet = useWalletStore()
+    if (change === 'chain') wallet.chainId = 137
+    else
+      wallet.address = change === 'disconnect' ? null : '0x2222222222222222222222222222222222222222'
+    wallet.contextGen += 1
+    await nextTick()
+    try {
+      expect(view.find('.modal-body').exists()).toBe(false)
+      release()
+      await flushPromises()
+      expect(view.find('.modal-body').exists()).toBe(false)
+      expect(abortPrepared).toHaveBeenCalledWith(prep)
+      expect(sendPreparedOperation).not.toHaveBeenCalled()
+    } finally {
+      release()
+      await flushPromises()
+    }
+  }
+)
+
+it.each(['submitted-warning', 'confirmation-timeout', 'confirmed-result'] as const)(
+  'preserves an idle %s dialog after a same-account wallet context event',
+  async (outcome) => {
+    const prep = preparedFixture()
+    const hash = `0x${'a'.repeat(64)}`
+    const state: TxStepState = {
+      estimate: 'done',
+      send: 'done',
+      confirm: outcome === 'confirmed-result' ? 'done' : 'error',
+      txHash: hash,
+      error:
+        outcome === 'submitted-warning'
+          ? 'Transaction submitted, but confirmation could not be completed. Do not resend. Check wallet Activity and the explorer, then recheck pending operations.'
+          : outcome === 'confirmation-timeout'
+            ? 'Confirmation timed out. The transaction may still be pending. Do not resend. Check wallet Activity and the explorer, then recheck pending operations.'
+            : undefined
+    }
+    vi.mocked(prepareOperation).mockImplementationOnce(async (_params, callbacks) => {
+      callbacks?.onStep?.(prep.state)
+      return prep
+    })
+    vi.mocked(sendPreparedOperation).mockImplementationOnce(async (_prep, callbacks) => {
+      callbacks?.onStep?.(state)
+      return state
+    })
+    const view = render()
+    await flushPromises()
+    const button = (name: string) => view.findAll('button').find((entry) => entry.text() === name)!
+    await button('Confirm Mint').trigger('click')
+    await flushPromises()
+    await button('Open MetaMask & Sign').trigger('click')
+    await flushPromises()
+    expect(view.getComponent({ name: 'TxModal' }).props('state')).toEqual(state)
+    expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('false')
+    const wallet = useWalletStore()
+    const account = wallet.address
+    wallet.contextGen += 1
+    await nextTick()
+    await flushPromises()
+    expect(wallet.address).toBe(account)
+    expect(view.find('.modal-body').exists()).toBe(true)
+    expect(view.getComponent({ name: 'TxModal' }).props('state')).toEqual(state)
+    expect(view.get('.modal-body a').attributes('href')).toContain(hash)
+    if (state.error) expect(view.get('.modal-body .err-text').text()).toContain('Do not resend.')
+    expect(sendPreparedOperation).toHaveBeenCalledOnce()
+    expect(abortPrepared).not.toHaveBeenCalled()
+  }
+)
+
+it('explains stale and refreshing form gates beside every form in both languages', async () => {
+  const view = render()
+  await flushPromises()
+  const store = useVmuStore()
+  store.stale = true
+  await nextTick()
+  for (const tab of ['General Mint', 'Empty Slots Mint', 'Slots Management']) {
+    await view
+      .findAll('button')
+      .find((button) => button.text() === tab)!
+      .trigger('click')
+    expect(
+      view
+        .get('.form-grid')
+        .element.parentElement!.querySelector('[data-testid="operation-blocked-reason"]')
+        ?.textContent
+    ).toContain('Transactions are disabled until a complete refresh succeeds.')
+  }
+  store.loading = true
+  i18n.setPreference('zh-Hant')
+  await nextTick()
+  expect(view.get('[data-testid="operation-blocked-reason"]').text()).toContain(
+    '完整重新整理成功前，所有交易操作均已停用。'
+  )
+  store.loading = false
+  store.stale = false
+  await nextTick()
+  expect(view.find('[data-testid="operation-blocked-reason"]').exists()).toBe(false)
+})
 
 it('normalizes a wallet read timeout from the real Track button without losing its stage', async () => {
   const hash = `0x${'a'.repeat(64)}`

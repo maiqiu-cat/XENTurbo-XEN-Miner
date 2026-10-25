@@ -1,6 +1,14 @@
 # XENTurbo XEN Miner
 
-Current release: **v1.1.10**. The page header displays the same version as the source package and Git release tag.
+Current release: **v1.1.11**. The page header displays the same version as the source package and Git release tag.
+
+### v1.1.11 Stale List Recovery
+
+- Failed manual refreshes retain the last complete VMU list and cached snapshot, with explicit English and Traditional Chinese warnings that the data may be outdated. Failed or partial reads never become empty slots.
+- All transaction entry points, including General Mint and Create Slots, remain disabled after a read failure until a complete refresh succeeds. A full refresh invalidates unsigned preparation; an already-open wallet request or broadcast transaction is not cancelled.
+- Invalidated preparation and preflight work keep the transaction gate closed until cleanup finishes. Account and network changes close obsolete preparation dialogs, while idle transaction results and do-not-resend warnings survive repeated wallet context events.
+- Guarded late snapshot saves against newer refreshes and context changes. Manual refresh no longer deletes IndexedDB snapshots. Existing selection resets and other non-blocking review observations remain unchanged.
+- Kept default RPC lists and order, retry counts, Multicall limits of 400/300, transport batches of three and scan concurrency of two. Damaged locks without a hash remain preserved and blocking; P2-C remains unproven and its gate is not relaxed.
 
 ### v1.1.10 Rate-Limit Messages
 

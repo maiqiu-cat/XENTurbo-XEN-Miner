@@ -51,7 +51,7 @@ async function expectEnabledWithClock(page: Page, button: Locator): Promise<void
     .poll(
       async () => {
         await page.clock.runFor(50)
-        return button.isEnabled()
+        return (await button.count()) > 0 && (await button.isEnabled())
       },
       // Advance paused timers frequently without skipping the readiness gate or background polls.
       { timeout: 15_000, intervals: [100] }
@@ -105,11 +105,13 @@ function blockResult(chainId: number, timestamp = BLOCK_TIMESTAMP) {
 
 interface RpcMockState {
   vmuCount?: number
+  unreadableVmuId?: number
   successfulTx?: boolean
   confirmed?: boolean
   operation?: 'GENERAL_MINT' | 'CREATE_EMPTY_SLOT' | 'MINT_EMPTY_SLOT' | 'CLAIM' | 'CLAIM_REUSE'
   blockTimestamp?: number
   maturityTimestamp?: number
+  maturityVmuId?: number
 }
 
 function contractReadResult(chainId: 1 | 137, params: unknown[], state: RpcMockState = {}): string {
@@ -141,6 +143,17 @@ function contractReadResult(chainId: 1 | 137, params: unknown[], state: RpcMockS
     const calls = decoded.calls as Array<{ callData: string }>
     const results = calls.map(({ callData }) => {
       const [proxy] = xenInterface.decodeFunctionData('userMints', callData)
+      if (
+        state.unreadableVmuId &&
+        proxy.toLowerCase() ===
+          computeProxyAddress({
+            factory: FACTORY,
+            vmuTemplate: VMU_TEMPLATE,
+            wallet: ACCOUNT_A,
+            vmuId: state.unreadableVmuId
+          }).toLowerCase()
+      )
+        return [false, '0x']
       const firstProxy = computeProxyAddress({
         factory: FACTORY,
         vmuTemplate: VMU_TEMPLATE,
@@ -158,6 +171,15 @@ function contractReadResult(chainId: 1 | 137, params: unknown[], state: RpcMockS
           state.operation === 'CLAIM_REUSE')
       const empty =
         (state.operation === 'MINT_EMPTY_SLOT' && !state.confirmed) || (changed && !minting)
+      const maturityApplies =
+        !state.maturityVmuId ||
+        proxy.toLowerCase() ===
+          computeProxyAddress({
+            factory: FACTORY,
+            vmuTemplate: VMU_TEMPLATE,
+            wallet: ACCOUNT_A,
+            vmuId: state.maturityVmuId
+          }).toLowerCase()
       return [
         true,
         xenInterface.encodeFunctionResult('userMints', [
@@ -167,7 +189,9 @@ function contractReadResult(chainId: 1 | 137, params: unknown[], state: RpcMockS
             ? BigInt(BLOCK_TIMESTAMP + 10 * 86_400)
             : empty
               ? 0n
-              : BigInt(state.maturityTimestamp ?? 1_700_000_000),
+              : BigInt(
+                  maturityApplies ? (state.maturityTimestamp ?? 1_700_000_000) : 1_700_000_000
+                ),
           minting ? 200n : empty ? 0n : 100n,
           3_000n,
           0n
@@ -1725,6 +1749,204 @@ test('a failed first pending check on a new wallet stays blocked until a success
   await expect(mint).toBeEnabled()
 })
 
+for (const stage of ['preparing', 'send-preflight'] as const) {
+  test(`waits for ${stage} cleanup after an automatic refresh before retrying the same VMU`, async ({
+    page
+  }) => {
+    await page.clock.install()
+    await emulateDesktopGoogleChrome(page)
+    const state: RpcMockState = {
+      vmuCount: 2,
+      maturityVmuId: 2,
+      maturityTimestamp: BLOCK_TIMESTAMP + 5
+    }
+    await mockSameOriginRpc(page, state)
+    await installInjectedWallet(page)
+    let hold = false
+    let held = 0
+    let release!: () => void
+    const delayed = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const errors: string[] = []
+    page.on('pageerror', (error) => errors.push(error.message))
+    for (const endpoint of ETHEREUM_RPC_ROUTES) {
+      await page.route(endpoint, async (route) => {
+        const payload = route.request().postDataJSON()
+        const calls = (Array.isArray(payload) ? payload : [payload]) as Array<{
+          method: string
+          params: unknown[]
+        }>
+        const selectedRead = calls.some(({ method, params }) => {
+          const call = params[0] as { to?: string; data?: string } | undefined
+          return (
+            method === 'eth_call' &&
+            call?.to?.toLowerCase() === MULTICALL.toLowerCase() &&
+            multicallInterface.decodeFunctionData('aggregate3', call.data!).calls.length === 1
+          )
+        })
+        if (
+          hold &&
+          (stage === 'preparing'
+            ? calls.some((call) => call.method === 'eth_estimateGas')
+            : selectedRead)
+        ) {
+          held += 1
+          await delayed
+        }
+        return route.fallback()
+      })
+    }
+    await page.goto('/')
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+    await page.clock.pauseAt(await page.evaluate(() => Date.now() + 100))
+    await page.locator('tbody input[type="checkbox"]').first().check()
+    hold = stage === 'preparing'
+    await page.getByRole('button', { name: 'Claim only', exact: true }).click()
+    if (stage === 'send-preflight') {
+      await expectEnabledWithClock(page, page.getByRole('button', { name: 'Open MetaMask & Sign' }))
+      hold = true
+      await page.getByRole('button', { name: 'Open MetaMask & Sign' }).click()
+    }
+    await expect
+      .poll(async () => {
+        await page.clock.runFor(50)
+        return held
+      })
+      .toBe(1)
+    try {
+      state.blockTimestamp = BLOCK_TIMESTAMP + 10
+      await expect
+        .poll(
+          async () => {
+            await page.clock.runFor(100)
+            const error = page.locator('.modal-body .err-text')
+            return (await error.count()) ? error.textContent() : ''
+          },
+          { timeout: 15_000, intervals: [50] }
+        )
+        .toContain('No transaction was submitted.')
+      await expect(page.locator('.modal-body .err-text')).toContainText(
+        'No transaction was submitted.'
+      )
+      await expect
+        .poll(
+          async () => {
+            await page.clock.runFor(50)
+            return page.getByTestId('stale-vmu-warning').count()
+          },
+          { timeout: 15_000, intervals: [100] }
+        )
+        .toBe(0)
+      await expect(page.getByTestId('operation-blocked-reason')).toContainText(
+        'previous operation to finish cancelling'
+      )
+      await page.getByRole('button', { name: 'Close transaction dialog' }).click()
+      await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeDisabled()
+      // Selection is allowed while busy, but retrying the same VMU must stay blocked.
+      // Both rows are now mature; the last group contains the original VMU.
+      await page.locator('tbody input[type="checkbox"]').last().check()
+      await expect(page.getByRole('button', { name: 'Claim only', exact: true })).toBeDisabled()
+      await expect(
+        page.getByRole('button', { name: 'Claim & Re-Mint (100d)', exact: true })
+      ).toBeDisabled()
+      expect(
+        await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks') ?? '[]'))
+      ).toContainEqual(expect.objectContaining({ ids: [1] }))
+      await page.getByTestId('language-selector').selectOption('zh-Hant')
+      await expect(page.getByTestId('operation-blocked-reason')).toContainText(
+        '等待前一次操作完成取消'
+      )
+      await captureQaScreenshot(page, `refresh-cancelling-${stage}-zh`)
+      hold = false
+      release()
+      await expectEnabledWithClock(
+        page,
+        page.getByRole('button', { name: '確認鑄造', exact: true })
+      )
+      await expect(page.getByTestId('operation-blocked-reason')).toHaveCount(0)
+      expect(
+        await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks') ?? '[]'))
+      ).toEqual([])
+      await expect(page.getByRole('button', { name: '僅領取', exact: true })).toBeEnabled()
+      await page.getByRole('button', { name: '僅領取', exact: true }).click()
+      await expectEnabledWithClock(page, page.getByRole('button', { name: '開啟 MetaMask 並簽署' }))
+      expect(
+        await page.evaluate(() => JSON.parse(localStorage.getItem('sm.vmuLocks') ?? '[]'))
+      ).toContainEqual(expect.objectContaining({ ids: [1] }))
+      await expect(page.locator('.modal-body .err-text')).toHaveCount(0)
+      await captureQaScreenshot(page, `refresh-retry-${stage}-zh`)
+      await page.getByRole('button', { name: '取消', exact: true }).click()
+      expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+        sendAttempts: 0,
+        successfulBroadcasts: 0
+      })
+      expect(errors).toEqual([])
+    } finally {
+      hold = false
+      release()
+    }
+  })
+}
+
+for (const change of ['account', 'chain', 'disconnect'] as const) {
+  test(`closes an in-flight preparation on ${change} and ignores its late response`, async ({
+    page
+  }) => {
+    await emulateDesktopGoogleChrome(page)
+    await mockSameOriginRpc(page)
+    await installInjectedWallet(page)
+    let held = 0
+    let release!: () => void
+    const delayed = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    for (const endpoint of ETHEREUM_RPC_ROUTES) {
+      await page.route(endpoint, async (route) => {
+        const payload = route.request().postDataJSON()
+        if (
+          (Array.isArray(payload) ? payload : [payload]).some(
+            (call: { method: string }) => call.method === 'eth_estimateGas'
+          )
+        ) {
+          held += 1
+          await delayed
+        }
+        return route.fallback()
+      })
+    }
+    await page.goto('/')
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+    await page.getByRole('button', { name: 'Confirm Mint', exact: true }).click()
+    await expect.poll(() => held).toBe(1)
+    await expect(page.locator('.modal-body')).toBeVisible()
+    try {
+      await page.evaluate(
+        ({ change, account }) => {
+          if (change === 'chain') window.__walletMock.emitChain('0x89')
+          else window.__walletMock.emitAccounts(change === 'disconnect' ? [] : [account])
+        },
+        { change, account: ACCOUNT_B }
+      )
+      await expect(page.locator('.modal-body')).toHaveCount(0)
+      release()
+      if (change === 'disconnect')
+        await expect(page.getByRole('button', { name: 'Connect Wallet' }).first()).toBeVisible()
+      else
+        await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+      await expect(page.locator('.modal-body')).toHaveCount(0)
+      expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+        sendAttempts: 0,
+        successfulBroadcasts: 0
+      })
+    } finally {
+      release()
+    }
+  })
+}
+
 test('a late wallet hash restores a broadcast lock after the UI timeout', async ({ page }) => {
   await page.clock.install()
   await emulateDesktopGoogleChrome(page)
@@ -2046,8 +2268,17 @@ test.describe('Traditional Chinese interface', () => {
         await page.getByRole('button', { name: '連接錢包' }).first().click()
         await expect(page.locator('.group-note')).toContainText('共 2 個 VMU')
         await expect(page.getByRole('button', { name: '重新整理', exact: true })).toBeEnabled()
+        const oldRows = await page.locator('tbody tr').allTextContents()
+        await page.locator('tbody input[type="checkbox"]').first().check()
+        await expect(page.locator('.action-bar')).toBeVisible()
         limited = true
         await page.getByRole('button', { name: '重新整理', exact: true }).click()
+        await expect(
+          page.getByRole('button', { name: '正在重新整理…', exact: true })
+        ).toBeDisabled()
+        await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeDisabled()
+        await expect(page.locator('.action-bar')).toHaveCount(0)
+        await expect(page.locator('tbody input[type="checkbox"]').first()).toBeDisabled()
         const chinese =
           failure === 'visible-retry-after'
             ? 'RPC 節點受到限流。請於 1 秒後重試。RPC 清單已保留。'
@@ -2069,10 +2300,19 @@ test.describe('Traditional Chinese interface', () => {
         )
         await expect(page.locator('body')).not.toContainText('missing revert data')
         await expect(page.locator('body')).not.toContainText('server response 429')
-        await expect(page.locator('tbody tr')).toHaveCount(0)
+        expect(await page.locator('tbody tr').allTextContents()).toEqual(oldRows)
+        await expect(page.getByTestId('stale-vmu-warning')).toContainText(
+          '目前顯示先前載入的 VMU 資料，可能已過期。完整重新整理成功前，所有交易操作均已停用。'
+        )
+        await expect(page.getByTestId('stale-vmu-warning')).toContainText('上次載入：')
+        await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeDisabled()
         await captureQaScreenshot(page, `rpc-exhausted-${chainId}-${failure}-zh`)
         await page.getByTestId('language-selector').selectOption('en')
         await expect(page.locator('.err-banner')).toHaveText(english)
+        await expect(page.getByTestId('stale-vmu-warning')).toContainText(
+          'Previously loaded VMU data may be outdated. Transactions are disabled until a complete refresh succeeds.'
+        )
+        await expect(page.getByTestId('stale-vmu-warning')).toContainText('Last loaded:')
         await captureQaScreenshot(page, `rpc-exhausted-${chainId}-${failure}-en`)
         await page.getByRole('button', { name: 'RPC', exact: true }).click()
         await expect(page.locator('textarea')).toHaveValue('')
@@ -2082,6 +2322,10 @@ test.describe('Traditional Chinese interface', () => {
         await page.getByRole('button', { name: 'Close', exact: true }).click()
         limited = false
         await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+        await expect(page.getByTestId('stale-vmu-warning')).toHaveCount(0)
+        await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+        await expect(page.locator('tbody input[type="checkbox"]').first()).toBeEnabled()
+        await expect(page.locator('tbody input[type="checkbox"]').first()).not.toBeChecked()
         await expect(page.locator('.group-note')).toContainText('2 VMUs total')
         await expect(page.locator('.err-banner,.rank-banner,.tag-warn')).toHaveCount(0)
         expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
@@ -2105,6 +2349,135 @@ test.describe('Traditional Chinese interface', () => {
         expect(errors).toEqual([])
         expect(unexpected).toEqual([])
         await captureQaScreenshot(page, `rpc-exhausted-${chainId}-${failure}-recovered-zh`)
+      })
+    }
+  }
+
+  for (const chainId of [1, 137] as const) {
+    for (const failure of ['offline', 'partial'] as const) {
+      test(`retains a stale snapshot through ${failure}, reload and recovery (${chainId})`, async ({
+        page
+      }) => {
+        await page.setViewportSize({ width: chainId === 1 ? 1280 : 390, height: 900 })
+        await emulateDesktopGoogleChrome(page)
+        const state: RpcMockState = { vmuCount: 2 }
+        await mockSameOriginRpc(page, state)
+        await installInjectedWallet(page)
+        let unavailable = false
+        let holdCount = false
+        let release!: () => void
+        const delayed = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        const errors: string[] = []
+        const unexpected: string[] = []
+        page.on('pageerror', (error) => errors.push(error.message))
+        await page.route('https://**/*', async (route) => {
+          const url = route.request().url()
+          if (url === 'https://gasstation.polygon.technology/v2')
+            return route.fulfill({ json: { standard: { maxFee: 40, maxPriorityFee: 30 } } })
+          if (
+            ![...ETHEREUM_RPC_ROUTES, ...POLYGON_RPC_ROUTES].some((pattern) => pattern.test(url))
+          ) {
+            unexpected.push(url)
+            return route.abort()
+          }
+          const payload = route.request().postDataJSON() as
+            { method: string; params: unknown[] } | Array<{ method: string; params: unknown[] }>
+          const batch = Array.isArray(payload) ? payload : [payload]
+          const isCount = batch.some((call) => {
+            const transaction = call.params[0] as { to?: string; data?: string } | undefined
+            return (
+              call.method === 'eth_call' &&
+              transaction?.to?.toLowerCase() === FACTORY.toLowerCase() &&
+              transaction.data?.startsWith(factoryInterface.getFunction('vmuCount')!.selector)
+            )
+          })
+          if (isCount && holdCount) await delayed
+          if (isCount && unavailable)
+            return route.fulfill({ status: 401, body: 'Fixture endpoint unavailable' })
+          return route.fallback()
+        })
+        await page.goto('/')
+        await page.evaluate((id) => window.__walletMock.emitChain(id), `0x${chainId.toString(16)}`)
+        await page.getByRole('button', { name: '連接錢包' }).first().click()
+        await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeEnabled()
+        await expect(page.locator('.group-note')).toContainText('共 2 個 VMU')
+        const rows = await page.locator('tbody tr').allTextContents()
+        await page.locator('tbody input[type="checkbox"]').first().check()
+        holdCount = true
+        unavailable = failure === 'offline'
+        state.unreadableVmuId = failure === 'partial' ? 2 : undefined
+        await page.getByRole('button', { name: '重新整理', exact: true }).click()
+        await expect(
+          page.getByRole('button', { name: '正在重新整理…', exact: true })
+        ).toBeDisabled()
+        expect(await page.locator('tbody tr').allTextContents()).toEqual(rows)
+        await expect(page.locator('.action-bar')).toHaveCount(0)
+        await expect(page.locator('tbody input[type="checkbox"]').first()).toBeDisabled()
+        await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeDisabled()
+        release()
+        holdCount = false
+        await expect(page.getByRole('button', { name: '重新整理', exact: true })).toBeEnabled()
+        await expect(page.locator('.err-banner')).toBeVisible()
+        expect(await page.locator('tbody tr').allTextContents()).toEqual(rows)
+        await expect(page.getByTestId('stale-vmu-warning')).toContainText('可能已過期')
+        await expect(page.getByTestId('stale-vmu-warning')).toContainText('上次載入：')
+        await captureQaScreenshot(page, `retained-${chainId}-${failure}-zh`)
+        const formReason = page.getByTestId('operation-blocked-reason')
+        await expect(formReason).toContainText('完整重新整理成功前，所有交易操作均已停用。')
+        const formBox = await page.locator('.form-grid').boundingBox()
+        const reasonBox = await formReason.boundingBox()
+        expect(reasonBox!.y - (formBox!.y + formBox!.height)).toBeGreaterThanOrEqual(0)
+        expect(reasonBox!.y - (formBox!.y + formBox!.height)).toBeLessThan(40)
+        expect(reasonBox!.x).toBeGreaterThanOrEqual(0)
+        expect(reasonBox!.x + reasonBox!.width).toBeLessThanOrEqual(page.viewportSize()!.width)
+        await page.getByTestId('language-selector').selectOption('en')
+        await expect(formReason).toContainText(
+          'Transactions are disabled until a complete refresh succeeds.'
+        )
+        await expect(page.getByTestId('stale-vmu-warning')).toContainText('may be outdated')
+        await expect(page.getByTestId('stale-vmu-warning')).toContainText('Last loaded:')
+        await captureQaScreenshot(page, `retained-${chainId}-${failure}-en`)
+        await page.getByTestId('language-selector').selectOption('zh-Hant')
+        await page.reload()
+        await expect(page.locator('html')).toHaveAttribute('lang', 'zh-Hant')
+        await expect(page.getByTestId('language-selector')).toHaveValue('zh-Hant')
+        await page.evaluate((id) => window.__walletMock.emitChain(id), `0x${chainId.toString(16)}`)
+        await page.getByRole('button', { name: '連接錢包' }).first().click()
+        await expect(page.getByRole('button', { name: '重新整理', exact: true })).toBeEnabled()
+        await expect(page.locator('.err-banner')).toBeVisible()
+        await expect(page.locator('.group-note')).toContainText('共 2 個 VMU')
+        await expect(page.getByTestId('stale-vmu-warning')).toContainText('可能已過期')
+        await expect(page.locator('tbody input[type="checkbox"]').first()).toBeDisabled()
+        await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeDisabled()
+        expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+          sendAttempts: 0,
+          successfulBroadcasts: 0
+        })
+        const warningBox = await page.getByTestId('stale-vmu-warning').boundingBox()
+        const viewport = page.viewportSize()!
+        expect(warningBox!.x).toBeGreaterThanOrEqual(0)
+        expect(warningBox!.x + warningBox!.width).toBeLessThanOrEqual(viewport.width)
+        expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(viewport.width)
+        unavailable = false
+        state.unreadableVmuId = undefined
+        state.vmuCount = 3
+        await page.getByRole('button', { name: '重新整理', exact: true }).click()
+        await expect(page.getByTestId('stale-vmu-warning')).toHaveCount(0)
+        await expect(formReason).toHaveCount(0)
+        await expect(page.locator('.err-banner')).toHaveCount(0)
+        await expect(page.locator('.group-note')).toContainText('共 3 個 VMU')
+        await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeEnabled()
+        await expect(page.locator('tbody input[type="checkbox"]').first()).toBeEnabled()
+        await expect(page.locator('tbody input[type="checkbox"]').first()).not.toBeChecked()
+        await captureQaScreenshot(page, `retained-${chainId}-${failure}-recovered-zh`)
+        expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+          sendAttempts: 0,
+          successfulBroadcasts: 0
+        })
+        expect(errors).toEqual([])
+        expect(unexpected).toEqual([])
       })
     }
   }
@@ -2238,7 +2611,14 @@ test.describe('Traditional Chinese interface', () => {
     ).toContainEqual(expect.objectContaining({ phase: 'broadcast', txHash: TX_HASH }))
     await page.getByTestId('language-selector').selectOption('en')
     await expect(page.locator('.err-text')).toContainText('Do not resend')
+    await page.evaluate((account) => window.__walletMock.emitAccounts([account]), ACCOUNT_A)
+    await expect(page.locator('.err-text')).toContainText('Do not resend')
+    await expect(page.locator('.modal-body a')).toHaveAttribute('href', new RegExp(TX_HASH))
     await page.getByTestId('language-selector').selectOption('zh-Hant')
+    await expect(page.locator('.err-text')).toHaveText(
+      '確認逾時。交易可能仍待確認。請勿重送。請檢查錢包 Activity 與區塊瀏覽器，再重新檢查待確認交易。'
+    )
+    expect(await page.evaluate(() => localStorage.getItem('sm.vmuLocks'))).toContain(TX_HASH)
     await captureQaScreenshot(page, 'confirmation-timeout-zh')
     await page.getByRole('button', { name: '關閉交易對話框' }).click()
     await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeDisabled()
