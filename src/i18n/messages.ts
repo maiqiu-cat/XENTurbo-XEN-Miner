@@ -1,4 +1,7 @@
 // English is the fallback and the stable source text. Values are plain text, never HTML.
+export const STALE_PREPARATION_MESSAGE =
+  'VMU data is being refreshed or may be outdated. Refresh successfully, then prepare the transaction again. No transaction was submitted.'
+
 export const messages = {
   'Language choice could not be saved. It applies only to this tab.':
     '無法儲存語言選擇，目前僅套用於此分頁。',
@@ -60,8 +63,10 @@ export const messages = {
   'VMU data is not verified. Transactions are disabled until a complete refresh succeeds.':
     'VMU 資料尚未驗證。完整重新整理成功前，所有交易操作均已停用。',
   'Last loaded: {time}': '上次載入：{time}',
-  'VMU data is being refreshed or may be outdated. Refresh successfully, then prepare the transaction again. No transaction was submitted.':
+  [STALE_PREPARATION_MESSAGE]:
     'VMU 資料正在重新整理或可能已過期。請成功重新整理後，再重新準備交易。此次操作未送出任何交易。',
+  'Waiting for the previous operation to finish cancelling. Transactions remain disabled until cleanup completes.':
+    '正在等待前一次操作完成取消。在清理完成之前，所有交易操作均保持停用。',
   'Global rank unavailable. Reward estimates are disabled until the next successful refresh.':
     '無法取得全域排名。獎勵預估已停用，直到下次成功重新整理。',
   All: '全部',

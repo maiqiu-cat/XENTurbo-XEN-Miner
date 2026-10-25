@@ -29,6 +29,7 @@ import { APP_VERSION } from '@/config/version'
 import { rpcConfigurationMessage } from '@/core/rpc'
 import LanguageSelect from '@/components/LanguageSelect.vue'
 import { t, message } from '@/i18n'
+import { STALE_PREPARATION_MESSAGE } from '@/i18n/messages'
 
 const wallet = useWalletStore()
 const store = useVmuStore()
@@ -215,6 +216,17 @@ const txVisible = ref(false)
 const txState = ref<TxStepState | null>(null)
 const txTitle = ref('')
 const busy = ref(false)
+// An invalidated UI must wait for its async work to release locks and the submission gate.
+const operationFlights = reactive(new Set<{ chain: ChainKey; wallet: string }>())
+const cancelling = computed(
+  () =>
+    !busy.value &&
+    [...operationFlights].some(
+      (flight) =>
+        flight.chain === activeChain.value &&
+        flight.wallet.toLowerCase() === wallet.address?.toLowerCase()
+    )
+)
 const recoveryOpen = ref(false)
 const waitingWallet = computed(
   () =>
@@ -238,6 +250,7 @@ const canOperate = computed(
     listReady.value &&
     !rpcUnavailable.value &&
     !busy.value &&
+    !cancelling.value &&
     !recoveryOpen.value &&
     pendingReady.value &&
     !hasPending.value
@@ -255,7 +268,6 @@ watch([() => wallet.address, () => wallet.chainKey, () => wallet.contextGen], ()
     txState.value?.confirm === 'process' ||
     txState.value?.confirm === 'done'
   opSeq += 1
-  if (!busy.value && !prepared.value) return
   if (!walletRequestOpen && !broadcasted) abortPrepared(prepared.value)
   prepared.value = null
   busy.value = false
@@ -263,8 +275,15 @@ watch([() => wallet.address, () => wallet.chainKey, () => wallet.contextGen], ()
   txVisible.value = false
 })
 
-const stalePreparationMessage =
-  'VMU data is being refreshed or may be outdated. Refresh successfully, then prepare the transaction again. No transaction was submitted.'
+const operationBlockedReason = computed(() => {
+  if (cancelling.value)
+    return 'Waiting for the previous operation to finish cancelling. Transactions remain disabled until cleanup completes.'
+  if (!listReady.value)
+    return store.syncedAt !== null
+      ? 'Previously loaded VMU data may be outdated. Transactions are disabled until a complete refresh succeeds.'
+      : 'VMU data is not verified. Transactions are disabled until a complete refresh succeeds.'
+  return null
+})
 
 function invalidateStalePreparation() {
   if (!busy.value && !prepared.value) return
@@ -286,8 +305,8 @@ function invalidateStalePreparation() {
     send: 'wait',
     confirm: 'wait',
     readyToSign: false,
-    error: stalePreparationMessage,
-    logs: [{ at: Date.now(), status: 'error', message: stalePreparationMessage }]
+    error: STALE_PREPARATION_MESSAGE,
+    logs: [{ at: Date.now(), status: 'error', message: STALE_PREPARATION_MESSAGE }]
   }
 }
 
@@ -299,100 +318,106 @@ async function operate(
   title: string
 ) {
   if (!canOperate.value || !activeChain.value || !wallet.address) return
-  const requestedChain = activeChain.value
-  const requestedWallet = wallet.address
-  const requestedContextGen = wallet.contextGen
-  const requestedListGen = store.refreshGen
-  const seq = ++opSeq
-  busy.value = true
-  prepared.value = null
-  txTitle.value = title
-  txVisible.value = true
-  txState.value = {
-    estimate: 'process',
-    send: 'wait',
-    confirm: 'wait',
-    logs: [
-      {
-        at: Date.now(),
-        status: 'process',
-        message: 'Checking pending transactions through the wallet...'
-      }
-    ]
-  }
-  // Fresh check right before starting — polling may be a few seconds stale.
-  const { count: n, error: checkError } = await checkPendingForSubmit()
-  if (
-    seq !== opSeq ||
-    wallet.contextGen !== requestedContextGen ||
-    activeChain.value !== requestedChain ||
-    wallet.address?.toLowerCase() !== requestedWallet.toLowerCase()
-  ) {
-    return
-  }
-  if (!listReady.value || store.refreshGen !== requestedListGen) {
-    invalidateStalePreparation()
-    return
-  }
-  if (checkError || !pendingReady.value || pendingError.value) {
-    busy.value = false
-    const error =
-      checkError ??
-      pendingError.value ??
-      'Pending transaction check has not completed. Recheck before submitting.'
-    txState.value = {
-      estimate: 'error',
-      send: 'wait',
-      confirm: 'wait',
-      error,
-      logs: [{ at: Date.now(), status: 'error', message: `Pending check failed: ${error}` }]
-    }
-    return
-  }
-  if (n > 0) {
-    txTitle.value = title
-    txState.value = {
-      estimate: 'error',
-      send: 'wait',
-      confirm: 'wait',
-      error:
-        pendingBlockedReason.value ??
-        `Blocked: ${n} pending tx on-chain. Wait, Speed up, or Cancel in MetaMask first.`
-    }
-    txVisible.value = true
-    busy.value = false
-    return
-  }
-
-  busy.value = true
-  prepared.value = null
-  txTitle.value = title
-  txState.value = { estimate: 'wait', send: 'wait', confirm: 'wait' }
-  txVisible.value = true
+  const flight = { chain: activeChain.value, wallet: wallet.address }
+  operationFlights.add(flight)
   try {
-    // Phase 1 only: estimate. Send waits for an explicit click (fresh user gesture).
-    const prep = await prepareOperation(
-      { chain: requestedChain, wallet: requestedWallet, op, ...args },
-      {
-        onStep: (s) => {
-          if (seq === opSeq && wallet.contextGen === requestedContextGen) txState.value = s
-        },
-        isCancelled: () =>
-          seq !== opSeq ||
-          wallet.contextGen !== requestedContextGen ||
-          !listReady.value ||
-          store.refreshGen !== requestedListGen
-      }
-    )
-    if (seq !== opSeq || wallet.contextGen !== requestedContextGen) {
-      abortPrepared(prep)
+    const requestedChain = activeChain.value
+    const requestedWallet = wallet.address
+    const requestedContextGen = wallet.contextGen
+    const requestedListGen = store.refreshGen
+    const seq = ++opSeq
+    busy.value = true
+    prepared.value = null
+    txTitle.value = title
+    txVisible.value = true
+    txState.value = {
+      estimate: 'process',
+      send: 'wait',
+      confirm: 'wait',
+      logs: [
+        {
+          at: Date.now(),
+          status: 'process',
+          message: 'Checking pending transactions through the wallet...'
+        }
+      ]
+    }
+    // Fresh check right before starting — polling may be a few seconds stale.
+    const { count: n, error: checkError } = await checkPendingForSubmit()
+    if (
+      seq !== opSeq ||
+      wallet.contextGen !== requestedContextGen ||
+      activeChain.value !== requestedChain ||
+      wallet.address?.toLowerCase() !== requestedWallet.toLowerCase()
+    ) {
       return
     }
-    prepared.value = prep
-    // Keep busy=true while waiting for the user to click "Open MetaMask & Sign".
-  } catch {
-    if (seq === opSeq && wallet.contextGen === requestedContextGen) busy.value = false
-    void checkPending()
+    if (!listReady.value || store.refreshGen !== requestedListGen) {
+      invalidateStalePreparation()
+      return
+    }
+    if (checkError || !pendingReady.value || pendingError.value) {
+      busy.value = false
+      const error =
+        checkError ??
+        pendingError.value ??
+        'Pending transaction check has not completed. Recheck before submitting.'
+      txState.value = {
+        estimate: 'error',
+        send: 'wait',
+        confirm: 'wait',
+        error,
+        logs: [{ at: Date.now(), status: 'error', message: `Pending check failed: ${error}` }]
+      }
+      return
+    }
+    if (n > 0) {
+      txTitle.value = title
+      txState.value = {
+        estimate: 'error',
+        send: 'wait',
+        confirm: 'wait',
+        error:
+          pendingBlockedReason.value ??
+          `Blocked: ${n} pending tx on-chain. Wait, Speed up, or Cancel in MetaMask first.`
+      }
+      txVisible.value = true
+      busy.value = false
+      return
+    }
+
+    busy.value = true
+    prepared.value = null
+    txTitle.value = title
+    txState.value = { estimate: 'wait', send: 'wait', confirm: 'wait' }
+    txVisible.value = true
+    try {
+      // Phase 1 only: estimate. Send waits for an explicit click (fresh user gesture).
+      const prep = await prepareOperation(
+        { chain: requestedChain, wallet: requestedWallet, op, ...args },
+        {
+          onStep: (s) => {
+            if (seq === opSeq && wallet.contextGen === requestedContextGen) txState.value = s
+          },
+          isCancelled: () =>
+            seq !== opSeq ||
+            wallet.contextGen !== requestedContextGen ||
+            !listReady.value ||
+            store.refreshGen !== requestedListGen
+        }
+      )
+      if (seq !== opSeq || wallet.contextGen !== requestedContextGen) {
+        abortPrepared(prep)
+        return
+      }
+      prepared.value = prep
+      // Keep busy=true while waiting for the user to click "Open MetaMask & Sign".
+    } catch {
+      if (seq === opSeq && wallet.contextGen === requestedContextGen) busy.value = false
+      void checkPending()
+    }
+  } finally {
+    operationFlights.delete(flight)
   }
 }
 
@@ -429,56 +454,66 @@ async function signPrepared() {
     invalidateStalePreparation()
     return
   }
-  const seq = opSeq
-  const requestedContextGen = wallet.contextGen
-  const requestedListGen = store.refreshGen
-  const { count: n, error: checkError } = await checkPendingForSubmit()
-  if (seq !== opSeq || wallet.contextGen !== requestedContextGen || prepared.value !== prep) return
-  if (!listReady.value || store.refreshGen !== requestedListGen) {
-    invalidateStalePreparation()
-    return
-  }
-  if (checkError || !pendingReady.value || n > 0 || pendingError.value) {
-    abortPrepared(prep)
-    prepared.value = null
-    busy.value = false
-    txState.value = {
-      estimate: 'done',
-      send: 'error',
-      confirm: 'wait',
-      readyToSign: false,
-      error:
-        checkError ??
-        pendingError.value ??
-        pendingBlockedReason.value ??
-        `A previous transaction is still pending (${n}). Wait for it in MetaMask, then retry.`
-    }
-    return
-  }
-  prepared.value = null
+  const flight = { chain: prep.chain, wallet: prep.wallet }
+  operationFlights.add(flight)
   try {
-    await sendPreparedOperation(prep, {
-      onStep: (s) => {
-        if (seq === opSeq && wallet.contextGen === requestedContextGen) {
-          txState.value = s
-        }
-      },
-      isCancelled: () => seq !== opSeq || wallet.contextGen !== requestedContextGen
-    })
-  } catch {
-    // error in txState
-  } finally {
-    if (seq === opSeq && wallet.contextGen === requestedContextGen) {
-      busy.value = false
-      if (prep.receipt) {
-        const affectedIds =
-          prep.op === 'GENERAL_MINT' || prep.op === 'CREATE_EMPTY_SLOT'
-            ? Array.from({ length: prep.count }, (_, index) => (prep.preVmuCount ?? 0) + index + 1)
-            : prep.ids
-        void store.refreshAffected(affectedIds)
-      }
-      void checkPending()
+    const seq = opSeq
+    const requestedContextGen = wallet.contextGen
+    const requestedListGen = store.refreshGen
+    const { count: n, error: checkError } = await checkPendingForSubmit()
+    if (seq !== opSeq || wallet.contextGen !== requestedContextGen || prepared.value !== prep)
+      return
+    if (!listReady.value || store.refreshGen !== requestedListGen) {
+      invalidateStalePreparation()
+      return
     }
+    if (checkError || !pendingReady.value || n > 0 || pendingError.value) {
+      abortPrepared(prep)
+      prepared.value = null
+      busy.value = false
+      txState.value = {
+        estimate: 'done',
+        send: 'error',
+        confirm: 'wait',
+        readyToSign: false,
+        error:
+          checkError ??
+          pendingError.value ??
+          pendingBlockedReason.value ??
+          `A previous transaction is still pending (${n}). Wait for it in MetaMask, then retry.`
+      }
+      return
+    }
+    prepared.value = null
+    try {
+      await sendPreparedOperation(prep, {
+        onStep: (s) => {
+          if (seq === opSeq && wallet.contextGen === requestedContextGen) {
+            txState.value = s
+          }
+        },
+        isCancelled: () => seq !== opSeq || wallet.contextGen !== requestedContextGen
+      })
+    } catch {
+      // error in txState
+    } finally {
+      if (seq === opSeq && wallet.contextGen === requestedContextGen) {
+        busy.value = false
+        if (prep.receipt) {
+          const affectedIds =
+            prep.op === 'GENERAL_MINT' || prep.op === 'CREATE_EMPTY_SLOT'
+              ? Array.from(
+                  { length: prep.count },
+                  (_, index) => (prep.preVmuCount ?? 0) + index + 1
+                )
+              : prep.ids
+          void store.refreshAffected(affectedIds)
+        }
+        void checkPending()
+      }
+    }
+  } finally {
+    operationFlights.delete(flight)
   }
 }
 
@@ -674,7 +709,7 @@ const explorerAddrUrl = computed(() => {
         :key="wallet.contextGen"
         :chain="activeChain"
         :wallet="wallet.address"
-        :disabled="busy"
+        :disabled="busy || cancelling"
         @open="recoveryOpen = $event"
         @changed="checkPending({ reverifyResults: true })"
       />
@@ -803,6 +838,14 @@ const explorerAddrUrl = computed(() => {
           </p>
         </div>
 
+        <p
+          v-if="operationBlockedReason"
+          class="dim reuse-term-note"
+          role="status"
+          data-testid="operation-blocked-reason"
+        >
+          {{ message(operationBlockedReason) }}
+        </p>
         <p class="dim reuse-term-note">
           {{ t('Contract:') }}
           <a :href="explorerAddrUrl" target="_blank" rel="noreferrer">{{
@@ -815,6 +858,7 @@ const explorerAddrUrl = computed(() => {
       <MintList
         :busy="
           busy ||
+          cancelling ||
           recoveryOpen ||
           !pendingReady ||
           hasPending ||

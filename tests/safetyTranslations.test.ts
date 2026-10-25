@@ -31,6 +31,10 @@ describe('Traditional Chinese safety instructions', () => {
     [
       'VMU data is being refreshed or may be outdated. Refresh successfully, then prepare the transaction again. No transaction was submitted.',
       'VMU 資料正在重新整理或可能已過期。請成功重新整理後，再重新準備交易。此次操作未送出任何交易。'
+    ],
+    [
+      'Waiting for the previous operation to finish cancelling. Transactions remain disabled until cleanup completes.',
+      '正在等待前一次操作完成取消。在清理完成之前，所有交易操作均保持停用。'
     ]
   ])('preserves the stale-list safety gate in both languages: %s', (source, translated) => {
     const i18n = translator()

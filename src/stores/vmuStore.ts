@@ -195,6 +195,7 @@ export const useVmuStore = defineStore('vmu', {
   },
   actions: {
     reset() {
+      this.stale = true
       abortClockRefresh(this)
       clearMaturityTimer()
       this.vmuCount = 0
@@ -205,13 +206,13 @@ export const useVmuStore = defineStore('vmu', {
       this.syncedAt = null
       this.chainTimestampMs = null
       this.loading = false
-      this.stale = true
       this.progress = { loaded: 0, total: 0 }
       this.error = null
       this.readErrors = 0
     },
 
     detach() {
+      this.stale = true
       abortRefresh(this)
       this.refreshGen += 1
       this.chain = null
@@ -221,6 +222,7 @@ export const useVmuStore = defineStore('vmu', {
 
     /** Load cached snapshot instantly, then refresh from chain in the background. */
     async load(chain: ChainKey, wallet: string) {
+      this.stale = true
       abortRefresh(this)
       const gen = ++this.refreshGen
       this.chain = chain

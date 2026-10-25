@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Vmu, WalletSnapshot } from '@/core/types'
 import { READ_TIMEOUT_MS } from '@/core/readDeadline'
 import { RpcConfigurationError } from '@/core/rpc'
+import { watch } from 'vue'
 
 const chainReader = vi.hoisted(() => ({
   readVmuCount: vi.fn(),
@@ -500,6 +501,82 @@ describe('vmu store request invalidation', () => {
     expect(chainReader.readWalletVmus).toHaveBeenCalledTimes(2)
   })
 
+  it.each(['full', 'affected'] as const)(
+    'does not reopen the gate when a superseded %s snapshot save finishes after restart failure',
+    async (kind) => {
+      const store = useVmuStore()
+      const vmu = mintingVmu()
+      snapshots.loadSnapshot.mockResolvedValue(null)
+      chainReader.readVmuCount.mockResolvedValue(1)
+      chainReader.readGlobalRank.mockResolvedValue(100)
+      chainReader.readWalletVmus.mockResolvedValue([vmu])
+      chainReader.readVmuStates.mockResolvedValue([vmu])
+      await store.load('eth', walletA)
+      expect(store.transactionReady).toBe(true)
+      const save = deferred<void>()
+      snapshots.saveSnapshot.mockClear().mockReturnValueOnce(save.promise)
+      const schedule = vi.spyOn(store, 'scheduleMaturityRefresh')
+      const first = kind === 'full' ? store.refresh() : store.refreshAffected([1])
+      await vi.waitFor(() => expect(snapshots.saveSnapshot).toHaveBeenCalledOnce())
+      expect(store.transactionReady).toBe(false)
+      rpcHealth.ensureHealthyReadProvider.mockRejectedValueOnce(new Error('restarted read offline'))
+      try {
+        await store.hardRefresh()
+        expect(store.loading).toBe(false)
+        expect(store.stale).toBe(true)
+        expect(store.transactionReady).toBe(false)
+        expect(store.error).toBe('restarted read offline')
+        save.resolve()
+        await first
+        expect(store.stale).toBe(true)
+        expect(store.transactionReady).toBe(false)
+        expect(store.error).toBe('restarted read offline')
+        expect(schedule).not.toHaveBeenCalled()
+      } finally {
+        save.resolve()
+        await first
+        store.detach()
+        schedule.mockRestore()
+      }
+    }
+  )
+
+  it.each(['reset', 'load', 'detach'] as const)(
+    'closes the readiness gate before %s changes its snapshot or context',
+    async (action) => {
+      const store = useVmuStore()
+      store.$patch({
+        chain: 'eth',
+        wallet: walletA,
+        vmus: [mintingVmu()],
+        vmuCount: 1,
+        syncedAt: 123,
+        stale: false
+      })
+      snapshots.loadSnapshot.mockResolvedValue(null)
+      if (action === 'load')
+        rpcHealth.ensureHealthyReadProvider.mockRejectedValueOnce(new Error('offline'))
+      const observed: boolean[] = []
+      const stop = watch(
+        [() => store.vmus, () => store.chain, () => store.wallet],
+        () => {
+          observed.push(store.transactionReady)
+        },
+        { flush: 'sync' }
+      )
+      try {
+        if (action === 'load') await store.load('polygon', walletB)
+        else store[action]()
+        expect(observed.length).toBeGreaterThan(0)
+        expect(observed.every((ready) => !ready)).toBe(true)
+        expect(store.transactionReady).toBe(false)
+      } finally {
+        stop()
+        store.detach()
+      }
+    }
+  )
+
   it.each([100, 1_000, 10_000])(
     'refreshes one VMU without rescanning a complete %i-VMU wallet',
     async (size) => {
@@ -532,13 +609,13 @@ describe('vmu store request invalidation', () => {
     }
   )
 
-  it('persists a plain DTO when a targeted refresh leaves an unreadable reactive row untouched', async () => {
+  it('persists a plain DTO when a targeted refresh leaves a readable reactive row untouched', async () => {
     const store = useVmuStore()
-    const damaged = { ...mintingVmu(2), status: 'READ_ERROR' as const, readOk: false }
+    const untouched = mintingVmu(2)
     store.$patch({
       chain: 'eth',
       wallet: walletA,
-      vmus: [mintingVmu(1), damaged],
+      vmus: [mintingVmu(1), untouched],
       vmuCount: 2,
       syncedAt: Date.now(),
       stale: false
@@ -554,10 +631,11 @@ describe('vmu store request invalidation', () => {
     await store.refreshAffected([1])
     expect(snapshots.saveSnapshot).toHaveBeenCalledOnce()
     expect(cloned).toMatchObject({
-      vmus: [expect.objectContaining({ id: 1, status: 'EMPTY' }), damaged]
+      vmus: [expect.objectContaining({ id: 1, status: 'EMPTY' }), untouched]
     })
-    expect(store.vmus[1]).toEqual(damaged)
-    expect(store.readErrors).toBe(1)
+    expect(store.vmus[1]).toEqual(untouched)
+    expect(store.readErrors).toBe(0)
+    expect(store.transactionReady).toBe(true)
     expect(chainReader.readWalletVmus).not.toHaveBeenCalled()
     store.detach()
   })
