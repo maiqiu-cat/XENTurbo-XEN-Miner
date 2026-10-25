@@ -261,6 +261,7 @@ const prepared = ref<PreparedOp | null>(null)
 // Detach the old UI context, but preserve records for non-cancellable wallet sends.
 watch([() => wallet.address, () => wallet.chainKey, () => wallet.contextGen], () => {
   recoveryOpen.value = false
+  if (!busy.value && !prepared.value && txState.value?.error !== STALE_PREPARATION_MESSAGE) return
   const walletRequestOpen = txState.value?.walletPrompted === true
   const broadcasted =
     Boolean(txState.value?.txHash) ||

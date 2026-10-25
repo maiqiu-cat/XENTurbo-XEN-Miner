@@ -2611,7 +2611,14 @@ test.describe('Traditional Chinese interface', () => {
     ).toContainEqual(expect.objectContaining({ phase: 'broadcast', txHash: TX_HASH }))
     await page.getByTestId('language-selector').selectOption('en')
     await expect(page.locator('.err-text')).toContainText('Do not resend')
+    await page.evaluate((account) => window.__walletMock.emitAccounts([account]), ACCOUNT_A)
+    await expect(page.locator('.err-text')).toContainText('Do not resend')
+    await expect(page.locator('.modal-body a')).toHaveAttribute('href', new RegExp(TX_HASH))
     await page.getByTestId('language-selector').selectOption('zh-Hant')
+    await expect(page.locator('.err-text')).toHaveText(
+      '確認逾時。交易可能仍待確認。請勿重送。請檢查錢包 Activity 與區塊瀏覽器，再重新檢查待確認交易。'
+    )
+    expect(await page.evaluate(() => localStorage.getItem('sm.vmuLocks'))).toContain(TX_HASH)
     await captureQaScreenshot(page, 'confirmation-timeout-zh')
     await page.getByRole('button', { name: '關閉交易對話框' }).click()
     await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeDisabled()

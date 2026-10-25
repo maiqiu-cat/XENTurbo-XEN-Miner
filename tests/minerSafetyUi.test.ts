@@ -21,7 +21,8 @@ import {
   abortPrepared,
   prepareOperation,
   sendPreparedOperation,
-  type PreparedOp
+  type PreparedOp,
+  type TxStepState
 } from '@/core/txManager'
 import MinerView from '@/views/MinerView.vue'
 import StorageRecovery from '@/components/StorageRecovery.vue'
@@ -403,6 +404,55 @@ it.each(['account', 'chain', 'disconnect', 'invalidated-then-account'] as const)
       release()
       await flushPromises()
     }
+  }
+)
+
+it.each(['submitted-warning', 'confirmation-timeout', 'confirmed-result'] as const)(
+  'preserves an idle %s dialog after a same-account wallet context event',
+  async (outcome) => {
+    const prep = preparedFixture()
+    const hash = `0x${'a'.repeat(64)}`
+    const state: TxStepState = {
+      estimate: 'done',
+      send: 'done',
+      confirm: outcome === 'confirmed-result' ? 'done' : 'error',
+      txHash: hash,
+      error:
+        outcome === 'submitted-warning'
+          ? 'Transaction submitted, but confirmation could not be completed. Do not resend. Check wallet Activity and the explorer, then recheck pending operations.'
+          : outcome === 'confirmation-timeout'
+            ? 'Confirmation timed out. The transaction may still be pending. Do not resend. Check wallet Activity and the explorer, then recheck pending operations.'
+            : undefined
+    }
+    vi.mocked(prepareOperation).mockImplementationOnce(async (_params, callbacks) => {
+      callbacks?.onStep?.(prep.state)
+      return prep
+    })
+    vi.mocked(sendPreparedOperation).mockImplementationOnce(async (_prep, callbacks) => {
+      callbacks?.onStep?.(state)
+      return state
+    })
+    const view = render()
+    await flushPromises()
+    const button = (name: string) => view.findAll('button').find((entry) => entry.text() === name)!
+    await button('Confirm Mint').trigger('click')
+    await flushPromises()
+    await button('Open MetaMask & Sign').trigger('click')
+    await flushPromises()
+    expect(view.getComponent({ name: 'TxModal' }).props('state')).toEqual(state)
+    expect(view.get('[data-testid="mint-list"]').attributes('data-busy')).toBe('false')
+    const wallet = useWalletStore()
+    const account = wallet.address
+    wallet.contextGen += 1
+    await nextTick()
+    await flushPromises()
+    expect(wallet.address).toBe(account)
+    expect(view.find('.modal-body').exists()).toBe(true)
+    expect(view.getComponent({ name: 'TxModal' }).props('state')).toEqual(state)
+    expect(view.get('.modal-body a').attributes('href')).toContain(hash)
+    if (state.error) expect(view.get('.modal-body .err-text').text()).toContain('Do not resend.')
+    expect(sendPreparedOperation).toHaveBeenCalledOnce()
+    expect(abortPrepared).not.toHaveBeenCalled()
   }
 )
 

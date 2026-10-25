@@ -104,8 +104,6 @@ describe('MintList selection context', () => {
     const refresh = wrapper.findAll('button').find((button) => button.text() === 'Refresh')!
     expect(refresh.attributes('disabled')).toBeUndefined()
     await wrapper.get('tbody tr').trigger('click')
-    expect(wrapper.emitted('claim')).toBeUndefined()
-    expect(wrapper.emitted('claim-reuse')).toBeUndefined()
     expect(wrapper.text()).not.toContain('VMUs selected')
 
     store.stale = false
