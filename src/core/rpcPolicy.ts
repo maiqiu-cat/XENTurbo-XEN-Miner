@@ -2,6 +2,8 @@ import { ReadTimeoutError } from './readDeadline'
 
 type ErrorRecord = Record<string, unknown>
 
+export const MAX_COOLDOWN_MS = 60_000
+
 function record(value: unknown): ErrorRecord | undefined {
   return value !== null && typeof value === 'object' ? (value as ErrorRecord) : undefined
 }
@@ -17,23 +19,25 @@ export class RpcReadInvalidatedError extends Error {
 
 export class RpcRateLimitError extends Error {
   readonly code = 'RPC_RATE_LIMITED'
+  readonly retryAfterMs: number
 
-  constructor(readonly retryAfterMs: number) {
+  constructor(retryAfterMs: number) {
+    const boundedDelay = Math.max(1, Math.min(retryAfterMs, MAX_COOLDOWN_MS))
     super(
-      `RPC endpoints are rate-limited. Retry in ${Math.ceil(retryAfterMs / 1_000)}s. Your RPC list was preserved.`
+      `RPC endpoints are rate-limited. Retry in ${Math.ceil(boundedDelay / 1_000)}s. Your RPC list was preserved.`
     )
     this.name = 'RpcRateLimitError'
+    this.retryAfterMs = boundedDelay
   }
+}
+
+export function isRpcReadInvalidated(error: unknown): boolean {
+  return error instanceof RpcReadInvalidatedError || record(error)?.code === 'RPC_READ_INVALIDATED'
 }
 
 export function isRpcReadCancelled(error: unknown): boolean {
   const value = record(error)
-  return (
-    error instanceof RpcReadInvalidatedError ||
-    value?.code === 'RPC_READ_INVALIDATED' ||
-    value?.name === 'AbortError' ||
-    value?.code === 'CANCELLED'
-  )
+  return isRpcReadInvalidated(error) || value?.name === 'AbortError' || value?.code === 'CANCELLED'
 }
 
 // Endpoint failures may fail over once, but only transient/rate-limit failures may replay.

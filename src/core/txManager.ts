@@ -1186,7 +1186,7 @@ export function normalizeError(
   if (/^LOCK_CONFLICT:/i.test(msg))
     return 'Some selected VMUs are already pending in another tab/window. Wait or refresh.'
   if (err?.code === 'RPC_READ_INVALIDATED')
-    return 'The RPC read context is no longer active. Recheck transaction records before starting another operation. Do not resend.'
+    return 'The RPC read was cancelled because its context changed. No transaction was submitted by this read. Start a new read with the current settings.'
   if (err?.code === 'RPC_RATE_LIMITED') return err.message
   if (/OPERATION_ALREADY_STARTED/i.test(msg))
     return 'This prepared operation has already started or finished. Check wallet Activity and recheck pending operations. Do not resend.'

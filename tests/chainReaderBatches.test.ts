@@ -94,6 +94,7 @@ vi.mock('@/core/rpc', () => ({
 }))
 
 import { readVmuStates, readWalletVmus } from '@/core/chainReader'
+import { RpcReadInvalidatedError } from '@/core/rpcPolicy'
 
 describe('wallet VMU batch reads', () => {
   beforeEach(() => {
@@ -228,6 +229,29 @@ describe('wallet VMU batch reads', () => {
     expect(vmus.slice(401).every((vmu) => vmu.readOk && vmu.status === 'MINTING')).toBe(true)
     expect(vmus.map((vmu) => vmu.id)).toEqual(Array.from({ length: 801 }, (_, i) => i + 1))
   })
+
+  for (const mode of ['wallet', 'selected'] as const) {
+    it.each([
+      new RpcReadInvalidatedError(),
+      Object.assign(new Error('Fixture retired read context'), { code: 'RPC_READ_INVALIDATED' })
+    ])(`allows one fresh-provider pass for an invalidated ${mode} scan: %s`, async (error) => {
+      batchState.endpointFailures.set(1, error)
+      const wallet = '0x0000000000000000000000000000000000000002'
+      const vmus =
+        mode === 'wallet'
+          ? await readWalletVmus('polygon', wallet, { vmuCount: 301, chainTimestampMs: 1_000 })
+          : await readVmuStates(
+              'polygon',
+              wallet,
+              Array.from({ length: 301 }, (_, i) => i + 1),
+              { blockTag: 42 }
+            )
+      expect(vmus).toHaveLength(301)
+      expect(vmus.every((vmu) => vmu.readOk && vmu.status === 'MINTING')).toBe(true)
+      expect(batchState.sizes).toEqual([300, 1, 300])
+      expect(vmus.map((vmu) => vmu.id)).toEqual(Array.from({ length: 301 }, (_, i) => i + 1))
+    })
+  }
 
   it.each(['eth', 'polygon'] as const)(
     'stops scheduling later %s batches when aborted',

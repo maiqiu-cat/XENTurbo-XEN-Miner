@@ -4,7 +4,7 @@ import { Multicall3ABI } from '@/abis/Multicall3ABI'
 import { XENCryptoABI } from '@/abis/XENCryptoABI'
 import { readVmuStates, readWalletVmus } from '@/core/chainReader'
 import { CHAINS, readCustomRpc, writeCustomRpc, type ChainKey } from '@/config/chains'
-import { ensureHealthyReadProvider, resetProviders } from '@/core/rpc'
+import { ensureHealthyReadProvider, getReadProvider, resetProviders } from '@/core/rpc'
 
 interface RpcRequest {
   id: number
@@ -21,6 +21,7 @@ const multicall = new Interface(Multicall3ABI)
 const xen = new Interface(XENCryptoABI)
 const multicallSizes: number[] = []
 let multicallError: { code: number; message: string; data?: string } | undefined
+let multicallDelayMs = 0
 
 beforeEach(() => {
   const storage = new Map<string, string>()
@@ -34,12 +35,16 @@ beforeEach(() => {
   unavailableAddresses.clear()
   multicallSizes.length = 0
   multicallError = undefined
+  multicallDelayMs = 0
   // Intercept only the HTTP boundary; keep ethers serialization, batching and ID matching real.
   FetchRequest.registerGetUrl(async (request) => {
     if (!request.body) throw new Error('Missing JSON-RPC request body')
     const payload = JSON.parse(new TextDecoder().decode(request.body)) as RpcRequest | RpcRequest[]
     const calls = Array.isArray(payload) ? payload : [payload]
     requests.push({ url: request.url, calls })
+    if (multicallDelayMs && calls.some(({ method }) => method === 'eth_call')) {
+      await new Promise((resolve) => setTimeout(resolve, multicallDelayMs))
+    }
     const replies = calls.map(({ id, method, params }) => {
       if (calls.length > 3) {
         return {
@@ -107,9 +112,78 @@ afterEach(() => {
   resetProviders()
   FetchRequest.registerGetUrl(originalTransport)
   vi.unstubAllGlobals()
+  vi.useRealTimers()
 })
 
 describe('public RPC wire batch compatibility', () => {
+  for (const mode of ['wallet', 'selected'] as const) {
+    it.each([false, true])(
+      `uses the replacement pool for a ${mode} scan without overriding caller cancellation (%s)`,
+      async (cancel) => {
+        vi.useFakeTimers()
+        chainId = '0x89'
+        const endpoints = ['https://rpc-a.example/', 'https://rpc-b.example/']
+        writeCustomRpc('polygon', endpoints)
+        const original = await ensureHealthyReadProvider('polygon', async () => chainId)
+        const warm = original.getBlockNumber()
+        await vi.advanceTimersByTimeAsync(50)
+        await warm
+        requests.length = 0
+        multicallDelayMs = 500
+        const controller = new AbortController()
+        const ids = Array.from({ length: 601 }, (_, i) => i + 1)
+        const wallet = '0x1111111111111111111111111111111111111111'
+        const pending =
+          mode === 'wallet'
+            ? readWalletVmus('polygon', wallet, {
+                vmuCount: 601,
+                chainTimestampMs: 1_800_000_000_000,
+                signal: controller.signal
+              })
+            : readVmuStates('polygon', wallet, ids, { blockTag: 42, signal: controller.signal })
+        const result = pending.then(
+          (vmus) => ({ vmus }),
+          (error: unknown) => ({ error })
+        )
+        await vi.advanceTimersByTimeAsync(50)
+        const beforeReplacement = requests.length
+        expect(beforeReplacement).toBeGreaterThan(0)
+        const replacement = await ensureHealthyReadProvider('polygon', async (url) => {
+          if (url === endpoints[1]) throw new Error('Fixture health probe failed')
+          return chainId
+        })
+        expect(replacement).not.toBe(original)
+        expect(getReadProvider('polygon')).toBe(replacement)
+        if (cancel) controller.abort()
+        await vi.advanceTimersByTimeAsync(5_000)
+        const outcome = await result
+        if (cancel) {
+          expect(outcome).toMatchObject({ error: { name: 'AbortError' } })
+          expect(requests).toHaveLength(beforeReplacement)
+        } else {
+          if (!('vmus' in outcome)) throw outcome.error
+          expect(outcome.vmus).toHaveLength(601)
+          expect(outcome.vmus.filter((vmu) => !vmu.readOk || vmu.status === 'READ_ERROR')).toEqual(
+            []
+          )
+          expect(outcome.vmus.every((vmu) => vmu.status === 'CLAIMABLE')).toBe(true)
+          expect(outcome.vmus.map((vmu) => vmu.id)).toEqual(ids)
+          expect(multicallSizes).toEqual([300, 300, 1])
+          expect(requests.slice(beforeReplacement).length).toBeGreaterThan(0)
+          expect(requests.every(({ calls }) => calls.length <= 3)).toBe(true)
+          const reads = requests
+            .flatMap(({ calls }) => calls)
+            .filter(({ method }) => method === 'eth_call')
+          expect(
+            reads.every(({ params }) => params[1] === (mode === 'selected' ? '0x2a' : 'latest'))
+          ).toBe(true)
+        }
+        expect(original.destroyed).toBe(true)
+        expect(readCustomRpc('polygon')).toEqual(endpoints)
+      }
+    )
+  }
+
   for (const mode of ['wallet', 'selected'] as const) {
     it.each([
       [{ code: -32000, message: 'result length 128064 exceeding limit 100000' }, 2],

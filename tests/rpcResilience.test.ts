@@ -7,6 +7,7 @@ import {
   getReadProvider,
   isRetryableRpcError,
   resetProviders,
+  RpcConfigurationError,
   withRetry
 } from '@/core/rpc'
 import { ReadTimeoutError } from '@/core/readDeadline'
@@ -493,12 +494,27 @@ describe('bounded read-only RPC failover', () => {
       await vi.advanceTimersByTimeAsync(100)
       expect(readRequests('eth_getTransactionReceipt')).toHaveLength(1)
       if (failure === 'configuration')
-        localStorage.setItem('sm.customRpc', JSON.stringify({ eth: ['http://invalid.example/'] }))
-      await expect(
-        ensureHealthyReadProvider('eth', async () => {
-          throw new Error('ECONNRESET')
+        localStorage.setItem(
+          'sm.customRpc',
+          JSON.stringify({
+            eth: Array.from({ length: 17 }, (_, index) => `https://rpc-${index}.example/`)
+          })
+        )
+      const probe = vi.fn(async () => {
+        throw new Error('ECONNRESET')
+      })
+      const error = await ensureHealthyReadProvider('eth', probe).catch((error: unknown) => error)
+      if (failure === 'configuration') {
+        expect(error).toBeInstanceOf(RpcConfigurationError)
+        expect(error).toMatchObject({
+          message: expect.stringContaining('Use at most 16 RPC endpoints')
         })
-      ).rejects.toThrow('RPC_UNAVAILABLE')
+        expect(probe).not.toHaveBeenCalled()
+      } else {
+        expect(error).not.toBeInstanceOf(RpcConfigurationError)
+        expect(error).toMatchObject({ message: expect.stringContaining('RPC_UNAVAILABLE') })
+        expect(probe).toHaveBeenCalledTimes(2)
+      }
       expect(settled).toBe(false)
       expect(provider.destroyed).toBe(false)
       receiptAvailable = true
@@ -903,6 +919,28 @@ describe('one retry layer and structured errors', () => {
     const recovered = provider.send('eth_getCode', [address, 'latest'])
     await vi.advanceTimersByTimeAsync(100)
     expect(await recovered).toBe('0x6001')
+    expect(readRequests('eth_getCode')).toHaveLength(1)
+  })
+
+  it('reports the same bounded cooldown for an oversized server Retry-After and the pool', async () => {
+    const provider = await ready(1)
+    failures.set(urls[0], { status: 429, retryAfter: '3600' })
+    const result = withRetry((signal) =>
+      provider.withSignal(signal).send('eth_getCode', [address, 'latest'])
+    ).catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(100)
+    expect(await result).toMatchObject({
+      code: 'RPC_RATE_LIMITED',
+      retryAfterMs: 60_000,
+      message: 'RPC endpoints are rate-limited. Retry in 60s. Your RPC list was preserved.'
+    })
+    const cooling = await provider
+      .send('eth_getCode', [address, 'latest'])
+      .catch((error: unknown) => error)
+    expect(cooling).toMatchObject({
+      code: 'RPC_RATE_LIMITED',
+      message: 'RPC endpoints are rate-limited. Retry in 60s. Your RPC list was preserved.'
+    })
     expect(readRequests('eth_getCode')).toHaveLength(1)
   })
 

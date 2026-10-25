@@ -6,7 +6,7 @@ import { XENCryptoABI } from '@/abis/XENCryptoABI'
 import { Multicall3ABI } from '@/abis/Multicall3ABI'
 import { computeProxyAddress, computeProxyAddressRange, minimalProxyRuntimeCode } from './create2'
 import { getReadProvider, withRetry } from './rpc'
-import { isRetryableRpcError } from './rpcPolicy'
+import { isRetryableRpcError, isRpcReadInvalidated } from './rpcPolicy'
 import type { Vmu, VmuStatus } from './types'
 import { mapWithConcurrency } from '@/utils/concurrency'
 
@@ -254,7 +254,7 @@ async function readVmuIds(
       })
     } catch (error) {
       throwIfAborted(signal)
-      if (!isRetryableRpcError(error)) {
+      if (!isRpcReadInvalidated(error) && !isRetryableRpcError(error)) {
         for (const proxy of slice) nonRetryableIds?.add(proxy.id)
       }
       slice.forEach((proxy) => vmus.push(emptyVmu(proxy.id, proxy.address, false)))
@@ -333,7 +333,7 @@ export async function readWalletVmus(
       decoded = slice.map((p, i) => decodeUserMint(p.id, p.address, results[i], chainTimestampMs))
     } catch (error) {
       throwIfAborted(opts.signal)
-      if (!isRetryableRpcError(error)) {
+      if (!isRpcReadInvalidated(error) && !isRetryableRpcError(error)) {
         for (const proxy of slice) nonRetryableIds.add(proxy.id)
       }
       decoded = slice.map((proxy) => emptyVmu(proxy.id, proxy.address, false))
@@ -346,7 +346,8 @@ export async function readWalletVmus(
   throwIfAborted(opts.signal)
   const vmus = vmuBatches.flat()
 
-  // Retry entry-level misses and transient reads, never replay semantic/endpoint failures.
+  // A second pass reacquires the current pool, so retired-pool reads can recover
+  // without replaying semantic/endpoint failures or overriding caller cancellation.
   const failedIds = vmus.filter((v) => !v.readOk && !nonRetryableIds.has(v.id)).map((v) => v.id)
   if (failedIds.length) {
     try {

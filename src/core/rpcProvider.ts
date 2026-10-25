@@ -12,6 +12,7 @@ import {
 import { abortError, assertReadActive, ReadTimeoutError, withReadDeadline } from './readDeadline'
 import {
   isRpcReadCancelled,
+  MAX_COOLDOWN_MS,
   rpcFailureKind,
   rpcRetryAfterMs,
   RpcReadInvalidatedError,
@@ -20,7 +21,6 @@ import {
 
 const REQUEST_TIMEOUT_MS = 12_000
 const STALL_TIMEOUT_MS = 2_500
-const MAX_COOLDOWN_MS = 60_000
 const READ_METHODS = new Set([
   'eth_chainId',
   'eth_blockNumber',
