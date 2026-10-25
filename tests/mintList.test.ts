@@ -47,6 +47,7 @@ function mountClaimableList() {
       }
     ],
     syncedAt: 1,
+    stale: false,
     chainTimestampMs: Date.now(),
     rankAvailable: false
   })
@@ -86,6 +87,34 @@ describe('MintList selection context', () => {
     await nextTick()
 
     expect(wrapper.text()).not.toContain('VMUs selected')
+  })
+
+  it('keeps stale rows visible but clears selection and blocks claim while allowing refresh', async () => {
+    const { wrapper, store } = mountClaimableList()
+    await wrapper.get('input[type="checkbox"]').trigger('click')
+    expect(wrapper.text()).toContain('1 VMUs selected')
+    store.stale = true
+    store.error = 'Read failed'
+    await nextTick()
+
+    expect(wrapper.findAll('tbody tr')).toHaveLength(1)
+    expect(wrapper.text()).not.toContain('VMUs selected')
+    expect(wrapper.get('[data-testid="stale-vmu-warning"]').text()).toContain('may be outdated')
+    expect(wrapper.get('input[type="checkbox"]').attributes('disabled')).toBeDefined()
+    const refresh = wrapper.findAll('button').find((button) => button.text() === 'Refresh')!
+    expect(refresh.attributes('disabled')).toBeUndefined()
+    await wrapper.get('tbody tr').trigger('click')
+    expect(wrapper.emitted('claim')).toBeUndefined()
+    expect(wrapper.emitted('claim-reuse')).toBeUndefined()
+    expect(wrapper.text()).not.toContain('VMUs selected')
+
+    store.stale = false
+    store.error = null
+    await nextTick()
+    expect(wrapper.find('[data-testid="stale-vmu-warning"]').exists()).toBe(false)
+    expect(wrapper.get('input[type="checkbox"]').attributes('disabled')).toBeUndefined()
+    await wrapper.get('input[type="checkbox"]').trigger('click')
+    expect(wrapper.text()).toContain('1 VMUs selected')
   })
 
   it('renders large grouped wallets in bounded pages', async () => {

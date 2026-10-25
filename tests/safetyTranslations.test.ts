@@ -21,6 +21,25 @@ function translator() {
 describe('Traditional Chinese safety instructions', () => {
   it.each([
     [
+      'Previously loaded VMU data may be outdated. Transactions are disabled until a complete refresh succeeds.',
+      '目前顯示先前載入的 VMU 資料，可能已過期。完整重新整理成功前，所有交易操作均已停用。'
+    ],
+    [
+      'VMU data is not verified. Transactions are disabled until a complete refresh succeeds.',
+      'VMU 資料尚未驗證。完整重新整理成功前，所有交易操作均已停用。'
+    ],
+    [
+      'VMU data is being refreshed or may be outdated. Refresh successfully, then prepare the transaction again. No transaction was submitted.',
+      'VMU 資料正在重新整理或可能已過期。請成功重新整理後，再重新準備交易。此次操作未送出任何交易。'
+    ]
+  ])('preserves the stale-list safety gate in both languages: %s', (source, translated) => {
+    const i18n = translator()
+    expect(i18n.message(source)).toBe(translated)
+    i18n.setPreference('en')
+    expect(i18n.message(source)).toBe(source)
+  })
+  it.each([
+    [
       'Confirmation timed out. The transaction may still be pending. Do not resend. Check wallet Activity and the explorer, then recheck pending operations.',
       '確認逾時。交易可能仍待確認。請勿重送。請檢查錢包 Activity 與區塊瀏覽器，再重新檢查待確認交易。'
     ],

@@ -222,6 +222,12 @@ const waitingWallet = computed(
     txState.value.send === 'process' &&
     !txState.value.txHash
 )
+const listReady = computed(
+  () =>
+    store.transactionReady &&
+    store.chain === activeChain.value &&
+    store.wallet?.toLowerCase() === wallet.address?.toLowerCase()
+)
 
 const canOperate = computed(
   () =>
@@ -229,6 +235,7 @@ const canOperate = computed(
     wallet.isSupportedChain &&
     !wallet.isContractWallet &&
     wallet.contractWalletChecked &&
+    listReady.value &&
     !rpcUnavailable.value &&
     !busy.value &&
     !recoveryOpen.value &&
@@ -256,15 +263,46 @@ watch([() => wallet.address, () => wallet.chainKey, () => wallet.contextGen], ()
   txVisible.value = false
 })
 
+const stalePreparationMessage =
+  'VMU data is being refreshed or may be outdated. Refresh successfully, then prepare the transaction again. No transaction was submitted.'
+
+function invalidateStalePreparation() {
+  if (!busy.value && !prepared.value) return
+  // Wallet prompts and broadcast transactions cannot be cancelled by a list refresh.
+  if (
+    txState.value?.walletPrompted ||
+    txState.value?.txHash ||
+    txState.value?.send === 'done' ||
+    txState.value?.confirm === 'process' ||
+    txState.value?.confirm === 'done'
+  )
+    return
+  opSeq += 1
+  abortPrepared(prepared.value)
+  prepared.value = null
+  busy.value = false
+  txState.value = {
+    estimate: 'error',
+    send: 'wait',
+    confirm: 'wait',
+    readyToSign: false,
+    error: stalePreparationMessage,
+    logs: [{ at: Date.now(), status: 'error', message: stalePreparationMessage }]
+  }
+}
+
+watch([() => store.refreshGen, listReady], invalidateStalePreparation, { flush: 'sync' })
+
 async function operate(
   op: OpType,
   args: { ids?: number[]; count?: number; term?: number },
   title: string
 ) {
-  if (!activeChain.value || !wallet.address) return
+  if (!canOperate.value || !activeChain.value || !wallet.address) return
   const requestedChain = activeChain.value
   const requestedWallet = wallet.address
   const requestedContextGen = wallet.contextGen
+  const requestedListGen = store.refreshGen
   const seq = ++opSeq
   busy.value = true
   prepared.value = null
@@ -290,6 +328,10 @@ async function operate(
     activeChain.value !== requestedChain ||
     wallet.address?.toLowerCase() !== requestedWallet.toLowerCase()
   ) {
+    return
+  }
+  if (!listReady.value || store.refreshGen !== requestedListGen) {
+    invalidateStalePreparation()
     return
   }
   if (checkError || !pendingReady.value || pendingError.value) {
@@ -335,7 +377,11 @@ async function operate(
         onStep: (s) => {
           if (seq === opSeq && wallet.contextGen === requestedContextGen) txState.value = s
         },
-        isCancelled: () => seq !== opSeq || wallet.contextGen !== requestedContextGen
+        isCancelled: () =>
+          seq !== opSeq ||
+          wallet.contextGen !== requestedContextGen ||
+          !listReady.value ||
+          store.refreshGen !== requestedListGen
       }
     )
     if (seq !== opSeq || wallet.contextGen !== requestedContextGen) {
@@ -379,10 +425,19 @@ async function checkPendingForSubmit(): Promise<{ count: number; error: string |
 async function signPrepared() {
   const prep = prepared.value
   if (!prep) return
+  if (!listReady.value) {
+    invalidateStalePreparation()
+    return
+  }
   const seq = opSeq
   const requestedContextGen = wallet.contextGen
+  const requestedListGen = store.refreshGen
   const { count: n, error: checkError } = await checkPendingForSubmit()
   if (seq !== opSeq || wallet.contextGen !== requestedContextGen || prepared.value !== prep) return
+  if (!listReady.value || store.refreshGen !== requestedListGen) {
+    invalidateStalePreparation()
+    return
+  }
   if (checkError || !pendingReady.value || n > 0 || pendingError.value) {
     abortPrepared(prep)
     prepared.value = null

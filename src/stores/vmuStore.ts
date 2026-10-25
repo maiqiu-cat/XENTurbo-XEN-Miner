@@ -9,7 +9,7 @@ import {
   readVmuStates,
   classifyVmuStatus
 } from '@/core/chainReader'
-import { loadSnapshot, saveSnapshot, clearSnapshot } from '@/core/idb'
+import { loadSnapshot, saveSnapshot } from '@/core/idb'
 import { broadcastLockedIds } from '@/core/localLock'
 import {
   ensureHealthyReadProvider,
@@ -31,6 +31,8 @@ interface State {
   syncedAt: number | null
   chainTimestampMs: number | null
   loading: boolean
+  /** Display-only until a complete current-context inventory has been read. */
+  stale: boolean
   progress: { loaded: number; total: number }
   error: string | null
   /** Number of VMUs whose Multicall read failed (not EMPTY). */
@@ -96,12 +98,16 @@ export const useVmuStore = defineStore('vmu', {
     syncedAt: null,
     chainTimestampMs: null,
     loading: false,
+    stale: true,
     progress: { loaded: 0, total: 0 },
     error: null,
     readErrors: 0,
     refreshGen: 0
   }),
   getters: {
+    transactionReady(state): boolean {
+      return !state.stale && !state.loading && state.syncedAt !== null
+    },
     emptyIds(state): number[] {
       // Only hide ids that already have a broadcast tx (not soft pre-sign locks).
       const locked =
@@ -199,6 +205,7 @@ export const useVmuStore = defineStore('vmu', {
       this.syncedAt = null
       this.chainTimestampMs = null
       this.loading = false
+      this.stale = true
       this.progress = { loaded: 0, total: 0 }
       this.error = null
       this.readErrors = 0
@@ -264,10 +271,9 @@ export const useVmuStore = defineStore('vmu', {
           this.chain === chain &&
           this.wallet === wallet
         this.loading = true
+        this.stale = true
         this.error = null
-        this.globalRank = 0
-        this.rankAvailable = false
-        this.rankError = null
+        this.progress = { loaded: 0, total: 0 }
         try {
           await withReadDeadline(() => ensureHealthyReadProvider(chain), 'RPC health check', {
             signal: controller.signal
@@ -282,15 +288,6 @@ export const useVmuStore = defineStore('vmu', {
             readChainTimestamp(chain, { signal: controller.signal })
           ])
           if (!isCurrent()) return
-
-          if (rankResult.ok) {
-            this.globalRank = rankResult.rank
-            this.rankAvailable = true
-          } else {
-            const err = rankResult.error as any
-            this.rankError =
-              err?.shortMessage || err?.message || 'Global rank is unavailable on the active chain'
-          }
 
           const scannedVmus = await readWalletVmus(chain, wallet, {
             vmuCount: count,
@@ -314,15 +311,31 @@ export const useVmuStore = defineStore('vmu', {
                 }
               : vmu
           )
+          const readErrors = vmus.filter((v) => !v.readOk || v.status === 'READ_ERROR').length
+          if (readErrors > 0) {
+            this.error = `${readErrors} VMU(s) failed to read. Refresh or check RPC — do not treat them as empty.`
+            // A partial retry must not overwrite the last complete display snapshot or cache.
+            if (
+              this.syncedAt !== null &&
+              this.vmus.length === this.vmuCount &&
+              this.vmus.every((vmu) => vmu.readOk && vmu.status !== 'READ_ERROR')
+            )
+              return
+          }
 
           this.vmuCount = count
           this.vmus = vmus
           this.chainTimestampMs = latestChainTimestampMs
-          this.readErrors = vmus.filter((v) => !v.readOk || v.status === 'READ_ERROR').length
+          this.globalRank = rankResult.ok ? rankResult.rank : 0
+          this.rankAvailable = rankResult.ok
+          const rankError = rankResult.ok ? null : (rankResult.error as any)
+          this.rankError = rankResult.ok
+            ? null
+            : rankError?.shortMessage ||
+              rankError?.message ||
+              'Global rank is unavailable on the active chain'
+          this.readErrors = readErrors
           this.syncedAt = Date.now()
-          if (this.readErrors > 0) {
-            this.error = `${this.readErrors} VMU(s) failed to read. Refresh or check RPC — do not treat them as empty.`
-          }
           await saveSnapshot({
             chain,
             wallet,
@@ -331,7 +344,10 @@ export const useVmuStore = defineStore('vmu', {
             syncedAt: this.syncedAt,
             chainTimestampMs: latestChainTimestampMs
           })
-          if (isCurrent()) this.scheduleMaturityRefresh()
+          if (isCurrent()) {
+            this.stale = this.readErrors > 0
+            this.scheduleMaturityRefresh()
+          }
         } catch (err: any) {
           if (controller.signal.aborted || err?.name === 'AbortError') return
           if (!isCurrent()) return
@@ -372,6 +388,7 @@ export const useVmuStore = defineStore('vmu', {
       }
       const selected = [...new Set(ids)]
       if (
+        this.stale ||
         !selected.length ||
         selected.some((id) => !Number.isSafeInteger(id) || id <= 0) ||
         this.vmus.length !== this.vmuCount ||
@@ -393,6 +410,7 @@ export const useVmuStore = defineStore('vmu', {
         this.wallet === wallet
       const promise = (async () => {
         this.loading = true
+        this.stale = true
         this.error = null
         try {
           await withReadDeadline(() => ensureHealthyReadProvider(chain), 'RPC health check', {
@@ -418,6 +436,11 @@ export const useVmuStore = defineStore('vmu', {
           if (!isCurrent()) return
           const updates = new Map(affected.map((vmu) => [vmu.id, vmu]))
           if (updates.size !== selected.length) throw new Error('Incomplete affected VMU result')
+          const failed = affected.filter((vmu) => !vmu.readOk || vmu.status === 'READ_ERROR').length
+          if (failed > 0) {
+            this.error = `${failed} VMU(s) failed to read. Refresh or check RPC — do not treat them as empty.`
+            return
+          }
           const vmus = this.vmus.map((vmu) => {
             const value = updates.get(vmu.id) ?? vmu
             return value.readOk
@@ -443,7 +466,10 @@ export const useVmuStore = defineStore('vmu', {
             syncedAt: this.syncedAt,
             chainTimestampMs: timestamp
           })
-          if (isCurrent()) this.scheduleMaturityRefresh()
+          if (isCurrent()) {
+            this.stale = this.readErrors > 0
+            this.scheduleMaturityRefresh()
+          }
         } catch (error) {
           if (isCurrent())
             this.error =
@@ -519,15 +545,7 @@ export const useVmuStore = defineStore('vmu', {
     },
 
     async hardRefresh() {
-      if (!this.chain || !this.wallet) return
-      const chain = this.chain
-      const wallet = this.wallet
-      const gen = ++this.refreshGen
-      abortRefresh(this)
-      this.reset()
-      await clearSnapshot(chain, wallet)
-      if (gen !== this.refreshGen || this.chain !== chain || this.wallet !== wallet) return
-      await this.refresh()
+      await this.refresh({ restart: true })
     },
 
     scheduleMaturityRefresh() {

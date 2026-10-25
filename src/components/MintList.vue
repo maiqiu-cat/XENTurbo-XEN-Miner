@@ -112,9 +112,10 @@ const pagedList = computed(() => {
 })
 
 const selected = ref<Set<string>>(new Set())
+const actionsDisabled = computed(() => props.busy || !store.transactionReady)
 
 function toggle(g: VmuGroup) {
-  if (g.status !== 'CLAIMABLE') return
+  if (!store.transactionReady || g.status !== 'CLAIMABLE') return
   const next = new Set(selected.value)
   if (next.has(g.key)) {
     next.delete(g.key)
@@ -155,16 +156,24 @@ watch(pageCount, (count) => {
 })
 
 watch(
-  [() => wallet.address, () => wallet.chainKey, () => wallet.contextGen, () => store.syncedAt],
-  clearSel
+  [
+    () => wallet.address,
+    () => wallet.chainKey,
+    () => wallet.contextGen,
+    () => store.syncedAt,
+    () => store.refreshGen,
+    () => store.transactionReady
+  ],
+  clearSel,
+  { flush: 'sync' }
 )
 
 function doClaim() {
-  if (overClaim.value) return
+  if (actionsDisabled.value || !selectedIds.value.length || overClaim.value) return
   emit('claim', selectedIds.value)
 }
 function doClaimReuse() {
-  if (overReuse.value) return
+  if (actionsDisabled.value || !selectedIds.value.length || overReuse.value) return
   clampReuseTerm()
   emit('claim-reuse', selectedIds.value, reuseTerm.value)
 }
@@ -186,12 +195,29 @@ function doClaimReuse() {
           :disabled="props.busy || store.loading"
           @click="store.hardRefresh()"
         >
-          {{ t('Refresh') }}
+          {{ store.loading ? t('Refreshing...') : t('Refresh') }}
         </button>
       </div>
     </div>
 
     <p v-if="store.error" class="err-banner">{{ message(store.error) }}</p>
+    <p
+      v-if="!store.transactionReady"
+      class="stale-banner"
+      role="status"
+      data-testid="stale-vmu-warning"
+    >
+      {{
+        t(
+          store.syncedAt !== null
+            ? 'Previously loaded VMU data may be outdated. Transactions are disabled until a complete refresh succeeds.'
+            : 'VMU data is not verified. Transactions are disabled until a complete refresh succeeds.'
+        )
+      }}
+      <span v-if="store.syncedAt !== null">
+        {{ t('Last loaded: {time}', { time: formatDate(store.syncedAt) }) }}
+      </span>
+    </p>
     <p v-if="store.rankError" class="rank-banner">
       {{
         t(
@@ -244,13 +270,17 @@ function doClaimReuse() {
         <tr
           v-for="g in pagedList"
           :key="g.key"
-          :class="{ selectable: g.status === 'CLAIMABLE', sel: selected.has(g.key) }"
+          :class="{
+            selectable: g.status === 'CLAIMABLE' && store.transactionReady,
+            sel: selected.has(g.key)
+          }"
           @click="toggle(g)"
         >
           <td>
             <input
               v-if="g.status === 'CLAIMABLE'"
               type="checkbox"
+              :disabled="!store.transactionReady"
               :checked="selected.has(g.key)"
               @click.stop="toggle(g)"
             />
@@ -325,7 +355,7 @@ function doClaimReuse() {
       <p v-if="props.blockedReason" class="blocked-reason">{{ message(props.blockedReason) }}</p>
 
       <div class="row wrap action-ops">
-        <button class="btn btn-primary" :disabled="props.busy || overClaim" @click="doClaim">
+        <button class="btn btn-primary" :disabled="actionsDisabled || overClaim" @click="doClaim">
           {{ t('Claim only') }}
         </button>
         <label class="reuse-term">
@@ -337,12 +367,12 @@ function doClaimReuse() {
             min="1"
             step="1"
             :max="DEFAULT_TERM_MAX"
-            :disabled="props.busy"
+            :disabled="actionsDisabled"
             @blur="clampReuseTerm"
           />
           <span class="dim">{{ t('days') }}</span>
         </label>
-        <button class="btn" :disabled="props.busy || overReuse" @click="doClaimReuse">
+        <button class="btn" :disabled="actionsDisabled || overReuse" @click="doClaimReuse">
           {{ t('Claim & Re-Mint ({days}d)', { days: reuseTerm }) }}
         </button>
       </div>
@@ -371,10 +401,17 @@ function doClaimReuse() {
   color: var(--danger);
   font-size: 13px;
 }
-.rank-banner {
+.rank-banner,
+.stale-banner {
   margin: 12px 0 0;
   color: var(--warn);
   font-size: 13px;
+}
+.stale-banner {
+  line-height: 1.5;
+}
+.stale-banner span {
+  display: block;
 }
 .tbl {
   width: 100%;

@@ -78,7 +78,9 @@ it('account switch during send preflight detaches the old UI without disabling t
   setActivePinia(createPinia())
   const wallet = useWalletStore()
   const store = useVmuStore()
-  vi.spyOn(store, 'load').mockResolvedValue()
+  vi.spyOn(store, 'load').mockImplementation(async (chain, wallet) => {
+    store.$patch({ chain, wallet, syncedAt: Date.now(), stale: false })
+  })
   vi.spyOn(store, 'refresh').mockResolvedValue()
   vi.spyOn(store, 'detach').mockImplementation(() => {})
   wallet.address = harness.prepared.wallet
