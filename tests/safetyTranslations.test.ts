@@ -137,6 +137,19 @@ describe('Traditional Chinese safety instructions', () => {
   })
 
   it.each([
+    new Error('Failed to persist snapshot: QuotaExceededError: The quota has been exceeded.'),
+    Object.assign(new Error('MetaMask - RPC Error: insufficient capacity for this request'), {
+      code: -32603
+    })
+  ])('preserves non-transport quota or capacity diagnostics: %s', (error) => {
+    const source = normalizeError(error)
+    expect(source).toBe(error.message)
+    expect(translator().message(source)).toBe(error.message)
+    expect(source).not.toContain('RPC endpoints are rate-limited')
+    expect(source).not.toContain('Your RPC list was preserved')
+  })
+
+  it.each([
     {
       shortMessage: 'missing revert data',
       code: 'CALL_EXCEPTION',

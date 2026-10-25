@@ -1,6 +1,13 @@
 # XENTurbo XEN Miner
 
-Current release: **v1.1.9**. The page header displays the same version as the source package and Git release tag.
+Current release: **v1.1.10**. The page header displays the same version as the source package and Git release tag.
+
+### v1.1.10 Rate-Limit Messages
+
+- Unified English and Traditional Chinese rate-limit messages for exhausted retries and preflight reads. Missing or cross-origin-hidden `Retry-After` values no longer produce a guessed countdown; readable server delays remain bounded.
+- Preserved the original cause when the retry budget cannot accommodate another attempt. Storage quota and wallet capacity diagnostics without structured RPC details are no longer mislabeled as read-RPC rate limits.
+- Kept default RPC lists and order, retry counts, Multicall limits of 400/300, transport batches of three and scan concurrency of two. Contracts, wallet signing, transaction safety gates and language persistence are unchanged.
+- Damaged locks without a hash remain preserved and blocking. P2-C remains unproven and its gate is not relaxed. Other non-blocking observations, including the selected-ID read-error wording and the all-endpoints-cooling message, remain deferred.
 
 ### v1.1.9 RPC Resilience And Safety Messages
 
