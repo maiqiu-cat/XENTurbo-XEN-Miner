@@ -9,6 +9,8 @@ export const runtimeMessages = {
     'RPC 讀取因環境變更而取消。此次讀取未送出任何交易。請使用目前設定重新讀取。',
   'RPC endpoints are rate-limited. Retry in {seconds}s. Your RPC list was preserved.':
     'RPC 節點受到限流。請於 {seconds} 秒後重試。RPC 清單已保留。',
+  'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.':
+    'RPC 節點受到限流。請稍候再重試。RPC 清單已保留。',
   'Some selected VMUs are already pending in another tab/window. Wait or refresh.':
     '部分選取的 VMU 已在其他分頁或視窗中處理。請等待或重新整理。',
   'Recovery stopped during a storage change. The original backup is retained. Inspect again; do not clear site data or resend.':

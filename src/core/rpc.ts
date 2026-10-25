@@ -482,7 +482,7 @@ export async function withRetry<T>(
       )
       const remaining = deadline - Date.now()
       if (delay >= remaining) {
-        if (rateLimited) throw new RpcRateLimitError(delay)
+        if (rateLimited) throw new RpcRateLimitError(serverDelay ?? undefined, { cause: err })
         throw err
       }
       await withReadDeadline(() => sleep(delay), 'RPC retry deadline', {
@@ -493,6 +493,10 @@ export async function withRetry<T>(
     } finally {
       controller.abort()
     }
+  }
+  // Normalize only the exhausted rate limit; semantic failures and cancellation keep their identity.
+  if (!(lastErr instanceof RpcRateLimitError) && rpcFailureKind(lastErr) === 'rate-limit') {
+    throw new RpcRateLimitError(rpcRetryAfterMs(lastErr) ?? undefined, { cause: lastErr })
   }
   throw lastErr
 }

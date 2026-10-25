@@ -19,12 +19,16 @@ export class RpcReadInvalidatedError extends Error {
 
 export class RpcRateLimitError extends Error {
   readonly code = 'RPC_RATE_LIMITED'
-  readonly retryAfterMs: number
+  readonly retryAfterMs: number | undefined
 
-  constructor(retryAfterMs: number) {
-    const boundedDelay = Math.max(1, Math.min(retryAfterMs, MAX_COOLDOWN_MS))
+  constructor(retryAfterMs?: number, options?: ErrorOptions) {
+    const boundedDelay =
+      retryAfterMs === undefined ? undefined : Math.max(1, Math.min(retryAfterMs, MAX_COOLDOWN_MS))
     super(
-      `RPC endpoints are rate-limited. Retry in ${Math.ceil(boundedDelay / 1_000)}s. Your RPC list was preserved.`
+      boundedDelay === undefined
+        ? 'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
+        : `RPC endpoints are rate-limited. Retry in ${Math.ceil(boundedDelay / 1_000)}s. Your RPC list was preserved.`,
+      options
     )
     this.name = 'RpcRateLimitError'
     this.retryAfterMs = boundedDelay

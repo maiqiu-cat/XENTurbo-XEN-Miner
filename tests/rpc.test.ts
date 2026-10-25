@@ -11,6 +11,7 @@ import {
   MAX_RPC_URL_LENGTH
 } from '@/config/chains'
 import { ReadTimeoutError, withReadDeadline } from '@/core/readDeadline'
+import { RpcRateLimitError, RpcReadInvalidatedError } from '@/core/rpcPolicy'
 import { normalizeError } from '@/core/txManager'
 import {
   ensureRecentReadProvider,
@@ -45,6 +46,58 @@ beforeEach(() => {
 })
 
 describe('RPC retry policy', () => {
+  it.each([0, 1, 3])(
+    'keeps the configured retry count when normalizing a rate limit: %i',
+    async (retries) => {
+      const original = Object.assign(new Error('HTTP 429'), {
+        response: { statusCode: 429, headers: {} }
+      })
+      const operation = vi.fn(async () => {
+        throw original
+      })
+      const sleep = vi.fn(async () => {})
+      const error = await withRetry(operation, { retries, sleep, jitterRatio: 0 }).catch(
+        (caught: unknown) => caught
+      )
+      expect(error).toBeInstanceOf(RpcRateLimitError)
+      expect(error).toMatchObject({ cause: original, code: 'RPC_RATE_LIMITED' })
+      expect((error as Error).cause).toBe(original)
+      expect(normalizeError(error)).toBe(
+        'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
+      )
+      expect(operation).toHaveBeenCalledTimes(retries + 1)
+      expect(sleep.mock.calls).toEqual([[1_000], [1_000], [1_600]].slice(0, retries))
+    }
+  )
+
+  it('preserves an already normalized rate limit and its remaining cooldown', async () => {
+    const error = new RpcRateLimitError(1_234)
+    await expect(withRetry(async () => Promise.reject(error), { retries: 0 })).rejects.toBe(error)
+  })
+
+  it.each([
+    new RpcReadInvalidatedError(),
+    new DOMException('rate limit read cancelled', 'AbortError'),
+    Object.assign(new Error('execution reverted: rate limit'), { code: 'CALL_EXCEPTION' }),
+    Object.assign(new Error('rate limit'), {
+      info: { error: { code: -32005, message: 'Too Many Requests', data: '0x08c379a0' } }
+    }),
+    Object.assign(new Error('capacity'), {
+      info: { error: { code: -32005, message: 'query returned more than 1000 results' } }
+    })
+  ])(
+    'does not turn semantic failures or cancellation into a retry suggestion: %s',
+    async (error) => {
+      const operation = vi.fn(async () => {
+        throw error
+      })
+      const sleep = vi.fn(async () => {})
+      await expect(withRetry(operation, { sleep })).rejects.toBe(error)
+      expect(operation).toHaveBeenCalledOnce()
+      expect(sleep).not.toHaveBeenCalled()
+    }
+  )
+
   it('preserves the production read timeout type and label through UI normalization', async () => {
     vi.useFakeTimers()
     const operation = vi.fn(() => new Promise<string>(() => {}))
