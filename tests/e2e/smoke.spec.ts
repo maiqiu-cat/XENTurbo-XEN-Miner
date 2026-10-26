@@ -2158,7 +2158,11 @@ test.describe('Traditional Chinese interface', () => {
   test.use({ locale: 'zh-TW' })
 
   for (const chainId of [1, 137] as const) {
-    for (const failure of ['http-ordinary-first-error', 'batch-invalid-request'] as const) {
+    for (const failure of [
+      'http-ordinary-first-error',
+      'batch-invalid-request',
+      'http-batch-first-error'
+    ] as const) {
       test(`restores the list after ${failure} (${chainId}) without changing safety or language`, async ({
         page
       }) => {
@@ -2166,6 +2170,7 @@ test.describe('Traditional Chinese interface', () => {
         await mockSameOriginRpc(page, { vmuCount: 2 })
         await installInjectedWallet(page)
         const endpoints = chainId === 1 ? ETHEREUM_RPC_ROUTES : POLYGON_RPC_ROUTES
+        const transient = failure !== 'batch-invalid-request'
         let faulty = false
         const posts: string[] = []
         const failed = new Set<string>()
@@ -2191,19 +2196,25 @@ test.describe('Traditional Chinese interface', () => {
               const url = route.request().url()
               posts.push(url)
               if (posts.length === 1) await delayed
-              if (
-                failure === 'http-ordinary-first-error' ? !failed.has(url) : endpoints[0].test(url)
-              ) {
+              if (transient ? !failed.has(url) : endpoints[0].test(url)) {
                 failed.add(url)
                 return route.fulfill({
-                  status: failure === 'http-ordinary-first-error' ? 500 : 200,
+                  status:
+                    failure === 'http-ordinary-first-error'
+                      ? 500
+                      : failure === 'http-batch-first-error'
+                        ? 503
+                        : 200,
                   json: {
                     jsonrpc: '2.0',
                     id: null,
                     error:
                       failure === 'http-ordinary-first-error'
                         ? { code: -32603, message: 'Internal error' }
-                        : { code: -32600, message: 'batch size too large' }
+                        : {
+                            code: -32600,
+                            message: transient ? 'Invalid request' : 'batch size too large'
+                          }
                   }
                 })
               }
@@ -2235,7 +2246,7 @@ test.describe('Traditional Chinese interface', () => {
         await expect(page.getByTestId('stale-vmu-warning')).toHaveCount(0)
         expect(await page.locator('tbody tr').allTextContents()).toEqual(rows)
         await expect(page.locator('tbody input[type="checkbox"]').first()).not.toBeChecked()
-        if (failure === 'http-ordinary-first-error') {
+        if (transient) {
           expect(posts).toHaveLength(5)
           endpoints.forEach((endpoint, index) => expect(posts[index]).toMatch(endpoint))
           expect(posts[4]).toBe(posts[0])
@@ -2402,7 +2413,16 @@ test.describe('Traditional Chinese interface', () => {
       'eth_estimateGas',
       'eth_getBlockByNumber'
     ] as const) {
-      for (const failure of ['http-429', 'json-rate-limit'] as const) {
+      const failures =
+        method === 'eth_estimateGas'
+          ? ([
+              'http-429',
+              'json-rate-limit',
+              'http-batch-invalid-request',
+              'http-transient-body'
+            ] as const)
+          : (['http-429', 'json-rate-limit'] as const)
+      for (const failure of failures) {
         test(`explains a preflight RPC rate limit (${chainId}, ${method}, ${failure}) without signing or retaining a soft lock`, async ({
           page
         }) => {
@@ -2452,6 +2472,23 @@ test.describe('Traditional Chinese interface', () => {
                 for (const call of targets) failedCalls.push({ url, params: call.params })
                 if (failure === 'http-429')
                   return route.fulfill({ status: 429, body: 'Fixture rate limit' })
+                if (failure === 'http-batch-invalid-request' || failure === 'http-transient-body')
+                  return route.fulfill({
+                    status: 429,
+                    headers: {
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Expose-Headers': 'Retry-After',
+                      'Retry-After': '5'
+                    },
+                    json: {
+                      jsonrpc: '2.0',
+                      id: null,
+                      error:
+                        failure === 'http-batch-invalid-request'
+                          ? { code: -32600, message: 'Invalid request' }
+                          : { code: -32000, message: 'header not found' }
+                    }
+                  })
                 const replies = batch.map((call) => ({
                   jsonrpc: '2.0',
                   id: call.id,
@@ -2484,9 +2521,14 @@ test.describe('Traditional Chinese interface', () => {
           await page
             .getByRole('button', { name: isMint ? '確認鑄造' : '僅領取', exact: true })
             .click()
-          const chinese = 'RPC 節點受到限流。請稍候再重試。RPC 清單已保留。'
-          const english =
-            'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
+          const timed =
+            failure === 'http-batch-invalid-request' || failure === 'http-transient-body'
+          const chinese = timed
+            ? 'RPC 節點受到限流。請於 5 秒後重試。RPC 清單已保留。'
+            : 'RPC 節點受到限流。請稍候再重試。RPC 清單已保留。'
+          const english = timed
+            ? 'RPC endpoints are rate-limited. Retry in 5s. Your RPC list was preserved.'
+            : 'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
           await expect(page.locator('.modal-body .err-text')).toHaveText(chinese)
           await expect(page.getByTestId('tx-log')).toContainText(`準備失敗：${chinese}`)
           await expect(page.getByRole('button', { name: '開啟 MetaMask 並簽署' })).toHaveCount(0)
@@ -2552,6 +2594,8 @@ test.describe('Traditional Chinese interface', () => {
       'batch-rate-limit',
       'http-ordinary-no-retry-after',
       'http-ordinary-visible-retry-after',
+      'http-batch-invalid-request',
+      'http-transient-body',
       'visible-retry-after'
     ] as const) {
       test(`explains an exhausted RPC rate limit (${chainId}, ${failure}) and restores the list without signing`, async ({
@@ -2572,12 +2616,18 @@ test.describe('Traditional Chinese interface', () => {
         })
         let limited = false
         const limitedPosts: string[] = []
+        const limitedTimes: number[] = []
         const batchSizes: number[] = []
         const errors: string[] = []
         const unexpected: string[] = []
         const endpoints = chainId === 1 ? ETHEREUM_RPC_ROUTES : POLYGON_RPC_ROUTES
+        const priorityCase =
+          failure === 'http-batch-invalid-request' || failure === 'http-transient-body'
+        const retryAfterSeconds = priorityCase ? 5 : 1
         const visibleDelay =
-          failure === 'visible-retry-after' || failure === 'http-ordinary-visible-retry-after'
+          failure === 'visible-retry-after' ||
+          failure === 'http-ordinary-visible-retry-after' ||
+          priorityCase
         page.on('pageerror', (error) => errors.push(error.message))
         await page.route('https://**/*', async (route) => {
           const url = route.request().url()
@@ -2604,6 +2654,7 @@ test.describe('Traditional Chinese interface', () => {
           }
           if (limited && batch.some(isCount) && endpoints.some((pattern) => pattern.test(url))) {
             limitedPosts.push(url)
+            limitedTimes.push(Date.now())
             if (failure === 'batch-rate-limit')
               return route.fulfill({
                 json: {
@@ -2630,16 +2681,21 @@ test.describe('Traditional Chinese interface', () => {
             }
             const headers: Record<string, string> = { 'Access-Control-Allow-Origin': '*' }
             if (failure !== 'no-retry-after' && failure !== 'http-ordinary-no-retry-after')
-              headers['Retry-After'] = '1'
+              headers['Retry-After'] = String(retryAfterSeconds)
             if (visibleDelay) headers['Access-Control-Expose-Headers'] = 'Retry-After'
-            if (failure.startsWith('http-ordinary-'))
+            if (failure.startsWith('http-ordinary-') || priorityCase)
               return route.fulfill({
                 status: 429,
                 headers,
                 json: {
                   jsonrpc: '2.0',
                   id: null,
-                  error: { code: -32603, message: 'Internal error' }
+                  error:
+                    failure === 'http-batch-invalid-request'
+                      ? { code: -32600, message: 'Invalid request' }
+                      : failure === 'http-transient-body'
+                        ? { code: -32000, message: 'header not found' }
+                        : { code: -32603, message: 'Internal error' }
                 }
               })
             return route.fulfill({ status: 429, headers, body: 'Fixture rate limit' })
@@ -2665,21 +2721,30 @@ test.describe('Traditional Chinese interface', () => {
         await expect(page.locator('.action-bar')).toHaveCount(0)
         await expect(page.locator('tbody input[type="checkbox"]').first()).toBeDisabled()
         const chinese = visibleDelay
-          ? 'RPC 節點受到限流。請於 1 秒後重試。RPC 清單已保留。'
+          ? `RPC 節點受到限流。請於 ${retryAfterSeconds} 秒後重試。RPC 清單已保留。`
           : 'RPC 節點受到限流。請稍候再重試。RPC 清單已保留。'
         const english = visibleDelay
-          ? 'RPC endpoints are rate-limited. Retry in 1s. Your RPC list was preserved.'
+          ? `RPC endpoints are rate-limited. Retry in ${retryAfterSeconds}s. Your RPC list was preserved.`
           : 'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
-        await expect(page.locator('.err-banner')).toHaveText(chinese, { timeout: 10_000 })
+        await expect(page.locator('.err-banner')).toHaveText(chinese, {
+          timeout: priorityCase ? 25_000 : 10_000
+        })
         await expect(page.getByRole('button', { name: '重新整理', exact: true })).toBeEnabled()
-        // Retry backoff >= pool cooldown (both 1s); equality is eligible, not a skipped attempt.
+        // Retry backoff >= pool cooldown; equality is eligible, not a skipped attempt.
         expect(limitedPosts).toHaveLength(16)
         for (const endpoint of endpoints)
           expect(limitedPosts.filter((url) => endpoint.test(url))).toHaveLength(4)
+        if (priorityCase) {
+          for (const endpoint of endpoints) {
+            const times = limitedTimes.filter((_, index) => endpoint.test(limitedPosts[index]))
+            for (let i = 1; i < times.length; i++)
+              expect(times[i] - times[i - 1]).toBeGreaterThanOrEqual(5_000)
+          }
+        }
         expect(await page.evaluate(() => window.__rateLimitHeaders)).toEqual(
           failure === 'json-rate-limit' || failure === 'batch-rate-limit'
             ? []
-            : Array(16).fill(visibleDelay ? '1' : null)
+            : Array(16).fill(visibleDelay ? String(retryAfterSeconds) : null)
         )
         await expect(page.locator('body')).not.toContainText('missing revert data')
         await expect(page.locator('body')).not.toContainText('server response 429')

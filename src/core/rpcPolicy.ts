@@ -108,24 +108,29 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
       message
     )
   // An unassigned -32600 rejects the request envelope, not an individual call's semantics.
-  if (rpc?.code === -32600 && responseRpc?.unassigned) return capacity ? 'capacity' : 'endpoint'
+  if (
+    rpc?.code === -32600 &&
+    responseRpc?.unassigned &&
+    !(status === 429 || status === 408 || (status >= 500 && status <= 599))
+  )
+    return capacity ? 'capacity' : 'endpoint'
   if (
     data.some((part) => typeof part === 'string' && /^0x[0-9a-f]+$/i.test(part)) ||
     /execution reverted|\brevert(?:ed)?\b/i.test(message) ||
     /INVALID_ARGUMENT|invalid (?:argument|params?)|insufficient funds|user (?:rejected|denied)|ACTION_REJECTED|NONCE_EXPIRED|execution reverted/i.test(
       `${message} ${outer}`
     ) ||
-    rpc?.code === -32600 ||
+    (rpc?.code === -32600 && !responseRpc?.unassigned) ||
     rpc?.code === -32602 ||
     (value?.code === 'CALL_EXCEPTION' && typeof value.reason === 'string' && value.reason !== '')
   ) {
     return 'permanent'
   }
   if (capacity) return 'capacity'
+  if (status === 429) return 'rate-limit'
 
   // Validated RPC semantics win; HTTP status wins over unstructured HTML/SDK text.
   if (!rpc) {
-    if (status === 429) return 'rate-limit'
     if (status === 408 || (status >= 500 && status <= 599)) return 'transient'
     if (status >= 400 && status <= 499) return 'endpoint'
   }
@@ -156,7 +161,6 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
     return 'transient'
   }
   // Unclassified structured errors still retain the HTTP transport's retry/cooldown signal.
-  if (status === 429) return 'rate-limit'
   if (status === 408 || (status >= 500 && status <= 599)) return 'transient'
   return 'endpoint'
 }

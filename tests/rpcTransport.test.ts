@@ -5,14 +5,31 @@ import { expect, it, vi } from 'vitest'
 import { writeCustomRpc } from '@/config/chains'
 import { ensureHealthyReadProvider, resetProviders, withRetry } from '@/core/rpc'
 import { ReadTimeoutError } from '@/core/readDeadline'
+import { normalizeError } from '@/core/txManager'
 
-it.each(['http-500', 'http-429', 'batch-invalid-request'] as const)(
+it.each([
+  'http-500',
+  'http-429',
+  'batch-invalid-request',
+  'http-503-batch',
+  'http-429-batch',
+  'http-429-transient'
+] as const)(
   'recovers from %s through real loopback HTTP and Node ethers transport',
   async (failure) => {
     const nativeFetch = globalThis.fetch
     const transport = new FetchRequest('https://transport.example/').getUrlFunc
     const endpoints = ['https://transport.example/', 'https://peer.example/']
+    const status = failure.startsWith('http-429')
+      ? 429
+      : failure === 'http-503-batch'
+        ? 503
+        : failure === 'http-500'
+          ? 500
+          : 200
+    const retryAfter = failure === 'http-429' ? 1 : 5
     const reads: Array<{ endpoint: string; time: number }> = []
+    const errors: unknown[] = []
     const server = createServer((request, response) => {
       let body = ''
       request.on('data', (chunk) => {
@@ -27,8 +44,8 @@ it.each(['http-500', 'http-429', 'batch-invalid-request'] as const)(
         if (reading) reads.push({ endpoint: request.url!, time: performance.now() })
         response.setHeader('content-type', 'application/json')
         if (reading && reads.length === 1) {
-          response.statusCode = failure === 'http-500' ? 500 : failure === 'http-429' ? 429 : 200
-          if (failure === 'http-429') response.setHeader('retry-after', '1')
+          response.statusCode = status
+          if (status === 429) response.setHeader('retry-after', String(retryAfter))
           response.end(
             JSON.stringify({
               jsonrpc: '2.0',
@@ -36,7 +53,11 @@ it.each(['http-500', 'http-429', 'batch-invalid-request'] as const)(
               error:
                 failure === 'batch-invalid-request'
                   ? { code: -32600, message: 'batch size too large' }
-                  : { code: -32603, message: 'Internal error' }
+                  : failure.endsWith('-batch')
+                    ? { code: -32600, message: 'Invalid request' }
+                    : failure === 'http-429-transient'
+                      ? { code: -32000, message: 'header not found' }
+                      : { code: -32603, message: 'Internal error' }
             })
           )
           return
@@ -84,16 +105,31 @@ it.each(['http-500', 'http-429', 'batch-invalid-request'] as const)(
       await provider.getBlockNumber()
       await expect(
         withRetry(
-          () =>
-            provider.getTransactionCount('0x0000000000000000000000000000000000000001', 'pending'),
+          async () => {
+            try {
+              return await provider.getTransactionCount(
+                '0x0000000000000000000000000000000000000001',
+                'pending'
+              )
+            } catch (error) {
+              errors.push(error)
+              throw error
+            }
+          },
           { jitterRatio: 0 }
         )
       ).resolves.toBe(42)
       expect(reads.map(({ endpoint }) => endpoint)).toEqual(
         failure === 'batch-invalid-request' ? ['/first', '/second'] : ['/first', '/first']
       )
-      if (failure === 'http-429')
-        expect(reads[1].time - reads[0].time).toBeGreaterThanOrEqual(1_000)
+      expect(errors).toHaveLength(failure === 'batch-invalid-request' ? 0 : 1)
+      if (status === 429) {
+        expect(reads[1].time - reads[0].time).toBeGreaterThanOrEqual(retryAfter * 1_000)
+        expect(normalizeError(errors[0])).toBe(
+          `RPC endpoints are rate-limited. Retry in ${retryAfter}s. Your RPC list was preserved.`
+        )
+      }
+      if (status === 503) expect(reads[1].time - reads[0].time).toBeGreaterThanOrEqual(400)
     } finally {
       resetProviders()
       FetchRequest.registerGetUrl(transport)

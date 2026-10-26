@@ -13,6 +13,7 @@ import {
 import { ReadTimeoutError } from '@/core/readDeadline'
 import { RpcRateLimitError, rpcFailureKind, rpcRetryAfterMs } from '@/core/rpcPolicy'
 import { normalizeError } from '@/core/txManager'
+import { createI18n } from '@/i18n'
 
 interface RpcCall {
   id: number
@@ -36,11 +37,12 @@ interface Failure {
 
 const originalTransport = new FetchRequest('https://rpc.example/').getUrlFunc
 const urls = ['https://first.example/', 'https://second.example/', 'https://third.example/']
+const fourUrls = [...urls, 'https://fourth.example/']
 const address = '0x0000000000000000000000000000000000000001'
 const multicallInterface = new Interface(Multicall3ABI)
 const calls = [{ target: address, allowFailure: true, callData: '0x' }]
 const encoded = multicallInterface.encodeFunctionResult('aggregate3', [[[true, '0xab']]])
-const requests: Array<{ url: string; calls: RpcCall[] }> = []
+const requests: Array<{ url: string; calls: RpcCall[]; at: number }> = []
 const failures = new Map<string, Failure>()
 const discoveries = new Map<string, number>()
 const hash = `0x${'a'.repeat(64)}`
@@ -64,10 +66,10 @@ beforeEach(() => {
   receiptAvailable = false
   blockHeight = 42
   FetchRequest.registerGetUrl(async (request) => {
-    if (!urls.includes(request.url)) throw new Error('Unexpected RPC host')
+    if (!fourUrls.includes(request.url)) throw new Error('Unexpected RPC host')
     const payload = JSON.parse(new TextDecoder().decode(request.body!)) as RpcCall | RpcCall[]
     const batch = Array.isArray(payload) ? payload : [payload]
-    requests.push({ url: request.url, calls: batch })
+    requests.push({ url: request.url, calls: batch, at: Date.now() })
     let failure = failures.get(request.url)
     const discoveryDelay = failure?.discoveryDelay
     if (discoveryDelay && batch.every(({ method }) => method === 'eth_chainId')) {
@@ -165,7 +167,7 @@ afterEach(() => {
 })
 
 async function ready(count = 2) {
-  writeCustomRpc('eth', urls.slice(0, count))
+  writeCustomRpc('eth', fourUrls.slice(0, count))
   const provider = await ensureHealthyReadProvider('eth', async () => '0x1')
   const warm = provider.getBlockNumber()
   await vi.advanceTimersByTimeAsync(100)
@@ -179,6 +181,100 @@ function readRequests(method = 'eth_getTransactionCount') {
 }
 
 describe('bounded read-only RPC failover', () => {
+  it.each([408, 500, 503])(
+    'recovers a single endpoint after an HTTP %s whole-batch invalid request',
+    async (status) => {
+      const provider = await ready(1)
+      failures.set(urls[0], {
+        status,
+        readFailures: 1,
+        body: JSON.stringify({ id: null, error: { code: -32600, message: 'Invalid request' } })
+      })
+      const sleep = vi.fn(
+        (delay: number) => new Promise<void>((resolve) => setTimeout(resolve, delay))
+      )
+      const result = withRetry(() => provider.send('eth_getCode', [address, 'latest']), {
+        sleep,
+        jitterRatio: 0
+      }).catch((error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(await result).toBe('0x6001')
+      expect(sleep.mock.calls).toEqual([[400]])
+      expect(readRequests('eth_getCode').map(({ url }) => url)).toEqual([urls[0], urls[0]])
+      expect(requests).toHaveLength(2)
+    }
+  )
+
+  for (const count of [1, 4]) {
+    it.each([
+      { code: -32600, message: 'Invalid request' },
+      { code: -32000, message: 'header not found' }
+    ])(
+      `cools ${count} HTTP 429 endpoints before any replay and translates the error: %j`,
+      async (error) => {
+        const provider = await ready(count)
+        const endpoints = fourUrls.slice(0, count)
+        for (const url of endpoints)
+          failures.set(url, {
+            status: 429,
+            retryAfter: '5',
+            body: JSON.stringify({ id: null, error })
+          })
+        const read = () => provider.send('eth_getCode', [address, 'latest'])
+        const first = read().catch((failure: unknown) => failure)
+        await vi.advanceTimersByTimeAsync(100)
+        const cause = await first
+        expect(cause).toMatchObject({ code: 'SERVER_ERROR', response: { statusCode: 429 } })
+        expect(rpcRetryAfterMs(cause)).toBe(5_000)
+        expect(rpcFailureKind(cause)).toBe('rate-limit')
+        const english = 'RPC endpoints are rate-limited. Retry in 5s. Your RPC list was preserved.'
+        const chinese = 'RPC 節點受到限流。請於 5 秒後重試。RPC 清單已保留。'
+        const translator = createI18n({
+          languages: () => ['zh-TW'],
+          storage: () => ({ getItem: () => null, setItem: () => {}, removeItem: () => {} })
+        })
+        translator.restore()
+        expect(normalizeError(cause)).toBe(english)
+        expect(translator.message(normalizeError(cause))).toBe(chinese)
+        expect(readRequests('eth_getCode').map(({ url }) => url)).toEqual(endpoints)
+        const firstPosts = requests.length
+        const concurrent = [read(), read()].map((request) =>
+          request.catch((failure: unknown) => failure)
+        )
+        await vi.advanceTimersByTimeAsync(100)
+        for (const request of concurrent)
+          expect(await request).toMatchObject({ code: 'RPC_RATE_LIMITED' })
+        expect(requests).toHaveLength(firstPosts)
+        await vi.advanceTimersByTimeAsync(5_000)
+        requests.length = 0
+        const sleep = vi.fn(
+          (delay: number) => new Promise<void>((resolve) => setTimeout(resolve, delay))
+        )
+        const result = withRetry(read, { sleep, jitterRatio: 0 }).catch(
+          (failure: unknown) => failure
+        )
+        await vi.advanceTimersByTimeAsync(20_000)
+        const exhausted = await result
+        expect(exhausted).toMatchObject({
+          code: 'RPC_RATE_LIMITED',
+          cause: { code: 'SERVER_ERROR' }
+        })
+        expect(normalizeError(exhausted)).toBe(english)
+        expect(translator.message(normalizeError(exhausted))).toBe(chinese)
+        expect(sleep.mock.calls).toEqual([[5_000], [5_000], [5_000]])
+        const reads = readRequests('eth_getCode')
+        expect(reads).toHaveLength(count * 4)
+        expect(requests).toHaveLength(count * 4)
+        for (const endpoint of endpoints) {
+          const attempts = reads.filter(({ url }) => url === endpoint)
+          expect(attempts).toHaveLength(4)
+          for (let i = 1; i < attempts.length; i++)
+            expect(attempts[i].at - attempts[i - 1].at).toBeGreaterThanOrEqual(5_000)
+        }
+      }
+    )
+  }
+
   it.each([408, 500, 503])(
     'recovers a single endpoint after one HTTP %s ordinary JSON-RPC failure',
     async (status) => {
@@ -1122,11 +1218,50 @@ describe('one retry layer and structured errors', () => {
                   shortMessage: 'missing response for request',
                   value: wrapper === 'batch-array' ? [envelope] : envelope
                 }
-          expect(rpcFailureKind(failure)).toBe(expected)
-          expect(isRetryableRpcError(failure)).toBe(false)
+          const kind =
+            wrapper === 'responseBody' && expected !== 'capacity' ? 'rate-limit' : expected
+          expect(rpcFailureKind(failure)).toBe(kind)
+          expect(isRetryableRpcError(failure)).toBe(kind === 'rate-limit')
         }
       )
     }
+  }
+
+  for (const status of [408, 500, 503]) {
+    it.each([null, undefined])(
+      `retains HTTP ${status} for an unassigned -32600 with id %s`,
+      (id) => {
+        const failure = {
+          code: 'SERVER_ERROR',
+          response: { statusCode: status },
+          info: {
+            responseBody: JSON.stringify({
+              id,
+              error: { code: -32600, message: 'Invalid request' }
+            })
+          }
+        }
+        expect(rpcFailureKind(failure)).toBe('transient')
+      }
+    )
+  }
+
+  for (const wrapper of ['responseBody', 'info.error'] as const) {
+    it.each(['header not found', 'missing trie node', 'unknown block'])(
+      `classifies HTTP 429 before transient ${wrapper} wording: %s`,
+      (message) => {
+        const error = { code: -32000, message }
+        const failure = {
+          code: 'SERVER_ERROR',
+          response: { statusCode: 429 },
+          info:
+            wrapper === 'responseBody'
+              ? { responseBody: JSON.stringify({ id: null, error }) }
+              : { error }
+        }
+        expect(rpcFailureKind(failure)).toBe('rate-limit')
+      }
+    )
   }
 
   it.each([undefined, 'Invalid RPC receipt response', 'invalid value for value.hash'])(
