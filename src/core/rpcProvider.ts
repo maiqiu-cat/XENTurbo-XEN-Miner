@@ -77,6 +77,7 @@ interface Endpoint {
   provider: EndpointProvider
   blockedUntil: number
   blockedAt: number
+  cooldown?: { serverDelay: boolean; cause: unknown }
 }
 
 class ReadEndpointPool {
@@ -123,7 +124,10 @@ class ReadEndpointPool {
 
   refreshHealth(startedAt: number): void {
     for (const endpoint of this.endpoints) {
-      if (endpoint.blockedAt <= startedAt) endpoint.blockedUntil = 0
+      if (endpoint.blockedAt <= startedAt) {
+        endpoint.blockedUntil = 0
+        endpoint.cooldown = undefined
+      }
     }
     this.preferred = 0
   }
@@ -162,6 +166,7 @@ class ReadEndpointPool {
       let lastError: unknown
       let nonRetryableError: unknown
       let skippedUntil = Infinity
+      let skippedCooldown: Endpoint['cooldown']
       const stalls = new Set<ReturnType<typeof setTimeout>>()
       const finish = (result: () => void) => {
         if (settled) return
@@ -191,7 +196,10 @@ class ReadEndpointPool {
           const candidate = ordered[next++]
           const endpoint = this.endpoints[candidate]
           if (endpoint.blockedUntil > Date.now()) {
-            skippedUntil = Math.min(skippedUntil, endpoint.blockedUntil)
+            if (endpoint.blockedUntil < skippedUntil) {
+              skippedUntil = endpoint.blockedUntil
+              skippedCooldown = endpoint.cooldown
+            }
             continue
           }
           index = candidate
@@ -204,7 +212,12 @@ class ReadEndpointPool {
                 nonRetryableError ??
                   lastError ??
                   (Number.isFinite(skippedUntil)
-                    ? new RpcRateLimitError(Math.max(0, skippedUntil - Date.now()))
+                    ? new RpcRateLimitError(
+                        skippedCooldown?.serverDelay
+                          ? Math.max(0, skippedUntil - Date.now())
+                          : undefined,
+                        { cause: skippedCooldown?.cause }
+                      )
                     : new Error('RPC endpoints unavailable'))
               )
             )
@@ -250,7 +263,9 @@ class ReadEndpointPool {
               // Replaying the same oversized body cannot fix a capacity rejection.
               if (kind === 'capacity' || kind === 'endpoint') nonRetryableError = error
               if (kind === 'rate-limit') {
-                const wait = rpcRetryAfterMs(error) ?? 1_000
+                const serverDelay = rpcRetryAfterMs(error)
+                const wait = serverDelay ?? 1_000
+                endpoint.cooldown = { serverDelay: serverDelay !== null, cause: error }
                 endpoint.blockedAt = Date.now()
                 endpoint.blockedUntil = endpoint.blockedAt + Math.min(wait, MAX_COOLDOWN_MS)
               }

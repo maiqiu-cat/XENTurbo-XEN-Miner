@@ -7,11 +7,19 @@ import { nextTick } from 'vue'
 import MintList from '@/components/MintList.vue'
 import { useVmuStore } from '@/stores/vmuStore'
 import { useWalletStore } from '@/stores/walletStore'
+import { formatDate } from '@/utils/format'
 
-const chainClock = vi.hoisted(() => ({ readChainTimestamp: vi.fn() }))
+const chainClock = vi.hoisted(() => ({
+  readChainTimestamp: vi.fn(),
+  readVmuCount: vi.fn(),
+  readGlobalRank: vi.fn(),
+  readWalletVmus: vi.fn()
+}))
+const snapshots = vi.hoisted(() => ({ loadSnapshot: vi.fn(), saveSnapshot: vi.fn() }))
+vi.mock('@/core/idb', () => snapshots)
 vi.mock('@/core/chainReader', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/core/chainReader')>()),
-  readChainTimestamp: chainClock.readChainTimestamp
+  ...chainClock
 }))
 vi.mock('@/core/rpc', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/core/rpc')>()),
@@ -59,7 +67,14 @@ function mountClaimableList() {
 }
 
 describe('MintList selection context', () => {
-  beforeEach(() => setActivePinia(createPinia()))
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    snapshots.loadSnapshot.mockResolvedValue(null)
+    snapshots.saveSnapshot.mockResolvedValue(undefined)
+    chainClock.readChainTimestamp.mockResolvedValue(Date.now())
+    chainClock.readVmuCount.mockResolvedValue(1)
+    chainClock.readGlobalRank.mockResolvedValue(100)
+  })
   afterEach(() => {
     useVmuStore().detach()
     vi.useRealTimers()
@@ -77,6 +92,59 @@ describe('MintList selection context', () => {
     expect(wrapper.text()).not.toContain('VMUs selected')
     expect((wrapper.get('input[type="checkbox"]').element as HTMLInputElement).checked).toBe(false)
   })
+
+  it.each(['cache', 'failed-retry'] as const)(
+    'keeps outdated rows labelled during a pending %s refresh until a complete read succeeds',
+    async (scenario) => {
+      const { wrapper, store } = mountClaimableList()
+      const rows = store.vmus.map((vmu) => ({ ...vmu }))
+      const loadedAt = Date.now() - 3 * 86_400_000
+      store.syncedAt = loadedAt
+      chainClock.readWalletVmus.mockResolvedValue(rows)
+      if (scenario === 'cache') {
+        snapshots.loadSnapshot.mockResolvedValueOnce({
+          chain: 'eth',
+          wallet: ACCOUNT_A,
+          vmuCount: 1,
+          vmus: rows,
+          syncedAt: loadedAt,
+          chainTimestampMs: Date.now()
+        })
+      } else {
+        chainClock.readVmuCount.mockRejectedValueOnce(new Error('offline'))
+        await store.hardRefresh()
+        expect(store.error).not.toBeNull()
+      }
+      let release!: (count: number) => void
+      chainClock.readVmuCount.mockReturnValueOnce(
+        new Promise<number>((resolve) => {
+          release = resolve
+        })
+      )
+      const refresh = scenario === 'cache' ? store.load('eth', ACCOUNT_A) : store.hardRefresh()
+      try {
+        await flushPromises()
+        expect(store.loading).toBe(true)
+        expect(store.error).toBeNull()
+        expect(store.transactionReady).toBe(false)
+        const warning = wrapper.get('[data-testid="stale-vmu-warning"]')
+        expect(warning.text()).toContain('Previously loaded VMU data may be outdated.')
+        expect(warning.text()).toContain(`Last loaded: ${formatDate(loadedAt)}`)
+        expect(wrapper.findAll('tbody tr')).toHaveLength(1)
+        expect(wrapper.get('input[type="checkbox"]').attributes('disabled')).toBeDefined()
+      } finally {
+        release(1)
+        await refresh
+        await nextTick()
+      }
+      expect(store.transactionReady).toBe(true)
+      expect(wrapper.find('[data-testid="stale-vmu-warning"]').exists()).toBe(false)
+      expect(wrapper.get('input[type="checkbox"]').attributes('disabled')).toBeUndefined()
+      expect((wrapper.get('input[type="checkbox"]').element as HTMLInputElement).checked).toBe(
+        false
+      )
+    }
+  )
 
   it('clears selected VMUs after a completed full refresh', async () => {
     const { wrapper, store } = mountClaimableList()
@@ -161,6 +229,64 @@ describe('MintList selection context', () => {
     expect(wrapper.find('input[type="checkbox"]').exists()).toBe(false)
     wrapper.unmount()
   })
+
+  it('keeps the page but clears selection during refresh, without flashing a stale warning', async () => {
+    const { wrapper, store, wallet } = mountClaimableList()
+    store.vmus = Array.from({ length: 250 }, (_, index) => ({
+      ...store.vmus[0],
+      id: index + 1,
+      maturityTs: index * 1000
+    }))
+    store.vmuCount = 250
+    await nextTick()
+    await wrapper.get('button[aria-label="Next page"]').trigger('click')
+    await wrapper.get('input[type="checkbox"]').trigger('click')
+    expect(wrapper.text()).toContain('1 VMUs selected')
+    store.refreshGen += 1
+    store.loading = true
+    store.stale = true
+    await nextTick()
+    expect(wrapper.text()).toContain('Page 2 of 3')
+    expect(wrapper.text()).not.toContain('VMUs selected')
+    expect(wrapper.find('[data-testid="stale-vmu-warning"]').exists()).toBe(false)
+    expect(wrapper.get('input[type="checkbox"]').attributes('disabled')).toBeDefined()
+    store.syncedAt = 2
+    store.stale = false
+    store.loading = false
+    await nextTick()
+    expect(wrapper.text()).toContain('Page 2 of 3')
+    wallet.contextGen += 1
+    await nextTick()
+    expect(wrapper.text()).toContain('Page 1 of 3')
+    await wrapper.get('button[aria-label="Next page"]').trigger('click')
+    store.vmus = store.vmus.slice(0, 100)
+    await nextTick()
+    expect(wrapper.findAll('tbody tr')).toHaveLength(100)
+    expect(wrapper.text()).not.toContain('Page 2')
+  })
+
+  it.each(['focus', 'visibilitychange', 'pageshow'])(
+    'does not rescan stale matured rows after repeated %s events',
+    async (event) => {
+      vi.useFakeTimers()
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+      const { wrapper, store } = mountClaimableList()
+      store.vmus[0].status = 'MINTING'
+      store.stale = true
+      const refresh = vi.spyOn(store, 'refresh').mockResolvedValue()
+      chainClock.readChainTimestamp.mockResolvedValue(Date.now())
+      for (let index = 0; index < 5; index++) {
+        const resume = new Event(event)
+        if (event === 'pageshow') Object.defineProperty(resume, 'persisted', { value: true })
+        ;(event === 'visibilitychange' ? document : window).dispatchEvent(resume)
+        await flushPromises()
+        await vi.advanceTimersByTimeAsync(1500)
+      }
+      expect(refresh).not.toHaveBeenCalled()
+      expect(store.transactionReady).toBe(false)
+      wrapper.unmount()
+    }
+  )
 
   it('advances with a monotonic clock and waits for chain confirmation at maturity', async () => {
     vi.useFakeTimers()

@@ -112,6 +112,7 @@ interface RpcMockState {
   blockTimestamp?: number
   maturityTimestamp?: number
   maturityVmuId?: number
+  maturityByProxy?: Map<string, number>
 }
 
 function contractReadResult(chainId: 1 | 137, params: unknown[], state: RpcMockState = {}): string {
@@ -190,7 +191,8 @@ function contractReadResult(chainId: 1 | 137, params: unknown[], state: RpcMockS
             : empty
               ? 0n
               : BigInt(
-                  maturityApplies ? (state.maturityTimestamp ?? 1_700_000_000) : 1_700_000_000
+                  state.maturityByProxy?.get(proxy.toLowerCase()) ??
+                    (maturityApplies ? (state.maturityTimestamp ?? 1_700_000_000) : 1_700_000_000)
                 ),
           minting ? 200n : empty ? 0n : 100n,
           3_000n,
@@ -1816,6 +1818,8 @@ for (const stage of ['preparing', 'send-preflight'] as const) {
       })
       .toBe(1)
     try {
+      const priorLogs = await page.getByTestId('tx-log-entry').allTextContents()
+      expect(priorLogs.length).toBeGreaterThan(0)
       state.blockTimestamp = BLOCK_TIMESTAMP + 10
       await expect
         .poll(
@@ -1830,15 +1834,21 @@ for (const stage of ['preparing', 'send-preflight'] as const) {
       await expect(page.locator('.modal-body .err-text')).toContainText(
         'No transaction was submitted.'
       )
+      const invalidatedLogs = await page.getByTestId('tx-log-entry').allTextContents()
+      expect(invalidatedLogs.slice(0, priorLogs.length)).toEqual(priorLogs)
+      expect(invalidatedLogs).toHaveLength(priorLogs.length + 1)
+      // Refresh stays disabled while cancellation drains, even after its loading label clears.
       await expect
         .poll(
           async () => {
             await page.clock.runFor(50)
-            return page.getByTestId('stale-vmu-warning').count()
+            return page.getByRole('button', { name: 'Refresh', exact: true }).count()
           },
           { timeout: 15_000, intervals: [100] }
         )
-        .toBe(0)
+        .toBe(1)
+      await expect(page.getByRole('button', { name: 'Refresh', exact: true })).toBeDisabled()
+      await expect(page.getByTestId('stale-vmu-warning')).toHaveCount(0)
       await expect(page.getByTestId('operation-blocked-reason')).toContainText(
         'previous operation to finish cancelling'
       )
@@ -2031,8 +2041,371 @@ test('two tabs serialize wallet sends with a shared Web Lock', async ({ page, co
   await second.close()
 })
 
+for (const failure of ['unreadable', 'changed'] as const) {
+  test(`selected VMU ${failure} has distinct bilingual preflight advice without a wallet send`, async ({
+    page
+  }) => {
+    await emulateDesktopGoogleChrome(page)
+    const state: RpcMockState = { vmuCount: 1 }
+    await mockSameOriginRpc(page, state)
+    await installInjectedWallet(page)
+    const errors: string[] = []
+    page.on('pageerror', (error) => errors.push(error.message))
+    await page.goto('/')
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+    await page.locator('tbody input[type="checkbox"]').first().check()
+    if (failure === 'unreadable') state.unreadableVmuId = 1
+    else state.maturityTimestamp = BLOCK_TIMESTAMP + 86_400
+    await page.getByRole('button', { name: 'Claim only', exact: true }).click()
+    const error = page.locator('.modal-body .err-text')
+    await expect(error).toHaveText(
+      failure === 'unreadable'
+        ? 'Could not re-read the selected VMUs (ids 1). No transaction was submitted. Refresh and retry.'
+        : 'VMU state changed on-chain (ids 1). Refresh and retry.'
+    )
+    await page.getByRole('button', { name: 'Close transaction dialog' }).click()
+    await page.getByTestId('language-selector').selectOption('zh-Hant')
+    await page.getByRole('button', { name: '僅領取', exact: true }).click()
+    await expect(error).toHaveText(
+      failure === 'unreadable'
+        ? '無法重新讀取所選 VMU（ID 1）。此次操作未送出任何交易。請重新整理後再試。'
+        : '鏈上的 VMU 狀態已變更（ID 1）。請重新整理後再試。'
+    )
+    await captureQaScreenshot(page, `selected-read-${failure}-zh`)
+    expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+      sendAttempts: 0,
+      successfulBroadcasts: 0
+    })
+    expect(errors).toEqual([])
+  })
+}
+
+test('refresh preserves the visible page without a transient stale banner or table shift', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  const maturityByProxy = new Map(
+    Array.from({ length: 201 }, (_, index) => [
+      computeProxyAddress({
+        factory: FACTORY,
+        vmuTemplate: VMU_TEMPLATE,
+        wallet: ACCOUNT_A,
+        vmuId: index + 1
+      }).toLowerCase(),
+      1_700_000_000 + index
+    ])
+  )
+  const state: RpcMockState = { vmuCount: 201, maturityByProxy }
+  await mockSameOriginRpc(page, state)
+  await installInjectedWallet(page)
+  let hold = false
+  let release!: () => void
+  const delayed = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  for (const endpoint of ETHEREUM_RPC_ROUTES) {
+    await page.route(endpoint, async (route) => {
+      const payload = route.request().postDataJSON()
+      if (
+        hold &&
+        (Array.isArray(payload) ? payload : [payload]).some(
+          (call: { method: string }) => call.method === 'eth_call'
+        )
+      )
+        await delayed
+      return route.fallback()
+    })
+  }
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+  await page.getByRole('button', { name: 'Next page' }).click()
+  await expect(page.locator('.pagination')).toContainText('Page 2 of 3')
+  await page.locator('tbody input[type="checkbox"]').first().check()
+  const card = page.locator('.card').filter({ has: page.locator('.group-note') })
+  const tableOffset = () =>
+    card.evaluate(
+      (node) =>
+        node.querySelector('table')!.getBoundingClientRect().y - node.getBoundingClientRect().y
+    )
+  const before = await tableOffset()
+  hold = true
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+  try {
+    await expect(page.getByRole('button', { name: 'Refreshing...', exact: true })).toBeDisabled()
+    await expect(page.locator('.pagination')).toContainText('Page 2 of 3')
+    await expect(page.getByTestId('stale-vmu-warning')).toHaveCount(0)
+    await expect(page.locator('.action-bar')).toHaveCount(0)
+    expect(await tableOffset()).toBe(before)
+    expect(await page.locator('tbody input[type="checkbox"]').first().isDisabled()).toBe(true)
+  } finally {
+    hold = false
+    release()
+  }
+  await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+  await expect(page.locator('.pagination')).toContainText('Page 2 of 3')
+  await expect(page.getByTestId('stale-vmu-warning')).toHaveCount(0)
+  expect(await tableOffset()).toBe(before)
+  await captureQaScreenshot(page, 'refresh-preserved-page')
+  expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+    sendAttempts: 0,
+    successfulBroadcasts: 0
+  })
+})
+
 test.describe('Traditional Chinese interface', () => {
   test.use({ locale: 'zh-TW' })
+
+  for (const chainId of [1, 137] as const) {
+    for (const failure of [
+      'http-ordinary-first-error',
+      'batch-invalid-request',
+      'http-batch-first-error'
+    ] as const) {
+      test(`restores the list after ${failure} (${chainId}) without changing safety or language`, async ({
+        page
+      }) => {
+        await emulateDesktopGoogleChrome(page)
+        await mockSameOriginRpc(page, { vmuCount: 2 })
+        await installInjectedWallet(page)
+        const endpoints = chainId === 1 ? ETHEREUM_RPC_ROUTES : POLYGON_RPC_ROUTES
+        const transient = failure !== 'batch-invalid-request'
+        let faulty = false
+        const posts: string[] = []
+        const failed = new Set<string>()
+        const errors: string[] = []
+        page.on('pageerror', (error) => errors.push(error.message))
+        let release!: () => void
+        const delayed = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        for (const endpoint of endpoints) {
+          await page.route(endpoint, async (route) => {
+            const payload = route.request().postDataJSON()
+            const batch = Array.isArray(payload) ? payload : [payload]
+            const isCount = batch.some((call: { method: string; params: unknown[] }) => {
+              const tx = call.params[0] as { to?: string; data?: string } | undefined
+              return (
+                call.method === 'eth_call' &&
+                tx?.to?.toLowerCase() === FACTORY.toLowerCase() &&
+                tx.data?.startsWith(factoryInterface.getFunction('vmuCount')!.selector)
+              )
+            })
+            if (faulty && isCount) {
+              const url = route.request().url()
+              posts.push(url)
+              if (posts.length === 1) await delayed
+              if (transient ? !failed.has(url) : endpoints[0].test(url)) {
+                failed.add(url)
+                return route.fulfill({
+                  status:
+                    failure === 'http-ordinary-first-error'
+                      ? 500
+                      : failure === 'http-batch-first-error'
+                        ? 503
+                        : 200,
+                  json: {
+                    jsonrpc: '2.0',
+                    id: null,
+                    error:
+                      failure === 'http-ordinary-first-error'
+                        ? { code: -32603, message: 'Internal error' }
+                        : {
+                            code: -32600,
+                            message: transient ? 'Invalid request' : 'batch size too large'
+                          }
+                  }
+                })
+              }
+            }
+            return route.fallback()
+          })
+        }
+        await page.goto('/')
+        await expect(page).toHaveTitle('XENTurbo XEN Miner')
+        await page.evaluate((id) => window.__walletMock.emitChain(id), `0x${chainId.toString(16)}`)
+        await page.getByRole('button', { name: '連接錢包' }).first().click()
+        await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeEnabled()
+        const rows = await page.locator('tbody tr').allTextContents()
+        await page.locator('tbody input[type="checkbox"]').first().check()
+        faulty = true
+        await page.getByRole('button', { name: '重新整理', exact: true }).click()
+        try {
+          await expect(
+            page.getByRole('button', { name: '正在重新整理…', exact: true })
+          ).toBeDisabled()
+          await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeDisabled()
+          await expect(page.locator('tbody input[type="checkbox"]').first()).toBeDisabled()
+          await expect(page.locator('.action-bar')).toHaveCount(0)
+        } finally {
+          release()
+        }
+        await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeEnabled()
+        await expect(page.locator('.err-banner,.rank-banner,.tag-warn')).toHaveCount(0)
+        await expect(page.getByTestId('stale-vmu-warning')).toHaveCount(0)
+        expect(await page.locator('tbody tr').allTextContents()).toEqual(rows)
+        await expect(page.locator('tbody input[type="checkbox"]').first()).not.toBeChecked()
+        if (transient) {
+          expect(posts).toHaveLength(5)
+          endpoints.forEach((endpoint, index) => expect(posts[index]).toMatch(endpoint))
+          expect(posts[4]).toBe(posts[0])
+        } else {
+          expect(posts).toHaveLength(2)
+          expect(posts[0]).toMatch(endpoints[0])
+          expect(posts[1]).toMatch(endpoints[1])
+        }
+        await captureQaScreenshot(page, `rpc-recovered-${chainId}-${failure}-zh`)
+        await page.getByTestId('language-selector').selectOption('en')
+        await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+        await expect(page.locator('.group-note')).toContainText('2 VMUs total')
+        faulty = false
+        await page.reload()
+        await expect(page.getByTestId('language-selector')).toHaveValue('en')
+        await page.evaluate((id) => window.__walletMock.emitChain(id), `0x${chainId.toString(16)}`)
+        await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+        await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+        await expect(page.locator('.err-banner,.rank-banner,.tag-warn')).toHaveCount(0)
+        expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+          sendAttempts: 0,
+          successfulBroadcasts: 0
+        })
+        expect(await page.evaluate(() => localStorage.getItem('sm.customRpc'))).toBeNull()
+        expect(errors).toEqual([])
+      })
+    }
+  }
+
+  for (const scenario of ['cached', 'failed-retry'] as const) {
+    test(`keeps stale data labelled while the ${scenario} refresh is pending`, async ({ page }) => {
+      await page.setViewportSize({ width: scenario === 'cached' ? 1280 : 390, height: 900 })
+      await emulateDesktopGoogleChrome(page)
+      await mockSameOriginRpc(page, { vmuCount: 2 })
+      await installInjectedWallet(page)
+      const errors: string[] = []
+      page.on('pageerror', (error) => errors.push(error.message))
+      let mode: 'healthy' | 'failed' | 'pending' = 'healthy'
+      let release!: () => void
+      const delayed = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      for (const endpoint of ETHEREUM_RPC_ROUTES) {
+        await page.route(endpoint, async (route) => {
+          const payload = route.request().postDataJSON()
+          const batch = Array.isArray(payload) ? payload : [payload]
+          const isCount = batch.some((call: { method: string; params: unknown[] }) => {
+            const tx = call.params[0] as { to?: string; data?: string } | undefined
+            return (
+              call.method === 'eth_call' &&
+              tx?.to?.toLowerCase() === FACTORY.toLowerCase() &&
+              tx.data?.startsWith(factoryInterface.getFunction('vmuCount')!.selector)
+            )
+          })
+          if (isCount && mode === 'pending') await delayed
+          if (isCount && mode === 'failed')
+            return route.fulfill({ status: 401, body: 'Fixture read failure' })
+          return route.fallback()
+        })
+      }
+      await page.goto('/')
+      await expect(page).toHaveTitle('XENTurbo XEN Miner')
+      await page.getByRole('button', { name: '連接錢包' }).first().click()
+      await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeEnabled()
+      const inventory = () =>
+        page.locator('tbody tr').evaluateAll((rows) =>
+          rows.map((row) =>
+            Array.from(row.querySelectorAll('td'))
+              .slice(1, 5)
+              .map((cell) => cell.textContent)
+          )
+        )
+      const rows = await inventory()
+      const rewards = await page.locator('tbody tr td:last-child').allTextContents()
+      await page.getByTestId('language-selector').selectOption('en')
+      const initialEnglishWidth = await page.evaluate(() => document.documentElement.scrollWidth)
+      await page.getByTestId('language-selector').selectOption('zh-Hant')
+      let expectedDate: string | undefined
+      if (scenario === 'cached') {
+        expectedDate = await page.evaluate(async (wallet) => {
+          const db = await new Promise<IDBDatabase>((resolve, reject) => {
+            const request = indexedDB.open('standalone-miner', 2)
+            request.onsuccess = () => resolve(request.result)
+            request.onerror = () => reject(request.error)
+          })
+          try {
+            const loadedAt = Date.now() - 3 * 86_400_000
+            await new Promise<void>((resolve, reject) => {
+              const transaction = db.transaction('walletVmus', 'readwrite')
+              const store = transaction.objectStore('walletVmus')
+              const request = store.get(`eth:${wallet.toLowerCase()}`)
+              request.onsuccess = () => store.put({ ...request.result, syncedAt: loadedAt })
+              transaction.oncomplete = () => resolve()
+              transaction.onerror = () => reject(transaction.error)
+              transaction.onabort = () => reject(transaction.error)
+            })
+            const date = new Date(loadedAt)
+            return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+          } finally {
+            db.close()
+          }
+        }, ACCOUNT_A)
+        mode = 'pending'
+        await page.reload()
+        await page.getByRole('button', { name: '連接錢包' }).first().click()
+      } else {
+        mode = 'failed'
+        await page.getByRole('button', { name: '重新整理', exact: true }).click()
+        await expect(page.locator('.err-banner')).toHaveText(
+          'RPC 讀取失敗。請重新整理或檢查 RPC 設定。'
+        )
+        await expect(page.getByRole('button', { name: '重新整理', exact: true })).toBeEnabled()
+        mode = 'pending'
+        await page.getByRole('button', { name: '重新整理', exact: true }).click()
+      }
+      try {
+        await expect(
+          page.getByRole('button', { name: '正在重新整理…', exact: true })
+        ).toBeDisabled()
+        const warning = page.getByTestId('stale-vmu-warning')
+        await expect(warning).toContainText('目前顯示先前載入的 VMU 資料，可能已過期。')
+        await expect(warning).toContainText(/上次載入：\d{4}-\d{2}-\d{2} \d{2}:\d{2}/)
+        if (expectedDate) await expect(warning).toContainText(expectedDate)
+        await expect(page.locator('.err-banner')).toHaveCount(0)
+        expect(await inventory()).toEqual(rows)
+        // Cached VMUs do not persist the current global rank used for reward estimates.
+        expect(await page.locator('tbody tr td:last-child').allTextContents()).toEqual(
+          scenario === 'cached' ? rewards.map(() => '無法取得') : rewards
+        )
+        await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeDisabled()
+        await expect(page.locator('tbody input[type="checkbox"]').first()).toBeDisabled()
+        await captureQaScreenshot(page, `outdated-${scenario}-pending-zh`)
+        await page.getByTestId('language-selector').selectOption('en')
+        await expect(warning).toContainText('Previously loaded VMU data may be outdated.')
+        await expect(warning).toContainText(/Last loaded: \d{4}-\d{2}-\d{2} \d{2}:\d{2}/)
+        await captureQaScreenshot(page, `outdated-${scenario}-pending-en`)
+        // The existing table can exceed a narrow desktop window; the warning must not add overflow.
+        expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(
+          initialEnglishWidth
+        )
+        const warningBox = await warning.boundingBox()
+        expect(warningBox).not.toBeNull()
+        expect(warningBox!.x).toBeGreaterThanOrEqual(0)
+        expect(warningBox!.x + warningBox!.width).toBeLessThanOrEqual(page.viewportSize()!.width)
+        expect(await warning.evaluate((node) => node.scrollWidth === node.clientWidth)).toBe(true)
+      } finally {
+        mode = 'healthy'
+        release()
+      }
+      await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+      await expect(page.getByTestId('stale-vmu-warning')).toHaveCount(0)
+      await expect(page.locator('tbody input[type="checkbox"]').first()).not.toBeChecked()
+      expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+        sendAttempts: 0,
+        successfulBroadcasts: 0
+      })
+      expect(errors).toEqual([])
+    })
+  }
 
   for (const chainId of [1, 137] as const) {
     for (const method of [
@@ -2040,7 +2413,16 @@ test.describe('Traditional Chinese interface', () => {
       'eth_estimateGas',
       'eth_getBlockByNumber'
     ] as const) {
-      for (const failure of ['http-429', 'json-rate-limit'] as const) {
+      const failures =
+        method === 'eth_estimateGas'
+          ? ([
+              'http-429',
+              'json-rate-limit',
+              'http-batch-invalid-request',
+              'http-transient-body'
+            ] as const)
+          : (['http-429', 'json-rate-limit'] as const)
+      for (const failure of failures) {
         test(`explains a preflight RPC rate limit (${chainId}, ${method}, ${failure}) without signing or retaining a soft lock`, async ({
           page
         }) => {
@@ -2090,6 +2472,23 @@ test.describe('Traditional Chinese interface', () => {
                 for (const call of targets) failedCalls.push({ url, params: call.params })
                 if (failure === 'http-429')
                   return route.fulfill({ status: 429, body: 'Fixture rate limit' })
+                if (failure === 'http-batch-invalid-request' || failure === 'http-transient-body')
+                  return route.fulfill({
+                    status: 429,
+                    headers: {
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Expose-Headers': 'Retry-After',
+                      'Retry-After': '5'
+                    },
+                    json: {
+                      jsonrpc: '2.0',
+                      id: null,
+                      error:
+                        failure === 'http-batch-invalid-request'
+                          ? { code: -32600, message: 'Invalid request' }
+                          : { code: -32000, message: 'header not found' }
+                    }
+                  })
                 const replies = batch.map((call) => ({
                   jsonrpc: '2.0',
                   id: call.id,
@@ -2122,9 +2521,14 @@ test.describe('Traditional Chinese interface', () => {
           await page
             .getByRole('button', { name: isMint ? '確認鑄造' : '僅領取', exact: true })
             .click()
-          const chinese = 'RPC 節點受到限流。請稍候再重試。RPC 清單已保留。'
-          const english =
-            'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
+          const timed =
+            failure === 'http-batch-invalid-request' || failure === 'http-transient-body'
+          const chinese = timed
+            ? 'RPC 節點受到限流。請於 5 秒後重試。RPC 清單已保留。'
+            : 'RPC 節點受到限流。請稍候再重試。RPC 清單已保留。'
+          const english = timed
+            ? 'RPC endpoints are rate-limited. Retry in 5s. Your RPC list was preserved.'
+            : 'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
           await expect(page.locator('.modal-body .err-text')).toHaveText(chinese)
           await expect(page.getByTestId('tx-log')).toContainText(`準備失敗：${chinese}`)
           await expect(page.getByRole('button', { name: '開啟 MetaMask 並簽署' })).toHaveCount(0)
@@ -2187,6 +2591,11 @@ test.describe('Traditional Chinese interface', () => {
       'no-retry-after',
       'hidden-retry-after',
       'json-rate-limit',
+      'batch-rate-limit',
+      'http-ordinary-no-retry-after',
+      'http-ordinary-visible-retry-after',
+      'http-batch-invalid-request',
+      'http-transient-body',
       'visible-retry-after'
     ] as const) {
       test(`explains an exhausted RPC rate limit (${chainId}, ${failure}) and restores the list without signing`, async ({
@@ -2207,10 +2616,18 @@ test.describe('Traditional Chinese interface', () => {
         })
         let limited = false
         const limitedPosts: string[] = []
+        const limitedTimes: number[] = []
         const batchSizes: number[] = []
         const errors: string[] = []
         const unexpected: string[] = []
         const endpoints = chainId === 1 ? ETHEREUM_RPC_ROUTES : POLYGON_RPC_ROUTES
+        const priorityCase =
+          failure === 'http-batch-invalid-request' || failure === 'http-transient-body'
+        const retryAfterSeconds = priorityCase ? 5 : 1
+        const visibleDelay =
+          failure === 'visible-retry-after' ||
+          failure === 'http-ordinary-visible-retry-after' ||
+          priorityCase
         page.on('pageerror', (error) => errors.push(error.message))
         await page.route('https://**/*', async (route) => {
           const url = route.request().url()
@@ -2237,6 +2654,15 @@ test.describe('Traditional Chinese interface', () => {
           }
           if (limited && batch.some(isCount) && endpoints.some((pattern) => pattern.test(url))) {
             limitedPosts.push(url)
+            limitedTimes.push(Date.now())
+            if (failure === 'batch-rate-limit')
+              return route.fulfill({
+                json: {
+                  jsonrpc: '2.0',
+                  id: null,
+                  error: { code: -32005, message: 'opaque provider diagnostic' }
+                }
+              })
             if (failure === 'json-rate-limit') {
               const replies = batch.map((call) =>
                 isCount(call)
@@ -2254,9 +2680,24 @@ test.describe('Traditional Chinese interface', () => {
               return route.fulfill({ json: Array.isArray(payload) ? replies : replies[0] })
             }
             const headers: Record<string, string> = { 'Access-Control-Allow-Origin': '*' }
-            if (failure !== 'no-retry-after') headers['Retry-After'] = '1'
-            if (failure === 'visible-retry-after')
-              headers['Access-Control-Expose-Headers'] = 'Retry-After'
+            if (failure !== 'no-retry-after' && failure !== 'http-ordinary-no-retry-after')
+              headers['Retry-After'] = String(retryAfterSeconds)
+            if (visibleDelay) headers['Access-Control-Expose-Headers'] = 'Retry-After'
+            if (failure.startsWith('http-ordinary-') || priorityCase)
+              return route.fulfill({
+                status: 429,
+                headers,
+                json: {
+                  jsonrpc: '2.0',
+                  id: null,
+                  error:
+                    failure === 'http-batch-invalid-request'
+                      ? { code: -32600, message: 'Invalid request' }
+                      : failure === 'http-transient-body'
+                        ? { code: -32000, message: 'header not found' }
+                        : { code: -32603, message: 'Internal error' }
+                }
+              })
             return route.fulfill({ status: 429, headers, body: 'Fixture rate limit' })
           }
           return route.fallback()
@@ -2279,24 +2720,31 @@ test.describe('Traditional Chinese interface', () => {
         await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeDisabled()
         await expect(page.locator('.action-bar')).toHaveCount(0)
         await expect(page.locator('tbody input[type="checkbox"]').first()).toBeDisabled()
-        const chinese =
-          failure === 'visible-retry-after'
-            ? 'RPC 節點受到限流。請於 1 秒後重試。RPC 清單已保留。'
-            : 'RPC 節點受到限流。請稍候再重試。RPC 清單已保留。'
-        const english =
-          failure === 'visible-retry-after'
-            ? 'RPC endpoints are rate-limited. Retry in 1s. Your RPC list was preserved.'
-            : 'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
-        await expect(page.locator('.err-banner')).toHaveText(chinese, { timeout: 10_000 })
+        const chinese = visibleDelay
+          ? `RPC 節點受到限流。請於 ${retryAfterSeconds} 秒後重試。RPC 清單已保留。`
+          : 'RPC 節點受到限流。請稍候再重試。RPC 清單已保留。'
+        const english = visibleDelay
+          ? `RPC endpoints are rate-limited. Retry in ${retryAfterSeconds}s. Your RPC list was preserved.`
+          : 'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
+        await expect(page.locator('.err-banner')).toHaveText(chinese, {
+          timeout: priorityCase ? 25_000 : 10_000
+        })
         await expect(page.getByRole('button', { name: '重新整理', exact: true })).toBeEnabled()
-        // Retry backoff >= pool cooldown (both 1s); equality is eligible, not a skipped attempt.
+        // Retry backoff >= pool cooldown; equality is eligible, not a skipped attempt.
         expect(limitedPosts).toHaveLength(16)
         for (const endpoint of endpoints)
           expect(limitedPosts.filter((url) => endpoint.test(url))).toHaveLength(4)
+        if (priorityCase) {
+          for (const endpoint of endpoints) {
+            const times = limitedTimes.filter((_, index) => endpoint.test(limitedPosts[index]))
+            for (let i = 1; i < times.length; i++)
+              expect(times[i] - times[i - 1]).toBeGreaterThanOrEqual(5_000)
+          }
+        }
         expect(await page.evaluate(() => window.__rateLimitHeaders)).toEqual(
-          failure === 'json-rate-limit'
+          failure === 'json-rate-limit' || failure === 'batch-rate-limit'
             ? []
-            : Array(16).fill(failure === 'visible-retry-after' ? '1' : null)
+            : Array(16).fill(visibleDelay ? String(retryAfterSeconds) : null)
         )
         await expect(page.locator('body')).not.toContainText('missing revert data')
         await expect(page.locator('body')).not.toContainText('server response 429')
@@ -2419,7 +2867,11 @@ test.describe('Traditional Chinese interface', () => {
         release()
         holdCount = false
         await expect(page.getByRole('button', { name: '重新整理', exact: true })).toBeEnabled()
-        await expect(page.locator('.err-banner')).toBeVisible()
+        await expect(page.locator('.err-banner')).toHaveText(
+          failure === 'offline'
+            ? 'RPC 讀取失敗。請重新整理或檢查 RPC 設定。'
+            : /^上次重新整理未完成；下方清單載入於 \d{4}-\d{2}-\d{2} \d{2}:\d{2}。$/
+        )
         expect(await page.locator('tbody tr').allTextContents()).toEqual(rows)
         await expect(page.getByTestId('stale-vmu-warning')).toContainText('可能已過期')
         await expect(page.getByTestId('stale-vmu-warning')).toContainText('上次載入：')
@@ -2438,6 +2890,11 @@ test.describe('Traditional Chinese interface', () => {
         )
         await expect(page.getByTestId('stale-vmu-warning')).toContainText('may be outdated')
         await expect(page.getByTestId('stale-vmu-warning')).toContainText('Last loaded:')
+        await expect(page.locator('.err-banner')).toHaveText(
+          failure === 'offline'
+            ? 'RPC read failed. Refresh or check RPC settings.'
+            : /^The last refresh did not complete; the list below was loaded at \d{4}-\d{2}-\d{2} \d{2}:\d{2}\.$/
+        )
         await captureQaScreenshot(page, `retained-${chainId}-${failure}-en`)
         await page.getByTestId('language-selector').selectOption('zh-Hant')
         await page.reload()
@@ -2448,6 +2905,11 @@ test.describe('Traditional Chinese interface', () => {
         await expect(page.getByRole('button', { name: '重新整理', exact: true })).toBeEnabled()
         await expect(page.locator('.err-banner')).toBeVisible()
         await expect(page.locator('.group-note')).toContainText('共 2 個 VMU')
+        await expect(page.locator('.err-banner')).toHaveText(
+          failure === 'offline'
+            ? 'RPC 讀取失敗。請重新整理或檢查 RPC 設定。'
+            : /^上次重新整理未完成；下方清單載入於 \d{4}-\d{2}-\d{2} \d{2}:\d{2}。$/
+        )
         await expect(page.getByTestId('stale-vmu-warning')).toContainText('可能已過期')
         await expect(page.locator('tbody input[type="checkbox"]').first()).toBeDisabled()
         await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeDisabled()

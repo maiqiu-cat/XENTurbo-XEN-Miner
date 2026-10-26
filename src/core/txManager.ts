@@ -13,7 +13,7 @@ import { writeFactory, warmUpInjected } from './wallet'
 import { readFee, readVmuStatuses, readVmuStates } from './chainReader'
 import { readWalletEvidence, type WalletReceipt } from './walletEvidence'
 import { ReadTimeoutError } from './readDeadline'
-import { RpcRateLimitError, rpcFailureKind, rpcRetryAfterMs } from './rpcPolicy'
+import { RpcRateLimitError, rpcFailureKind, rpcResponseError, rpcRetryAfterMs } from './rpcPolicy'
 import { mapWithConcurrency } from '@/utils/concurrency'
 import {
   ensureHealthyReadProvider,
@@ -499,10 +499,13 @@ async function assertIdsStillValid(
   const want = expectedStatus(op)
   if (!want || !ids.length) return
   const statuses = await readVmuStatuses(chain, wallet, ids)
-  const bad = ids.filter((id) => {
-    const s = statuses.get(id)
-    return !s || s !== want || s === 'READ_ERROR'
-  })
+  const unreadable = ids.filter((id) => !statuses.has(id) || statuses.get(id) === 'READ_ERROR')
+  if (unreadable.length) {
+    throw new Error(
+      `Could not re-read the selected VMUs (ids ${unreadable.slice(0, 8).join(', ')}${unreadable.length > 8 ? '…' : ''}). No transaction was submitted. Refresh and retry.`
+    )
+  }
+  const bad = ids.filter((id) => statuses.get(id) !== want)
   if (bad.length) {
     throw new Error(
       `VMU state changed on-chain (ids ${bad.slice(0, 8).join(', ')}${bad.length > 8 ? '…' : ''}). Refresh and retry.`
@@ -1234,12 +1237,17 @@ export function normalizeError(
     return 'Transaction reverted on-chain. Refresh the list and try again.'
   if (/Wallet account changed|wrong network/i.test(msg)) return msg
   if (/still be pending/i.test(msg)) return msg
-  if (/VMU state changed|already pending|limited to|Term must|count must|No .* selected/i.test(msg))
+  if (
+    /Could not re-read the selected VMUs|VMU state changed|already pending|limited to|Term must|count must|No .* selected/i.test(
+      msg
+    )
+  )
     return msg
   if (/user rejected|denied|rejected the request/i.test(msg)) return 'Transaction rejected'
   const hasRpcErrorDetails =
     typeof err?.response?.statusCode === 'number' ||
     (err?.info?.error !== null && typeof err?.info?.error === 'object') ||
+    (err?.code === 'BAD_DATA' && rpcResponseError(err) !== undefined) ||
     (err?.code === 'UNKNOWN_ERROR' &&
       typeof err?.error?.code === 'number' &&
       typeof err?.error?.message === 'string' &&

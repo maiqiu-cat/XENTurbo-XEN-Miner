@@ -302,12 +302,16 @@ function invalidateStalePreparation() {
   prepared.value = null
   busy.value = false
   txState.value = {
-    estimate: 'error',
+    ...txState.value,
+    estimate: txState.value?.estimate ?? 'wait',
     send: 'wait',
     confirm: 'wait',
     readyToSign: false,
     error: STALE_PREPARATION_MESSAGE,
-    logs: [{ at: Date.now(), status: 'error', message: STALE_PREPARATION_MESSAGE }]
+    logs: [
+      ...(txState.value?.logs ?? []),
+      { at: Date.now(), status: 'error', message: STALE_PREPARATION_MESSAGE }
+    ]
   }
 }
 

@@ -58,6 +58,8 @@ const patterns = Object.entries(runtimeMessages)
         if (/^\{\w+\}$/.test(part)) {
           const key = part.slice(1, -1)
           keys.push(key)
+          // A wallet method label must not swallow longer wallet safety instructions.
+          if (key === 'method') return '([a-zA-Z][a-zA-Z0-9]*_[a-zA-Z0-9_]+)'
           return numericParameters.has(key) ? '(\\d+)' : '([\\s\\S]*?)'
         }
         return part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')

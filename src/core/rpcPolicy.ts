@@ -8,6 +8,36 @@ function record(value: unknown): ErrorRecord | undefined {
   return value !== null && typeof value === 'object' ? (value as ErrorRecord) : undefined
 }
 
+/** Extract a single HTTP error or an unassigned whole-batch BAD_DATA reply. */
+function rpcErrorResponse(error: unknown): { rpc: ErrorRecord; unassigned: boolean } | undefined {
+  const value = record(error)
+  let body: unknown
+  if (value?.code === 'SERVER_ERROR') {
+    const responseBody = record(value.info)?.responseBody
+    if (typeof responseBody !== 'string') return undefined
+    try {
+      body = JSON.parse(responseBody)
+    } catch {
+      return undefined
+    }
+  } else if (value?.code === 'BAD_DATA' && value.shortMessage === 'missing response for request') {
+    body = value.value
+  } else {
+    return undefined
+  }
+  const reply = record(Array.isArray(body) ? (body.length === 1 ? body[0] : undefined) : body)
+  if (!reply || 'result' in reply || (value.code === 'BAD_DATA' && reply.id != null))
+    return undefined
+  const rpc = record(reply.error)
+  return rpc && Number.isSafeInteger(rpc.code) && typeof rpc.message === 'string'
+    ? { rpc, unassigned: reply.id == null }
+    : undefined
+}
+
+export function rpcResponseError(error: unknown): ErrorRecord | undefined {
+  return rpcErrorResponse(error)?.rpc
+}
+
 export class RpcReadInvalidatedError extends Error {
   readonly code = 'RPC_READ_INVALIDATED'
 
@@ -23,7 +53,9 @@ export class RpcRateLimitError extends Error {
 
   constructor(retryAfterMs?: number, options?: ErrorOptions) {
     const boundedDelay =
-      retryAfterMs === undefined ? undefined : Math.max(1, Math.min(retryAfterMs, MAX_COOLDOWN_MS))
+      retryAfterMs === undefined || !Number.isFinite(retryAfterMs)
+        ? undefined
+        : Math.max(1, Math.min(retryAfterMs, MAX_COOLDOWN_MS))
     super(
       boundedDelay === undefined
         ? 'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
@@ -53,42 +85,64 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
   if (isRpcReadCancelled(error)) return 'permanent'
   if (error instanceof ReadTimeoutError) return 'transient'
 
-  const rpc =
+  const directRpc =
     record(record(value?.info)?.error) ??
     record(value?.error) ??
     (typeof value?.code === 'number' ? value : undefined)
+  const responseRpc = directRpc ? undefined : rpcErrorResponse(error)
+  const rpc = directRpc ?? responseRpc?.rpc
   const message = typeof rpc?.message === 'string' ? rpc.message : ''
-  const outer = [value?.message, value?.shortMessage, value?.code]
+  const response = record(value?.response)
+  const status = Number(response?.statusCode ?? value?.status)
+  const outer = [
+    Number.isFinite(status) ? undefined : value?.message,
+    value?.shortMessage,
+    value?.code
+  ]
     .filter((part): part is string => typeof part === 'string')
     .join(' ')
   const data = [value?.data, rpc?.data, record(rpc?.data)?.data]
+  const capacity =
+    status === 413 ||
+    /(?:result|response|returndata|payload|batch|query|logs?).{0,100}(?:exceed|limit|maximum|too (?:large|big|many)|more than)|(?:limit|maximum).{0,60}(?:bytes|items|results|response|payload|batch)/i.test(
+      message
+    )
+  // An unassigned -32600 rejects the request envelope, not an individual call's semantics.
+  if (
+    rpc?.code === -32600 &&
+    responseRpc?.unassigned &&
+    !(status === 429 || status === 408 || (status >= 500 && status <= 599))
+  )
+    return capacity ? 'capacity' : 'endpoint'
   if (
     data.some((part) => typeof part === 'string' && /^0x[0-9a-f]+$/i.test(part)) ||
     /execution reverted|\brevert(?:ed)?\b/i.test(message) ||
     /INVALID_ARGUMENT|invalid (?:argument|params?)|insufficient funds|user (?:rejected|denied)|ACTION_REJECTED|NONCE_EXPIRED|execution reverted/i.test(
-      outer
+      `${message} ${outer}`
     ) ||
-    rpc?.code === -32600 ||
+    (rpc?.code === -32600 && !responseRpc?.unassigned) ||
     rpc?.code === -32602 ||
     (value?.code === 'CALL_EXCEPTION' && typeof value.reason === 'string' && value.reason !== '')
   ) {
     return 'permanent'
   }
-  const response = record(value?.response)
-  const status = Number(response?.statusCode ?? value?.status)
-  if (
-    status === 413 ||
-    /(?:result|response|returndata|payload|batch|query|logs?).{0,100}(?:exceed|limit|maximum|too (?:large|big|many)|more than)|(?:limit|maximum).{0,60}(?:bytes|items|results|response|payload|batch)/i.test(
-      message
-    )
-  ) {
-    return 'capacity'
-  }
+  if (capacity) return 'capacity'
+  if (status === 429) return 'rate-limit'
 
-  const diagnostic = rpc ? message : outer || String(error)
+  // Validated RPC semantics win; HTTP status wins over unstructured HTML/SDK text.
+  if (!rpc) {
+    if (status === 408 || (status >= 500 && status <= 599)) return 'transient'
+    if (status >= 400 && status <= 499) return 'endpoint'
+  }
+  const diagnostic = rpc
+    ? message
+    : typeof value?.shortMessage === 'string'
+      ? value.shortMessage
+      : typeof value?.code === 'string'
+        ? value.code
+        : outer || String(error)
   if (
     value?.code === 'RPC_RATE_LIMITED' ||
-    status === 429 ||
     rpc?.code === -32005 ||
     rpc?.code === -32007 ||
     rpc?.code === 429 ||
@@ -99,15 +153,15 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
     return 'rate-limit'
   }
   if (
-    status === 408 ||
-    (status >= 500 && status <= 599) ||
-    /temporar(?:y|ily)|unavailable|overloaded|server busy|header not found|unknown block|block not found|missing trie node|state (?:is )?not available|\btimeout\b|\btimed out\b|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENETUNREACH|failed to fetch|network error|network request failed|offline/i.test(
+    /temporar(?:y|ily)|unavailable|overloaded|server busy|header not found|unknown block|block not found|block number too high|in the future|resource not found|deadline exceeded|missing trie node|state (?:is )?not available|\btimeout\b|\btimed out\b|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENETUNREACH|failed to fetch|network error|network request failed|offline/i.test(
       diagnostic
     ) ||
     value?.code === 'TIMEOUT'
   ) {
     return 'transient'
   }
+  // Unclassified structured errors still retain the HTTP transport's retry/cooldown signal.
+  if (status === 408 || (status >= 500 && status <= 599)) return 'transient'
   return 'endpoint'
 }
 

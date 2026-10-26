@@ -35,6 +35,26 @@ function responseFor(payload: Array<{ id: number }>) {
 }
 
 describe('release chain probe', () => {
+  it('classifies a terminated response stream as a request failure, not invalid JSON', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => {
+      const response = Response.json({})
+      vi.spyOn(response, 'json').mockRejectedValue(new TypeError('terminated'))
+      return response
+    })
+    expect(await probeReleaseEndpoint('https://rpc.example', config, fetchImpl)).toMatchObject({
+      healthy: false,
+      error: 'REQUEST_FAILED: terminated'
+    })
+    expect(fetchImpl).toHaveBeenCalledOnce()
+  })
+
+  it('still distinguishes malformed JSON from an interrupted response', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response('{'))
+    expect(await probeReleaseEndpoint('https://rpc.example', config, fetchImpl)).toMatchObject({
+      healthy: false,
+      error: expect.stringMatching(/^INVALID_RESULT:/)
+    })
+  })
   it.each(['TimeoutError', 'AbortError'] as const)(
     'classifies a %s while reading the response body as a request failure',
     async (name) => {

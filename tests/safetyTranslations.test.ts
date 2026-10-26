@@ -19,7 +19,24 @@ function translator() {
 }
 
 describe('Traditional Chinese safety instructions', () => {
+  it('limits the wallet-method template to method identifiers, not arbitrary wallet diagnostics', () => {
+    const i18n = translator()
+    expect(i18n.message('Wallet eth_getTransactionCount')).toBe('錢包 eth_getTransactionCount')
+    for (const diagnostic of [
+      'Wallet failed with an external diagnostic',
+      'Wallet custom unknown RPC failure'
+    ])
+      expect(i18n.message(diagnostic)).toBe(diagnostic)
+  })
   it.each([
+    [
+      'Could not re-read the selected VMUs (ids 1, 2). No transaction was submitted. Refresh and retry.',
+      '無法重新讀取所選 VMU（ID 1, 2）。此次操作未送出任何交易。請重新整理後再試。'
+    ],
+    [
+      'VMU state changed on-chain (ids 1, 2). Refresh and retry.',
+      '鏈上的 VMU 狀態已變更（ID 1, 2）。請重新整理後再試。'
+    ],
     [
       'Previously loaded VMU data may be outdated. Transactions are disabled until a complete refresh succeeds.',
       '目前顯示先前載入的 VMU 資料，可能已過期。完整重新整理成功前，所有交易操作均已停用。'
@@ -274,5 +291,86 @@ describe('Traditional Chinese safety instructions', () => {
     }
     visitDirectory(root)
     expect(missing).toEqual([])
+  })
+
+  it('translates all exposed storage-recovery errors with only exact internal diagnostics excluded', () => {
+    const i18n = translator()
+    const internal = new Set([
+      'Backup verification failed',
+      'Concurrent storage change',
+      'Write verification failed'
+    ])
+    const seenInternal = new Set<string>()
+    const missing: string[] = []
+    const ast = ts.createSourceFile(
+      'storageRecovery.ts',
+      readFileSync('src/core/storageRecovery.ts', 'utf8'),
+      ts.ScriptTarget.Latest,
+      true
+    )
+    function visit(node: ts.Node) {
+      if (ts.isNewExpression(node) && node.expression.getText(ast) === 'Error') {
+        const argument = node.arguments?.[0]
+        if (argument && ts.isStringLiteralLike(argument)) {
+          if (internal.has(argument.text)) seenInternal.add(argument.text)
+          else if (i18n.message(argument.text) === argument.text) missing.push(argument.text)
+        }
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(ast)
+    expect(seenInternal).toEqual(internal)
+    expect(missing).toEqual([])
+  })
+
+  it('translates every literal read-deadline label, including wallet method templates', () => {
+    const i18n = translator()
+    const labels = new Set<string>()
+    function scan(directory: string) {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const file = resolve(directory, entry.name)
+        if (entry.isDirectory()) {
+          scan(file)
+          continue
+        }
+        if (!/\.(?:ts|vue)$/.test(file)) continue
+        const source = readFileSync(file, 'utf8')
+        const descriptor = file.endsWith('.vue') ? parse(source).descriptor : null
+        const ast = ts.createSourceFile(
+          file,
+          descriptor
+            ? [descriptor.script?.content, descriptor.scriptSetup?.content]
+                .filter(Boolean)
+                .join('\n')
+            : source,
+          ts.ScriptTarget.Latest,
+          true
+        )
+        function visit(node: ts.Node) {
+          if (
+            (ts.isCallExpression(node) || ts.isNewExpression(node)) &&
+            /^(withReadDeadline|ReadTimeoutError)$/.test(node.expression.getText(ast))
+          ) {
+            const label = node.arguments?.[ts.isCallExpression(node) ? 1 : 0]
+            if (label && ts.isStringLiteralLike(label)) labels.add(label.text)
+            else if (label && ts.isTemplateExpression(label))
+              labels.add(
+                label.head.text +
+                  label.templateSpans.map((span) => `eth_chainId${span.literal.text}`).join('')
+              )
+          }
+          ts.forEachChild(node, visit)
+        }
+        visit(ast)
+      }
+    }
+    scan(resolve('src'))
+    expect(labels.has('Initial wallet accounts')).toBe(true)
+    expect(labels.has('Wallet eth_chainId')).toBe(true)
+    expect([...labels].filter((label) => i18n.message(label) === label)).toEqual([])
+    for (const label of labels)
+      expect(i18n.message(`${label} exceeded 15000 ms.`)).toContain(
+        `${i18n.message(label)} 超過 15000 毫秒時限。`
+      )
   })
 })

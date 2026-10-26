@@ -32,7 +32,7 @@ const steps = computed(() => {
 
 const done = computed(() => props.state?.confirm === 'done')
 const failed = computed(
-  () => props.state?.estimate === 'error' || props.state?.send === 'error' || props.state?.confirm === 'error'
+  () => !!props.state?.error || props.state?.estimate === 'error' || props.state?.send === 'error' || props.state?.confirm === 'error'
 )
 const readyToSign = computed(() => !!props.state?.readyToSign && props.state?.estimate === 'done')
 const waitingWallet = computed(
@@ -40,6 +40,7 @@ const waitingWallet = computed(
 )
 const preparing = computed(
   () =>
+    !props.state?.error &&
     !props.state?.txHash &&
     !props.state?.walletPrompted &&
     ((props.state?.send === 'wait' && (props.state?.estimate === 'wait' || props.state?.estimate === 'process')) ||

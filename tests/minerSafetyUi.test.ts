@@ -159,6 +159,42 @@ function preparedFixture(): PreparedOp {
   }
 }
 
+it.each([12, 24])(
+  'appends one invalidation record without discarding %i prior activity records',
+  async (count) => {
+    const prep = preparedFixture()
+    const logs = Array.from({ length: count }, (_, index) => ({
+      at: index,
+      status: 'done' as const,
+      message: `Completed read ${index}`
+    }))
+    prep.state.logs = logs
+    vi.mocked(prepareOperation).mockImplementation(async (_params, callbacks) => {
+      callbacks?.onStep?.(prep.state)
+      return prep
+    })
+    const view = render()
+    await flushPromises()
+    await view
+      .findAll('button')
+      .find((button) => button.text() === 'Confirm Mint')!
+      .trigger('click')
+    await flushPromises()
+    useVmuStore().refreshGen += 1
+    await nextTick()
+    const state = view.getComponent({ name: 'TxModal' }).props('state') as TxStepState
+    expect(state.estimate).toBe('done')
+    expect(state.readyToSign).toBe(false)
+    expect(state.logs).toHaveLength(count + 1)
+    expect(state.logs?.slice(0, count)).toEqual(logs)
+    expect(state.logs?.at(-1)).toEqual(
+      expect.objectContaining({ status: 'error', message: state.error })
+    )
+    expect(abortPrepared).toHaveBeenCalledWith(prep)
+    expect(sendPreparedOperation).not.toHaveBeenCalled()
+  }
+)
+
 it.each(['pending-check', 'preparing', 'prepared', 'sign-check'] as const)(
   'invalidates the %s operation across a list refresh, even if the refresh already recovered',
   async (stage) => {

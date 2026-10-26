@@ -33,11 +33,11 @@ describe('source and workflow secret guardrails', () => {
     }
   )
 
-  it('ignores private environment variants and explicitly retains public build templates', () => {
+  it('ignores production environments and retains only the example template', () => {
     const rules = readFileSync('.gitignore', 'utf8').split(/\r?\n/)
     expect(rules).toContain('.env')
     expect(rules).toContain('.env.*')
     expect(rules).toContain('!.env.example')
-    expect(rules).toContain('!.env.production')
+    expect(rules).not.toContain('!.env.production')
   })
 })

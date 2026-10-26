@@ -144,7 +144,6 @@ const overReuse = computed(() => selectedIds.value.length > claimReuseLimit.valu
 
 function clearSel() {
   selected.value = new Set()
-  page.value = 1
 }
 
 watch(filter, () => {
@@ -156,17 +155,16 @@ watch(pageCount, (count) => {
 })
 
 watch(
-  [
-    () => wallet.address,
-    () => wallet.chainKey,
-    () => wallet.contextGen,
-    () => store.syncedAt,
-    () => store.refreshGen,
-    () => store.transactionReady
-  ],
-  clearSel,
+  [() => wallet.address, () => wallet.chainKey, () => wallet.contextGen],
+  () => {
+    clearSel()
+    page.value = 1
+  },
   { flush: 'sync' }
 )
+watch([() => store.syncedAt, () => store.refreshGen, () => store.transactionReady], clearSel, {
+  flush: 'sync'
+})
 
 function doClaim() {
   if (actionsDisabled.value || !selectedIds.value.length || overClaim.value) return
@@ -202,7 +200,7 @@ function doClaimReuse() {
 
     <p v-if="store.error" class="err-banner">{{ message(store.error) }}</p>
     <p
-      v-if="!store.transactionReady"
+      v-if="store.stale && (!store.loading || store.showingOutdated)"
       class="stale-banner"
       role="status"
       data-testid="stale-vmu-warning"
