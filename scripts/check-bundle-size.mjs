@@ -4,8 +4,8 @@ import { pathToFileURL } from 'node:url'
 import { gzipSync } from 'node:zlib'
 
 const KIB = 1024
-export const MAX_CHUNK_GZIP_BYTES = 180 * KIB
-export const MAX_TOTAL_GZIP_BYTES = 220 * KIB
+export const MAX_CHUNK_GZIP_BYTES = 100 * KIB
+export const MAX_TOTAL_GZIP_BYTES = 190 * KIB
 
 async function listJavaScriptFiles(directory) {
   const entries = await readdir(directory, { withFileTypes: true })

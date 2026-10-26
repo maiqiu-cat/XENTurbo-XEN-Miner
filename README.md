@@ -370,7 +370,7 @@ and estimates.
 - `npm run format:check` - Prettier formatting check
 - `npm run check:bundle` - enforce gzip bundle budgets against `dist/`
 - `npm run check:public-safety` - scan public-source and commit privacy rules, plus version consistency
-- `node scripts/check-version.mjs` - validate the displayed/package version and release-tag consistency
+- `npm run check:version` - validate the displayed/package version and release-tag consistency
 - `npm run audit:prod` - check production dependency advisories
 - `npm run audit:dependencies` - check all dependency advisories
 - `npm run probe:release` - read-only chain/contract release probe, at most three JSON-RPC items per POST
@@ -430,8 +430,17 @@ the local snippet does not modify a live server.
 Before removing the unused WalletConnect/Web3Modal/Wagmi stack, the main application
 bundle measured **674.61 KiB gzip**. The enforced production budgets are:
 
-- largest JavaScript chunk: at most **180 KiB gzip**
-- all JavaScript files in `dist/`: at most **220 KiB gzip**
+- largest JavaScript chunk: at most **100 KiB gzip**
+- all JavaScript files in `dist/`: at most **190 KiB gzip**
+
+The split application and ethers chunks are checked individually and in total. These
+budgets leave modest growth room above the v1.1.11 baseline, without restoring the
+pre-split per-chunk allowance.
+
+CI intentionally runs on every `v*` tag, but accepts release tags only: `v` followed
+by the exact package version. Prerelease tags such as `v1.1.11-rc.1` deliberately
+fail the version gate. Use a draft PR for pre-release review; a different tag policy
+requires a separate change rather than bypassing the release check.
 
 Run `npm run build && npm run check:bundle` before publishing. The check prints every
 measured JavaScript chunk and exits non-zero when either limit is exceeded.
