@@ -169,6 +169,60 @@ function readRequests(method = 'eth_getTransactionCount') {
 }
 
 describe('bounded read-only RPC failover', () => {
+  for (const status of [400, 500, 503]) {
+    it.each([
+      { code: 3, message: 'execution reverted', data: '0x08c379a0' },
+      { code: -32602, message: 'invalid params' }
+    ])(
+      `does not replay or fail over an HTTP ${status} JSON-RPC semantic error: %j`,
+      async (error) => {
+        const provider = await ready(3)
+        for (const url of urls)
+          failures.set(url, { status, body: JSON.stringify({ jsonrpc: '2.0', id: null, error }) })
+        const result = withRetry(() =>
+          new Contract(address, Multicall3ABI, provider).aggregate3(calls)
+        ).catch((failure: unknown) => failure)
+        await vi.advanceTimersByTimeAsync(10_000)
+        expect(await result).toMatchObject({
+          code: 'SERVER_ERROR',
+          response: { statusCode: status }
+        })
+        expect(rpcFailureKind(await result)).toBe('permanent')
+        expect(requests).toHaveLength(1)
+        expect(readRequests('eth_call').map(({ url }) => url)).toEqual([urls[0]])
+      }
+    )
+  }
+
+  it.each([
+    [{ code: -32005, message: 'opaque provider diagnostic' }, 'rate-limit'],
+    [{ code: -32000, message: 'header not found' }, 'transient']
+  ] as const)('retries an unassigned whole-batch JSON-RPC error: %j', async (error, kind) => {
+    const provider = await ready(3)
+    for (const url of urls)
+      failures.set(url, { body: JSON.stringify({ jsonrpc: '2.0', id: null, error }) })
+    const direct = new Contract(address, Multicall3ABI, provider)
+      .aggregate3(calls)
+      .catch((failure: unknown) => failure)
+    await vi.advanceTimersByTimeAsync(100)
+    const first = await direct
+    expect(first).toMatchObject({ code: 'BAD_DATA', value: [{ id: null, error }] })
+    expect(rpcFailureKind(first)).toBe(kind)
+    if (kind === 'rate-limit') expect(normalizeError(first)).toBe(new RpcRateLimitError().message)
+    await vi.advanceTimersByTimeAsync(1_000)
+    requests.length = 0
+    const result = withRetry(
+      () => new Contract(address, Multicall3ABI, provider).aggregate3(calls),
+      { jitterRatio: 0 }
+    ).catch((failure: unknown) => failure)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(rpcFailureKind(await result)).toBe(kind)
+    expect(readRequests('eth_call')).toHaveLength(12)
+    for (const url of urls)
+      expect(readRequests('eth_call').filter((request) => request.url === url)).toHaveLength(4)
+    expect(requests.every(({ calls: batch }) => batch.length <= 3)).toBe(true)
+  })
+
   it('does not classify the serialized SDK response body when structured HTTP details are absent', () => {
     const error = Object.assign(
       new Error('server error (responseBody="over capacity, quota exceeded")'),
@@ -860,6 +914,101 @@ describe('bounded read-only RPC failover', () => {
 })
 
 describe('one retry layer and structured errors', () => {
+  for (const status of [400, 403, 404, 413, 429, 500, 502, 503]) {
+    it.each([
+      [{ code: 3, message: 'execution reverted', data: '0xabcd' }, 'permanent'],
+      [{ code: -32602, message: 'timeout' }, 'permanent'],
+      [{ code: -32600, message: 'rate limit' }, 'permanent'],
+      [{ code: -32000, message: 'insufficient funds' }, 'permanent'],
+      [
+        { code: -32005, message: 'opaque provider diagnostic', data: { data: '0xabcd' } },
+        'permanent'
+      ]
+    ] as const)(
+      `preserves semantic vetoes inside HTTP ${status} responseBody: %j`,
+      (error, kind) => {
+        const failure = {
+          code: 'SERVER_ERROR',
+          shortMessage: `server response ${status}`,
+          response: { statusCode: status },
+          info: { responseBody: JSON.stringify({ jsonrpc: '2.0', id: null, error }) }
+        }
+        expect(rpcFailureKind(failure)).toBe(kind)
+        expect(isRetryableRpcError(failure)).toBe(false)
+      }
+    )
+  }
+
+  for (const wrapper of ['http', 'batch-object', 'batch-array'] as const) {
+    it.each([
+      [{ code: -32005, message: 'opaque provider diagnostic' }, 'rate-limit'],
+      [{ code: -32007, message: 'opaque provider diagnostic' }, 'rate-limit'],
+      [{ code: 429, message: 'opaque provider diagnostic' }, 'rate-limit'],
+      [{ code: -32000, message: 'header not found' }, 'transient'],
+      [{ code: -32603, message: 'Internal error' }, 'endpoint'],
+      [{ code: -32005, message: 'query returned more than 1000 results' }, 'capacity'],
+      [{ code: 3, message: 'execution reverted: rate limit' }, 'permanent']
+    ] as const)(
+      `classifies a validated ${wrapper} RPC error before transport diagnostics: %j`,
+      (error, kind) => {
+        const envelope = { jsonrpc: '2.0', id: null, error }
+        const failure =
+          wrapper === 'http'
+            ? {
+                code: 'SERVER_ERROR',
+                response: { statusCode: 503 },
+                info: { responseBody: JSON.stringify(envelope) }
+              }
+            : {
+                code: 'BAD_DATA',
+                shortMessage: 'missing response for request',
+                value: wrapper === 'batch-array' ? [envelope] : envelope
+              }
+        expect(rpcFailureKind(failure)).toBe(kind)
+        if (kind === 'rate-limit')
+          expect(normalizeError(failure)).toBe(new RpcRateLimitError().message)
+      }
+    )
+  }
+
+  it.each([
+    'Over capacity',
+    '<html>quota exceeded</html>',
+    '{"error":',
+    JSON.stringify({ error: { code: '-32005', message: 'rate limit' } }),
+    JSON.stringify({ error: { code: -32005 } }),
+    JSON.stringify({ error: { code: null, message: 'rate limit' } }),
+    JSON.stringify({ result: 'quota' })
+  ])('does not interpret an invalid HTTP body as a JSON-RPC error: %s', (responseBody) => {
+    expect(
+      rpcFailureKind({
+        code: 'SERVER_ERROR',
+        response: { statusCode: 503 },
+        info: { responseBody }
+      })
+    ).toBe('transient')
+  })
+
+  it.each([
+    { error: { code: '-32005', message: 'rate limit' } },
+    { error: { code: -32005, message: 123 } },
+    { id: 123, error: { code: -32005, message: 'rate limit' } },
+    { result: '0x1', error: { code: -32005, message: 'rate limit' } },
+    [
+      { id: null, error: { code: -32005, message: 'rate limit' } },
+      { id: 1, result: '0x1' }
+    ],
+    'quota exceeded',
+    null
+  ])('does not reuse unrelated or malformed BAD_DATA values: %j', (value) => {
+    expect(
+      rpcFailureKind({ code: 'BAD_DATA', shortMessage: 'missing response for request', value })
+    ).toBe('endpoint')
+    expect(
+      normalizeError({ code: 'BAD_DATA', message: 'wallet capacity unavailable', value })
+    ).not.toContain('RPC endpoints are rate-limited')
+  })
+
   it.each([
     [{ code: -32005, message: 'unknown quota wording' }, 'rate-limit'],
     [{ code: -32007, message: 'opaque provider diagnostic' }, 'rate-limit'],

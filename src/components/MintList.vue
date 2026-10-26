@@ -200,7 +200,7 @@ function doClaimReuse() {
 
     <p v-if="store.error" class="err-banner">{{ message(store.error) }}</p>
     <p
-      v-if="store.stale && !store.loading"
+      v-if="store.stale && (!store.loading || store.showingOutdated)"
       class="stale-banner"
       role="status"
       data-testid="stale-vmu-warning"

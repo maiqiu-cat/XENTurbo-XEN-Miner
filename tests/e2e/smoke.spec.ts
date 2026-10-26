@@ -2157,6 +2157,137 @@ test('refresh preserves the visible page without a transient stale banner or tab
 test.describe('Traditional Chinese interface', () => {
   test.use({ locale: 'zh-TW' })
 
+  for (const scenario of ['cached', 'failed-retry'] as const) {
+    test(`keeps stale data labelled while the ${scenario} refresh is pending`, async ({ page }) => {
+      await page.setViewportSize({ width: scenario === 'cached' ? 1280 : 390, height: 900 })
+      await emulateDesktopGoogleChrome(page)
+      await mockSameOriginRpc(page, { vmuCount: 2 })
+      await installInjectedWallet(page)
+      const errors: string[] = []
+      page.on('pageerror', (error) => errors.push(error.message))
+      let mode: 'healthy' | 'failed' | 'pending' = 'healthy'
+      let release!: () => void
+      const delayed = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      for (const endpoint of ETHEREUM_RPC_ROUTES) {
+        await page.route(endpoint, async (route) => {
+          const payload = route.request().postDataJSON()
+          const batch = Array.isArray(payload) ? payload : [payload]
+          const isCount = batch.some((call: { method: string; params: unknown[] }) => {
+            const tx = call.params[0] as { to?: string; data?: string } | undefined
+            return (
+              call.method === 'eth_call' &&
+              tx?.to?.toLowerCase() === FACTORY.toLowerCase() &&
+              tx.data?.startsWith(factoryInterface.getFunction('vmuCount')!.selector)
+            )
+          })
+          if (isCount && mode === 'pending') await delayed
+          if (isCount && mode === 'failed')
+            return route.fulfill({ status: 401, body: 'Fixture read failure' })
+          return route.fallback()
+        })
+      }
+      await page.goto('/')
+      await expect(page).toHaveTitle('XENTurbo XEN Miner')
+      await page.getByRole('button', { name: '連接錢包' }).first().click()
+      await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeEnabled()
+      const inventory = () =>
+        page.locator('tbody tr').evaluateAll((rows) =>
+          rows.map((row) =>
+            Array.from(row.querySelectorAll('td'))
+              .slice(1, 5)
+              .map((cell) => cell.textContent)
+          )
+        )
+      const rows = await inventory()
+      const rewards = await page.locator('tbody tr td:last-child').allTextContents()
+      await page.getByTestId('language-selector').selectOption('en')
+      const initialEnglishWidth = await page.evaluate(() => document.documentElement.scrollWidth)
+      await page.getByTestId('language-selector').selectOption('zh-Hant')
+      let expectedDate: string | undefined
+      if (scenario === 'cached') {
+        expectedDate = await page.evaluate(async (wallet) => {
+          const db = await new Promise<IDBDatabase>((resolve, reject) => {
+            const request = indexedDB.open('standalone-miner', 2)
+            request.onsuccess = () => resolve(request.result)
+            request.onerror = () => reject(request.error)
+          })
+          try {
+            const loadedAt = Date.now() - 3 * 86_400_000
+            await new Promise<void>((resolve, reject) => {
+              const transaction = db.transaction('walletVmus', 'readwrite')
+              const store = transaction.objectStore('walletVmus')
+              const request = store.get(`eth:${wallet.toLowerCase()}`)
+              request.onsuccess = () => store.put({ ...request.result, syncedAt: loadedAt })
+              transaction.oncomplete = () => resolve()
+              transaction.onerror = () => reject(transaction.error)
+              transaction.onabort = () => reject(transaction.error)
+            })
+            const date = new Date(loadedAt)
+            return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+          } finally {
+            db.close()
+          }
+        }, ACCOUNT_A)
+        mode = 'pending'
+        await page.reload()
+        await page.getByRole('button', { name: '連接錢包' }).first().click()
+      } else {
+        mode = 'failed'
+        await page.getByRole('button', { name: '重新整理', exact: true }).click()
+        await expect(page.locator('.err-banner')).toHaveText(
+          'RPC 讀取失敗。請重新整理或檢查 RPC 設定。'
+        )
+        await expect(page.getByRole('button', { name: '重新整理', exact: true })).toBeEnabled()
+        mode = 'pending'
+        await page.getByRole('button', { name: '重新整理', exact: true }).click()
+      }
+      try {
+        await expect(
+          page.getByRole('button', { name: '正在重新整理…', exact: true })
+        ).toBeDisabled()
+        const warning = page.getByTestId('stale-vmu-warning')
+        await expect(warning).toContainText('目前顯示先前載入的 VMU 資料，可能已過期。')
+        await expect(warning).toContainText(/上次載入：\d{4}-\d{2}-\d{2} \d{2}:\d{2}/)
+        if (expectedDate) await expect(warning).toContainText(expectedDate)
+        await expect(page.locator('.err-banner')).toHaveCount(0)
+        expect(await inventory()).toEqual(rows)
+        // Cached VMUs do not persist the current global rank used for reward estimates.
+        expect(await page.locator('tbody tr td:last-child').allTextContents()).toEqual(
+          scenario === 'cached' ? rewards.map(() => '無法取得') : rewards
+        )
+        await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeDisabled()
+        await expect(page.locator('tbody input[type="checkbox"]').first()).toBeDisabled()
+        await captureQaScreenshot(page, `outdated-${scenario}-pending-zh`)
+        await page.getByTestId('language-selector').selectOption('en')
+        await expect(warning).toContainText('Previously loaded VMU data may be outdated.')
+        await expect(warning).toContainText(/Last loaded: \d{4}-\d{2}-\d{2} \d{2}:\d{2}/)
+        await captureQaScreenshot(page, `outdated-${scenario}-pending-en`)
+        // The existing table can exceed a narrow desktop window; the warning must not add overflow.
+        expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(
+          initialEnglishWidth
+        )
+        const warningBox = await warning.boundingBox()
+        expect(warningBox).not.toBeNull()
+        expect(warningBox!.x).toBeGreaterThanOrEqual(0)
+        expect(warningBox!.x + warningBox!.width).toBeLessThanOrEqual(page.viewportSize()!.width)
+        expect(await warning.evaluate((node) => node.scrollWidth === node.clientWidth)).toBe(true)
+      } finally {
+        mode = 'healthy'
+        release()
+      }
+      await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+      await expect(page.getByTestId('stale-vmu-warning')).toHaveCount(0)
+      await expect(page.locator('tbody input[type="checkbox"]').first()).not.toBeChecked()
+      expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+        sendAttempts: 0,
+        successfulBroadcasts: 0
+      })
+      expect(errors).toEqual([])
+    })
+  }
+
   for (const chainId of [1, 137] as const) {
     for (const method of [
       'eth_getTransactionCount',
@@ -2310,6 +2441,7 @@ test.describe('Traditional Chinese interface', () => {
       'no-retry-after',
       'hidden-retry-after',
       'json-rate-limit',
+      'batch-rate-limit',
       'visible-retry-after'
     ] as const) {
       test(`explains an exhausted RPC rate limit (${chainId}, ${failure}) and restores the list without signing`, async ({
@@ -2360,6 +2492,14 @@ test.describe('Traditional Chinese interface', () => {
           }
           if (limited && batch.some(isCount) && endpoints.some((pattern) => pattern.test(url))) {
             limitedPosts.push(url)
+            if (failure === 'batch-rate-limit')
+              return route.fulfill({
+                json: {
+                  jsonrpc: '2.0',
+                  id: null,
+                  error: { code: -32005, message: 'opaque provider diagnostic' }
+                }
+              })
             if (failure === 'json-rate-limit') {
               const replies = batch.map((call) =>
                 isCount(call)
@@ -2417,7 +2557,7 @@ test.describe('Traditional Chinese interface', () => {
         for (const endpoint of endpoints)
           expect(limitedPosts.filter((url) => endpoint.test(url))).toHaveLength(4)
         expect(await page.evaluate(() => window.__rateLimitHeaders)).toEqual(
-          failure === 'json-rate-limit'
+          failure === 'json-rate-limit' || failure === 'batch-rate-limit'
             ? []
             : Array(16).fill(failure === 'visible-retry-after' ? '1' : null)
         )

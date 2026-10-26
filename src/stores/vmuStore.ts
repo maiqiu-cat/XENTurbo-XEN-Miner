@@ -51,6 +51,8 @@ interface State {
   loading: boolean
   /** Display-only until a complete current-context inventory has been read. */
   stale: boolean
+  /** Retained data was already stale before this read, not just gated by a routine refresh. */
+  showingOutdated: boolean
   progress: { loaded: number; total: number }
   error: string | null
   /** Number of VMUs whose Multicall read failed (not EMPTY). */
@@ -117,6 +119,7 @@ export const useVmuStore = defineStore('vmu', {
     chainTimestampMs: null,
     loading: false,
     stale: true,
+    showingOutdated: false,
     progress: { loaded: 0, total: 0 },
     error: null,
     readErrors: 0,
@@ -214,6 +217,7 @@ export const useVmuStore = defineStore('vmu', {
   actions: {
     reset() {
       this.stale = true
+      this.showingOutdated = false
       abortClockRefresh(this)
       clearMaturityTimer()
       this.vmuCount = 0
@@ -253,6 +257,7 @@ export const useVmuStore = defineStore('vmu', {
       const cached = await loadSnapshot(chain, wallet)
       if (!isCurrent()) return
       if (cached) {
+        this.showingOutdated = true
         this.vmuCount = cached.vmuCount
         this.vmus = cached.vmus.map(normalizeVmu)
         this.syncedAt = cached.syncedAt
@@ -291,6 +296,7 @@ export const useVmuStore = defineStore('vmu', {
           gen === this.refreshGen &&
           this.chain === chain &&
           this.wallet === wallet
+        this.showingOutdated ||= this.stale && !this.loading && this.syncedAt !== null
         this.loading = true
         this.stale = true
         this.error = null
@@ -376,7 +382,10 @@ export const useVmuStore = defineStore('vmu', {
           if (!isCurrent()) return
           this.error = readFailureMessage(err)
         } finally {
-          if (isCurrent()) this.loading = false
+          if (isCurrent()) {
+            this.showingOutdated = this.stale && this.syncedAt !== null
+            this.loading = false
+          }
         }
       })()
 
@@ -492,7 +501,10 @@ export const useVmuStore = defineStore('vmu', {
         } catch (error) {
           if (isCurrent()) this.error = readFailureMessage(error)
         } finally {
-          if (isCurrent()) this.loading = false
+          if (isCurrent()) {
+            this.showingOutdated = this.stale && this.syncedAt !== null
+            this.loading = false
+          }
         }
       })()
       const flight = { chain, wallet, kind: 'affected' as const, controller, promise }

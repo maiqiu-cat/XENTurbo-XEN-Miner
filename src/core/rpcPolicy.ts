@@ -8,6 +8,30 @@ function record(value: unknown): ErrorRecord | undefined {
   return value !== null && typeof value === 'object' ? (value as ErrorRecord) : undefined
 }
 
+/** Recover only a single structured error, never diagnostic text or another batch item's reply. */
+export function rpcResponseError(error: unknown): ErrorRecord | undefined {
+  const value = record(error)
+  let body: unknown
+  if (value?.code === 'SERVER_ERROR') {
+    const responseBody = record(value.info)?.responseBody
+    if (typeof responseBody !== 'string') return undefined
+    try {
+      body = JSON.parse(responseBody)
+    } catch {
+      return undefined
+    }
+  } else if (value?.code === 'BAD_DATA') {
+    body = value.value
+  } else {
+    return undefined
+  }
+  const reply = record(Array.isArray(body) ? (body.length === 1 ? body[0] : undefined) : body)
+  if (!reply || 'result' in reply || (value.code === 'BAD_DATA' && reply.id != null))
+    return undefined
+  const rpc = record(reply.error)
+  return rpc && Number.isSafeInteger(rpc.code) && typeof rpc.message === 'string' ? rpc : undefined
+}
+
 export class RpcReadInvalidatedError extends Error {
   readonly code = 'RPC_READ_INVALIDATED'
 
@@ -58,7 +82,8 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
   const rpc =
     record(record(value?.info)?.error) ??
     record(value?.error) ??
-    (typeof value?.code === 'number' ? value : undefined)
+    (typeof value?.code === 'number' ? value : undefined) ??
+    rpcResponseError(error)
   const message = typeof rpc?.message === 'string' ? rpc.message : ''
   const response = record(value?.response)
   const status = Number(response?.statusCode ?? value?.status)
@@ -74,7 +99,7 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
     data.some((part) => typeof part === 'string' && /^0x[0-9a-f]+$/i.test(part)) ||
     /execution reverted|\brevert(?:ed)?\b/i.test(message) ||
     /INVALID_ARGUMENT|invalid (?:argument|params?)|insufficient funds|user (?:rejected|denied)|ACTION_REJECTED|NONCE_EXPIRED|execution reverted/i.test(
-      outer
+      `${message} ${outer}`
     ) ||
     rpc?.code === -32600 ||
     rpc?.code === -32602 ||
@@ -91,10 +116,12 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
     return 'capacity'
   }
 
-  // HTTP status wins over incidental words in an HTML/SDK response body.
-  if (status === 429) return 'rate-limit'
-  if (status === 408 || (status >= 500 && status <= 599)) return 'transient'
-  if (status >= 400 && status <= 499) return 'endpoint'
+  // Validated RPC semantics win; HTTP status wins over unstructured HTML/SDK text.
+  if (!rpc) {
+    if (status === 429) return 'rate-limit'
+    if (status === 408 || (status >= 500 && status <= 599)) return 'transient'
+    if (status >= 400 && status <= 499) return 'endpoint'
+  }
   const diagnostic = rpc
     ? message
     : typeof value?.shortMessage === 'string'
@@ -104,7 +131,6 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
         : outer || String(error)
   if (
     value?.code === 'RPC_RATE_LIMITED' ||
-    status === 429 ||
     rpc?.code === -32005 ||
     rpc?.code === -32007 ||
     rpc?.code === 429 ||
@@ -115,8 +141,6 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
     return 'rate-limit'
   }
   if (
-    status === 408 ||
-    (status >= 500 && status <= 599) ||
     /temporar(?:y|ily)|unavailable|overloaded|server busy|header not found|unknown block|block not found|block number too high|in the future|resource not found|deadline exceeded|missing trie node|state (?:is )?not available|\btimeout\b|\btimed out\b|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENETUNREACH|failed to fetch|network error|network request failed|offline/i.test(
       diagnostic
     ) ||

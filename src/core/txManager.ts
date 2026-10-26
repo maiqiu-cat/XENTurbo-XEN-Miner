@@ -13,7 +13,7 @@ import { writeFactory, warmUpInjected } from './wallet'
 import { readFee, readVmuStatuses, readVmuStates } from './chainReader'
 import { readWalletEvidence, type WalletReceipt } from './walletEvidence'
 import { ReadTimeoutError } from './readDeadline'
-import { RpcRateLimitError, rpcFailureKind, rpcRetryAfterMs } from './rpcPolicy'
+import { RpcRateLimitError, rpcFailureKind, rpcResponseError, rpcRetryAfterMs } from './rpcPolicy'
 import { mapWithConcurrency } from '@/utils/concurrency'
 import {
   ensureHealthyReadProvider,
@@ -1247,6 +1247,7 @@ export function normalizeError(
   const hasRpcErrorDetails =
     typeof err?.response?.statusCode === 'number' ||
     (err?.info?.error !== null && typeof err?.info?.error === 'object') ||
+    (err?.code === 'BAD_DATA' && rpcResponseError(err) !== undefined) ||
     (err?.code === 'UNKNOWN_ERROR' &&
       typeof err?.error?.code === 'number' &&
       typeof err?.error?.message === 'string' &&

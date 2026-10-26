@@ -7,11 +7,19 @@ import { nextTick } from 'vue'
 import MintList from '@/components/MintList.vue'
 import { useVmuStore } from '@/stores/vmuStore'
 import { useWalletStore } from '@/stores/walletStore'
+import { formatDate } from '@/utils/format'
 
-const chainClock = vi.hoisted(() => ({ readChainTimestamp: vi.fn() }))
+const chainClock = vi.hoisted(() => ({
+  readChainTimestamp: vi.fn(),
+  readVmuCount: vi.fn(),
+  readGlobalRank: vi.fn(),
+  readWalletVmus: vi.fn()
+}))
+const snapshots = vi.hoisted(() => ({ loadSnapshot: vi.fn(), saveSnapshot: vi.fn() }))
+vi.mock('@/core/idb', () => snapshots)
 vi.mock('@/core/chainReader', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/core/chainReader')>()),
-  readChainTimestamp: chainClock.readChainTimestamp
+  ...chainClock
 }))
 vi.mock('@/core/rpc', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/core/rpc')>()),
@@ -59,7 +67,14 @@ function mountClaimableList() {
 }
 
 describe('MintList selection context', () => {
-  beforeEach(() => setActivePinia(createPinia()))
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    snapshots.loadSnapshot.mockResolvedValue(null)
+    snapshots.saveSnapshot.mockResolvedValue(undefined)
+    chainClock.readChainTimestamp.mockResolvedValue(Date.now())
+    chainClock.readVmuCount.mockResolvedValue(1)
+    chainClock.readGlobalRank.mockResolvedValue(100)
+  })
   afterEach(() => {
     useVmuStore().detach()
     vi.useRealTimers()
@@ -77,6 +92,59 @@ describe('MintList selection context', () => {
     expect(wrapper.text()).not.toContain('VMUs selected')
     expect((wrapper.get('input[type="checkbox"]').element as HTMLInputElement).checked).toBe(false)
   })
+
+  it.each(['cache', 'failed-retry'] as const)(
+    'keeps outdated rows labelled during a pending %s refresh until a complete read succeeds',
+    async (scenario) => {
+      const { wrapper, store } = mountClaimableList()
+      const rows = store.vmus.map((vmu) => ({ ...vmu }))
+      const loadedAt = Date.now() - 3 * 86_400_000
+      store.syncedAt = loadedAt
+      chainClock.readWalletVmus.mockResolvedValue(rows)
+      if (scenario === 'cache') {
+        snapshots.loadSnapshot.mockResolvedValueOnce({
+          chain: 'eth',
+          wallet: ACCOUNT_A,
+          vmuCount: 1,
+          vmus: rows,
+          syncedAt: loadedAt,
+          chainTimestampMs: Date.now()
+        })
+      } else {
+        chainClock.readVmuCount.mockRejectedValueOnce(new Error('offline'))
+        await store.hardRefresh()
+        expect(store.error).not.toBeNull()
+      }
+      let release!: (count: number) => void
+      chainClock.readVmuCount.mockReturnValueOnce(
+        new Promise<number>((resolve) => {
+          release = resolve
+        })
+      )
+      const refresh = scenario === 'cache' ? store.load('eth', ACCOUNT_A) : store.hardRefresh()
+      try {
+        await flushPromises()
+        expect(store.loading).toBe(true)
+        expect(store.error).toBeNull()
+        expect(store.transactionReady).toBe(false)
+        const warning = wrapper.get('[data-testid="stale-vmu-warning"]')
+        expect(warning.text()).toContain('Previously loaded VMU data may be outdated.')
+        expect(warning.text()).toContain(`Last loaded: ${formatDate(loadedAt)}`)
+        expect(wrapper.findAll('tbody tr')).toHaveLength(1)
+        expect(wrapper.get('input[type="checkbox"]').attributes('disabled')).toBeDefined()
+      } finally {
+        release(1)
+        await refresh
+        await nextTick()
+      }
+      expect(store.transactionReady).toBe(true)
+      expect(wrapper.find('[data-testid="stale-vmu-warning"]').exists()).toBe(false)
+      expect(wrapper.get('input[type="checkbox"]').attributes('disabled')).toBeUndefined()
+      expect((wrapper.get('input[type="checkbox"]').element as HTMLInputElement).checked).toBe(
+        false
+      )
+    }
+  )
 
   it('clears selected VMUs after a completed full refresh', async () => {
     const { wrapper, store } = mountClaimableList()
