@@ -23,7 +23,9 @@ export class RpcRateLimitError extends Error {
 
   constructor(retryAfterMs?: number, options?: ErrorOptions) {
     const boundedDelay =
-      retryAfterMs === undefined ? undefined : Math.max(1, Math.min(retryAfterMs, MAX_COOLDOWN_MS))
+      retryAfterMs === undefined || !Number.isFinite(retryAfterMs)
+        ? undefined
+        : Math.max(1, Math.min(retryAfterMs, MAX_COOLDOWN_MS))
     super(
       boundedDelay === undefined
         ? 'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
@@ -58,7 +60,13 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
     record(value?.error) ??
     (typeof value?.code === 'number' ? value : undefined)
   const message = typeof rpc?.message === 'string' ? rpc.message : ''
-  const outer = [value?.message, value?.shortMessage, value?.code]
+  const response = record(value?.response)
+  const status = Number(response?.statusCode ?? value?.status)
+  const outer = [
+    Number.isFinite(status) ? undefined : value?.message,
+    value?.shortMessage,
+    value?.code
+  ]
     .filter((part): part is string => typeof part === 'string')
     .join(' ')
   const data = [value?.data, rpc?.data, record(rpc?.data)?.data]
@@ -74,8 +82,6 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
   ) {
     return 'permanent'
   }
-  const response = record(value?.response)
-  const status = Number(response?.statusCode ?? value?.status)
   if (
     status === 413 ||
     /(?:result|response|returndata|payload|batch|query|logs?).{0,100}(?:exceed|limit|maximum|too (?:large|big|many)|more than)|(?:limit|maximum).{0,60}(?:bytes|items|results|response|payload|batch)/i.test(
@@ -85,7 +91,17 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
     return 'capacity'
   }
 
-  const diagnostic = rpc ? message : outer || String(error)
+  // HTTP status wins over incidental words in an HTML/SDK response body.
+  if (status === 429) return 'rate-limit'
+  if (status === 408 || (status >= 500 && status <= 599)) return 'transient'
+  if (status >= 400 && status <= 499) return 'endpoint'
+  const diagnostic = rpc
+    ? message
+    : typeof value?.shortMessage === 'string'
+      ? value.shortMessage
+      : typeof value?.code === 'string'
+        ? value.code
+        : outer || String(error)
   if (
     value?.code === 'RPC_RATE_LIMITED' ||
     status === 429 ||
@@ -101,7 +117,7 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
   if (
     status === 408 ||
     (status >= 500 && status <= 599) ||
-    /temporar(?:y|ily)|unavailable|overloaded|server busy|header not found|unknown block|block not found|missing trie node|state (?:is )?not available|\btimeout\b|\btimed out\b|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENETUNREACH|failed to fetch|network error|network request failed|offline/i.test(
+    /temporar(?:y|ily)|unavailable|overloaded|server busy|header not found|unknown block|block not found|block number too high|in the future|resource not found|deadline exceeded|missing trie node|state (?:is )?not available|\btimeout\b|\btimed out\b|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENETUNREACH|failed to fetch|network error|network request failed|offline/i.test(
       diagnostic
     ) ||
     value?.code === 'TIMEOUT'

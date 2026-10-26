@@ -6,6 +6,7 @@ import PendingOpsPanel from '@/components/PendingOpsPanel.vue'
 import RpcSettings from '@/components/RpcSettings.vue'
 import TxModal from '@/components/TxModal.vue'
 import type { PendingOpView } from '@/core/pendingOps'
+import { STALE_PREPARATION_MESSAGE } from '@/i18n/messages'
 import * as rpc from '@/core/rpc'
 import { i18n } from '@/i18n'
 
@@ -58,6 +59,35 @@ function observeDisplaySideEffects(): () => void {
 }
 
 describe('transaction modal cancellation', () => {
+  it.each(['process', 'done'] as const)(
+    'closes an invalidated preparation while preserving the historical estimate %s',
+    async (estimate) => {
+      const wrapper = mount(TxModal, {
+        props: {
+          visible: true,
+          chain: 'eth',
+          title: 'Claim',
+          state: {
+            estimate,
+            send: 'wait',
+            confirm: 'wait',
+            readyToSign: false,
+            error: STALE_PREPARATION_MESSAGE
+          }
+        }
+      })
+      expect(wrapper.get('.step-icon').text()).toBe(estimate === 'done' ? 'OK' : '...')
+      expect(wrapper.get('.err-text').text()).toBe(STALE_PREPARATION_MESSAGE)
+      expect(wrapper.findAll('button').map((button) => button.text())).toEqual(['x', 'Close'])
+      const close = wrapper.get('button.btn-ghost')
+      expect(close.attributes('aria-label')).toBe('Close transaction dialog')
+      await close.trigger('click')
+      expect(wrapper.emitted('close')).toHaveLength(1)
+      expect(wrapper.emitted('cancel')).toBeUndefined()
+      expect(wrapper.emitted('sign')).toBeUndefined()
+    }
+  )
+
   it('keeps step elements and distinct accessible controls when the language changes', async () => {
     const preference = i18n.preference.value
     try {

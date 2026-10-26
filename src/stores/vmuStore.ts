@@ -17,8 +17,26 @@ import {
   rpcConfigurationMessage,
   rpcUnavailableMessage
 } from '@/core/rpc'
-import { assertReadActive, withReadDeadline } from '@/core/readDeadline'
+import { assertReadActive, ReadTimeoutError, withReadDeadline } from '@/core/readDeadline'
+import { RpcRateLimitError } from '@/core/rpcPolicy'
 import { estimateGroupXen } from '@/utils/rewards'
+import { formatDate } from '@/utils/format'
+
+function readFailureMessage(error: unknown): string {
+  if (error instanceof RpcConfigurationError) return rpcConfigurationMessage(error.message)
+  if (error instanceof RpcRateLimitError) return error.message
+  if (error instanceof ReadTimeoutError)
+    return `RPC read timed out. ${error.diagnostic} Refresh or check RPC settings.`
+  if (error instanceof Error && /RPC_UNAVAILABLE|RPC_NOT_VALIDATED/i.test(error.message))
+    return rpcUnavailableMessage()
+  // Keep raw endpoint diagnostics out of UI copy; do not serialize causes to telemetry.
+  console.warn('VMU refresh failed', error)
+  return 'RPC read failed. Refresh or check RPC settings.'
+}
+
+function retainedSnapshotMessage(syncedAt: number): string {
+  return `The last refresh did not complete; the list below was loaded at ${formatDate(syncedAt)}.`
+}
 
 interface State {
   chain: ChainKey | null
@@ -265,6 +283,7 @@ export const useVmuStore = defineStore('vmu', {
 
       const controller = new AbortController()
       abortClockRefresh(this)
+      clearMaturityTimer()
       const promise = (async () => {
         const gen = ++this.refreshGen
         const isCurrent = () =>
@@ -321,8 +340,10 @@ export const useVmuStore = defineStore('vmu', {
               this.syncedAt !== null &&
               this.vmus.length === this.vmuCount &&
               this.vmus.every((vmu) => vmu.readOk && vmu.status !== 'READ_ERROR')
-            )
+            ) {
+              this.error = retainedSnapshotMessage(this.syncedAt)
               return
+            }
           }
 
           this.vmuCount = count
@@ -353,12 +374,7 @@ export const useVmuStore = defineStore('vmu', {
         } catch (err: any) {
           if (controller.signal.aborted || err?.name === 'AbortError') return
           if (!isCurrent()) return
-          this.error =
-            err instanceof RpcConfigurationError
-              ? rpcConfigurationMessage(err.message)
-              : /RPC_UNAVAILABLE|RPC_NOT_VALIDATED/i.test(err?.shortMessage || err?.message || '')
-                ? rpcUnavailableMessage()
-                : err?.shortMessage || err?.message || 'Failed to read chain'
+          this.error = readFailureMessage(err)
         } finally {
           if (isCurrent()) this.loading = false
         }
@@ -403,6 +419,7 @@ export const useVmuStore = defineStore('vmu', {
       const newIds = selected.filter((id) => id > oldCount).sort((a, b) => a - b)
       abortRefresh(this)
       abortClockRefresh(this)
+      clearMaturityTimer()
       const controller = new AbortController()
       const gen = ++this.refreshGen
       const isCurrent = () =>
@@ -440,7 +457,7 @@ export const useVmuStore = defineStore('vmu', {
           if (updates.size !== selected.length) throw new Error('Incomplete affected VMU result')
           const failed = affected.filter((vmu) => !vmu.readOk || vmu.status === 'READ_ERROR').length
           if (failed > 0) {
-            this.error = `${failed} VMU(s) failed to read. Refresh or check RPC — do not treat them as empty.`
+            this.error = retainedSnapshotMessage(this.syncedAt!)
             return
           }
           const vmus = this.vmus.map((vmu) => {
@@ -473,15 +490,7 @@ export const useVmuStore = defineStore('vmu', {
             this.scheduleMaturityRefresh()
           }
         } catch (error) {
-          if (isCurrent())
-            this.error =
-              error instanceof RpcConfigurationError
-                ? rpcConfigurationMessage(error.message)
-                : error instanceof Error
-                  ? /RPC_UNAVAILABLE|RPC_NOT_VALIDATED/i.test(error.message)
-                    ? rpcUnavailableMessage()
-                    : error.message
-                  : 'Failed to refresh affected VMUs'
+          if (isCurrent()) this.error = readFailureMessage(error)
         } finally {
           if (isCurrent()) this.loading = false
         }
@@ -552,7 +561,7 @@ export const useVmuStore = defineStore('vmu', {
 
     scheduleMaturityRefresh() {
       clearMaturityTimer()
-      if (!this.chain || !this.wallet || this.chainTimestampMs === null) return
+      if (this.stale || !this.chain || !this.wallet || this.chainTimestampMs === null) return
       const nearest = this.vmus
         .filter((vmu) => vmu.status === 'MINTING' && vmu.maturityTs > 0)
         .reduce((value, vmu) => Math.min(value, vmu.maturityTs), Number.POSITIVE_INFINITY)
@@ -566,7 +575,7 @@ export const useVmuStore = defineStore('vmu', {
       )
       maturityTimer = setTimeout(() => {
         maturityTimer = null
-        if (this.chain === chain && this.wallet === wallet) void this.refresh()
+        if (!this.stale && this.chain === chain && this.wallet === wallet) void this.refresh()
       }, delay)
     }
   }

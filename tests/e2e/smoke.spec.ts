@@ -112,6 +112,7 @@ interface RpcMockState {
   blockTimestamp?: number
   maturityTimestamp?: number
   maturityVmuId?: number
+  maturityByProxy?: Map<string, number>
 }
 
 function contractReadResult(chainId: 1 | 137, params: unknown[], state: RpcMockState = {}): string {
@@ -190,7 +191,8 @@ function contractReadResult(chainId: 1 | 137, params: unknown[], state: RpcMockS
             : empty
               ? 0n
               : BigInt(
-                  maturityApplies ? (state.maturityTimestamp ?? 1_700_000_000) : 1_700_000_000
+                  state.maturityByProxy?.get(proxy.toLowerCase()) ??
+                    (maturityApplies ? (state.maturityTimestamp ?? 1_700_000_000) : 1_700_000_000)
                 ),
           minting ? 200n : empty ? 0n : 100n,
           3_000n,
@@ -1816,6 +1818,8 @@ for (const stage of ['preparing', 'send-preflight'] as const) {
       })
       .toBe(1)
     try {
+      const priorLogs = await page.getByTestId('tx-log-entry').allTextContents()
+      expect(priorLogs.length).toBeGreaterThan(0)
       state.blockTimestamp = BLOCK_TIMESTAMP + 10
       await expect
         .poll(
@@ -1830,15 +1834,21 @@ for (const stage of ['preparing', 'send-preflight'] as const) {
       await expect(page.locator('.modal-body .err-text')).toContainText(
         'No transaction was submitted.'
       )
+      const invalidatedLogs = await page.getByTestId('tx-log-entry').allTextContents()
+      expect(invalidatedLogs.slice(0, priorLogs.length)).toEqual(priorLogs)
+      expect(invalidatedLogs).toHaveLength(priorLogs.length + 1)
+      // Refresh stays disabled while cancellation drains, even after its loading label clears.
       await expect
         .poll(
           async () => {
             await page.clock.runFor(50)
-            return page.getByTestId('stale-vmu-warning').count()
+            return page.getByRole('button', { name: 'Refresh', exact: true }).count()
           },
           { timeout: 15_000, intervals: [100] }
         )
-        .toBe(0)
+        .toBe(1)
+      await expect(page.getByRole('button', { name: 'Refresh', exact: true })).toBeDisabled()
+      await expect(page.getByTestId('stale-vmu-warning')).toHaveCount(0)
       await expect(page.getByTestId('operation-blocked-reason')).toContainText(
         'previous operation to finish cancelling'
       )
@@ -2029,6 +2039,119 @@ test('two tabs serialize wallet sends with a shared Web Lock', async ({ page, co
   await expect(page.getByText('Transaction rejected', { exact: true })).toBeVisible()
   await expect.poll(() => second.evaluate(() => window.__walletMock.stats().sendAttempts)).toBe(1)
   await second.close()
+})
+
+for (const failure of ['unreadable', 'changed'] as const) {
+  test(`selected VMU ${failure} has distinct bilingual preflight advice without a wallet send`, async ({
+    page
+  }) => {
+    await emulateDesktopGoogleChrome(page)
+    const state: RpcMockState = { vmuCount: 1 }
+    await mockSameOriginRpc(page, state)
+    await installInjectedWallet(page)
+    const errors: string[] = []
+    page.on('pageerror', (error) => errors.push(error.message))
+    await page.goto('/')
+    await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+    await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+    await page.locator('tbody input[type="checkbox"]').first().check()
+    if (failure === 'unreadable') state.unreadableVmuId = 1
+    else state.maturityTimestamp = BLOCK_TIMESTAMP + 86_400
+    await page.getByRole('button', { name: 'Claim only', exact: true }).click()
+    const error = page.locator('.modal-body .err-text')
+    await expect(error).toHaveText(
+      failure === 'unreadable'
+        ? 'Could not re-read the selected VMUs (ids 1). No transaction was submitted. Refresh and retry.'
+        : 'VMU state changed on-chain (ids 1). Refresh and retry.'
+    )
+    await page.getByRole('button', { name: 'Close transaction dialog' }).click()
+    await page.getByTestId('language-selector').selectOption('zh-Hant')
+    await page.getByRole('button', { name: '僅領取', exact: true }).click()
+    await expect(error).toHaveText(
+      failure === 'unreadable'
+        ? '無法重新讀取所選 VMU（ID 1）。此次操作未送出任何交易。請重新整理後再試。'
+        : '鏈上的 VMU 狀態已變更（ID 1）。請重新整理後再試。'
+    )
+    await captureQaScreenshot(page, `selected-read-${failure}-zh`)
+    expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+      sendAttempts: 0,
+      successfulBroadcasts: 0
+    })
+    expect(errors).toEqual([])
+  })
+}
+
+test('refresh preserves the visible page without a transient stale banner or table shift', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  const maturityByProxy = new Map(
+    Array.from({ length: 201 }, (_, index) => [
+      computeProxyAddress({
+        factory: FACTORY,
+        vmuTemplate: VMU_TEMPLATE,
+        wallet: ACCOUNT_A,
+        vmuId: index + 1
+      }).toLowerCase(),
+      1_700_000_000 + index
+    ])
+  )
+  const state: RpcMockState = { vmuCount: 201, maturityByProxy }
+  await mockSameOriginRpc(page, state)
+  await installInjectedWallet(page)
+  let hold = false
+  let release!: () => void
+  const delayed = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  for (const endpoint of ETHEREUM_RPC_ROUTES) {
+    await page.route(endpoint, async (route) => {
+      const payload = route.request().postDataJSON()
+      if (
+        hold &&
+        (Array.isArray(payload) ? payload : [payload]).some(
+          (call: { method: string }) => call.method === 'eth_call'
+        )
+      )
+        await delayed
+      return route.fallback()
+    })
+  }
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+  await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+  await page.getByRole('button', { name: 'Next page' }).click()
+  await expect(page.locator('.pagination')).toContainText('Page 2 of 3')
+  await page.locator('tbody input[type="checkbox"]').first().check()
+  const card = page.locator('.card').filter({ has: page.locator('.group-note') })
+  const tableOffset = () =>
+    card.evaluate(
+      (node) =>
+        node.querySelector('table')!.getBoundingClientRect().y - node.getBoundingClientRect().y
+    )
+  const before = await tableOffset()
+  hold = true
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+  try {
+    await expect(page.getByRole('button', { name: 'Refreshing...', exact: true })).toBeDisabled()
+    await expect(page.locator('.pagination')).toContainText('Page 2 of 3')
+    await expect(page.getByTestId('stale-vmu-warning')).toHaveCount(0)
+    await expect(page.locator('.action-bar')).toHaveCount(0)
+    expect(await tableOffset()).toBe(before)
+    expect(await page.locator('tbody input[type="checkbox"]').first().isDisabled()).toBe(true)
+  } finally {
+    hold = false
+    release()
+  }
+  await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+  await expect(page.locator('.pagination')).toContainText('Page 2 of 3')
+  await expect(page.getByTestId('stale-vmu-warning')).toHaveCount(0)
+  expect(await tableOffset()).toBe(before)
+  await captureQaScreenshot(page, 'refresh-preserved-page')
+  expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+    sendAttempts: 0,
+    successfulBroadcasts: 0
+  })
 })
 
 test.describe('Traditional Chinese interface', () => {
@@ -2419,7 +2542,11 @@ test.describe('Traditional Chinese interface', () => {
         release()
         holdCount = false
         await expect(page.getByRole('button', { name: '重新整理', exact: true })).toBeEnabled()
-        await expect(page.locator('.err-banner')).toBeVisible()
+        await expect(page.locator('.err-banner')).toHaveText(
+          failure === 'offline'
+            ? 'RPC 讀取失敗。請重新整理或檢查 RPC 設定。'
+            : /^上次重新整理未完成；下方清單載入於 \d{4}-\d{2}-\d{2} \d{2}:\d{2}。$/
+        )
         expect(await page.locator('tbody tr').allTextContents()).toEqual(rows)
         await expect(page.getByTestId('stale-vmu-warning')).toContainText('可能已過期')
         await expect(page.getByTestId('stale-vmu-warning')).toContainText('上次載入：')
@@ -2438,6 +2565,11 @@ test.describe('Traditional Chinese interface', () => {
         )
         await expect(page.getByTestId('stale-vmu-warning')).toContainText('may be outdated')
         await expect(page.getByTestId('stale-vmu-warning')).toContainText('Last loaded:')
+        await expect(page.locator('.err-banner')).toHaveText(
+          failure === 'offline'
+            ? 'RPC read failed. Refresh or check RPC settings.'
+            : /^The last refresh did not complete; the list below was loaded at \d{4}-\d{2}-\d{2} \d{2}:\d{2}\.$/
+        )
         await captureQaScreenshot(page, `retained-${chainId}-${failure}-en`)
         await page.getByTestId('language-selector').selectOption('zh-Hant')
         await page.reload()
@@ -2448,6 +2580,11 @@ test.describe('Traditional Chinese interface', () => {
         await expect(page.getByRole('button', { name: '重新整理', exact: true })).toBeEnabled()
         await expect(page.locator('.err-banner')).toBeVisible()
         await expect(page.locator('.group-note')).toContainText('共 2 個 VMU')
+        await expect(page.locator('.err-banner')).toHaveText(
+          failure === 'offline'
+            ? 'RPC 讀取失敗。請重新整理或檢查 RPC 設定。'
+            : /^上次重新整理未完成；下方清單載入於 \d{4}-\d{2}-\d{2} \d{2}:\d{2}。$/
+        )
         await expect(page.getByTestId('stale-vmu-warning')).toContainText('可能已過期')
         await expect(page.locator('tbody input[type="checkbox"]').first()).toBeDisabled()
         await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeDisabled()

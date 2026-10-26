@@ -169,6 +169,83 @@ function readRequests(method = 'eth_getTransactionCount') {
 }
 
 describe('bounded read-only RPC failover', () => {
+  it('does not classify the serialized SDK response body when structured HTTP details are absent', () => {
+    const error = Object.assign(
+      new Error('server error (responseBody="over capacity, quota exceeded")'),
+      { code: 'SERVER_ERROR' }
+    )
+    expect(rpcFailureKind(error)).toBe('endpoint')
+    expect(isRetryableRpcError(error)).toBe(false)
+    expect(rpcFailureKind(Object.assign(error, { shortMessage: 'too many requests' }))).toBe(
+      'rate-limit'
+    )
+  })
+  it.each([undefined, '5'])(
+    'reports only server-sourced cooldown seconds and retains cause: %s',
+    async (retryAfter) => {
+      const provider = await ready(1)
+      failures.set(urls[0], { status: 429, retryAfter })
+      const first = provider
+        .getTransactionCount(address, 'pending')
+        .catch((error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(100)
+      const cause = await first
+      const second = provider
+        .withSignal(new AbortController().signal)
+        .getTransactionCount(address, 'pending')
+        .catch((error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(100)
+      const error = (await second) as RpcRateLimitError
+      expect(error).toBeInstanceOf(RpcRateLimitError)
+      expect(error.cause).toBe(cause)
+      expect(error.message).toBe(
+        retryAfter
+          ? 'RPC endpoints are rate-limited. Retry in 5s. Your RPC list was preserved.'
+          : 'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
+      )
+      if (!retryAfter) expect(error.retryAfterMs).toBeUndefined()
+      expect(readRequests()).toHaveLength(1)
+    }
+  )
+
+  it.each([NaN, Infinity, -Infinity])(
+    'does not invent a cooldown from non-finite delay %s',
+    (delay) => {
+      const error = new RpcRateLimitError(delay)
+      expect(error.retryAfterMs).toBeUndefined()
+      expect(error.message).toBe(
+        'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
+      )
+    }
+  )
+
+  it.each([401, 403, 404, 408, 429, 503])(
+    'classifies HTTP %i before incidental response-body keywords',
+    (status) => {
+      const error = Object.assign(
+        new Error('server error (responseBody="Over capacity, quota exceeded")'),
+        {
+          shortMessage: `server response ${status}`,
+          code: 'SERVER_ERROR',
+          response: { statusCode: status }
+        }
+      )
+      expect(rpcFailureKind(error)).toBe(
+        status === 429 ? 'rate-limit' : status === 408 || status === 503 ? 'transient' : 'endpoint'
+      )
+    }
+  )
+
+  it.each([
+    'block number too high',
+    'block is in the future',
+    'resource not found',
+    'deadline exceeded'
+  ])('retries a temporarily unavailable chain resource: %s', (message) => {
+    const error = { code: 'CALL_EXCEPTION', info: { error: { code: -32000, message } } }
+    expect(rpcFailureKind(error)).toBe('transient')
+    expect(isRetryableRpcError(error)).toBe(true)
+  })
   it('returns the second answer before a twenty-second first endpoint completes', async () => {
     const provider = await ready()
     failures.set(urls[0], { delay: 20_000 })

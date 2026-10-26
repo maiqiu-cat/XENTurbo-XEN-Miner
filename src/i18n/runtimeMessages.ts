@@ -1,6 +1,23 @@
 // Presentation-only translations of existing logs/errors; core error codes and persisted
 // transaction evidence remain in their original form.
 export const runtimeMessages = {
+  'Could not re-read the selected VMUs (ids {ids}). No transaction was submitted. Refresh and retry.':
+    '無法重新讀取所選 VMU（ID {ids}）。此次操作未送出任何交易。請重新整理後再試。',
+  'VMU state changed on-chain (ids {ids}). Refresh and retry.':
+    '鏈上的 VMU 狀態已變更（ID {ids}）。請重新整理後再試。',
+  'RPC read failed. Refresh or check RPC settings.': 'RPC 讀取失敗。請重新整理或檢查 RPC 設定。',
+  'RPC read timed out. {detail} Refresh or check RPC settings.':
+    'RPC 讀取逾時。{detail} 請重新整理或檢查 RPC 設定。',
+  'The last refresh did not complete; the list below was loaded at {time}.':
+    '上次重新整理未完成；下方清單載入於 {time}。',
+  'Storage access is unavailable. Restore browser storage access and retry. No records were changed.':
+    '無法存取儲存空間。請恢復瀏覽器儲存存取權限後重試。未變更任何記錄。',
+  'Transaction records changed in this or another tab. Inspect again before recovery.':
+    '交易記錄已在此分頁或其他分頁中變更。請重新檢查後再恢復。',
+  'Wallet account changed. Inspect again with the original account.':
+    '錢包帳戶已變更。請使用原帳戶重新檢查。',
+  'Recovery backup could not be saved and verified. No transaction records were changed. Export a backup and restore storage capacity first.':
+    '無法儲存及驗證恢復備份。未變更任何交易記錄。請先匯出備份並恢復可用儲存空間。',
   'Confirmation timed out. The transaction may still be pending. Do not resend. Check wallet Activity and the explorer, then recheck pending operations.':
     '確認逾時。交易可能仍待確認。請勿重送。請檢查錢包 Activity 與區塊瀏覽器，再重新檢查待確認交易。',
   'Transaction submitted, but confirmation could not be completed. Do not resend. Check wallet Activity and the explorer, then recheck pending operations.':
@@ -31,6 +48,19 @@ export const runtimeMessages = {
   'RPC retry deadline': 'RPC 重試總時限',
   'RPC health check': 'RPC 健康檢查',
   'Read operation': '讀取操作',
+  'Initial wallet accounts': '初始錢包帳戶',
+  'Initial wallet network': '初始錢包網路',
+  'Connected wallet network': '已連線錢包網路',
+  'Wallet account': '錢包帳戶',
+  'Wallet network': '錢包網路',
+  'Wallet {method}': '錢包 {method}',
+  'Pending block': '待確認區塊',
+  'Chain time refresh': '鏈上時間更新',
+  'Confirmation poll': '交易確認輪詢',
+  'IndexedDB snapshot read': 'IndexedDB 快照讀取',
+  'IndexedDB snapshot write': 'IndexedDB 快照寫入',
+  'IndexedDB snapshot delete': 'IndexedDB 快照刪除',
+  'Wallet type verification': '錢包類型驗證',
   'XENTurbo XEN Miner requires PC Google Chrome. You are currently using {browser}.':
     'XENTurbo XEN Miner 需要使用電腦版 Google Chrome。您目前使用的是 {browser}。',
   'Claim & Re-Mint ({days} days)': '領取並重新鑄造（{days} 天）',

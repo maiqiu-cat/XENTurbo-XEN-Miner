@@ -1,7 +1,9 @@
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Vmu, WalletSnapshot } from '@/core/types'
-import { READ_TIMEOUT_MS } from '@/core/readDeadline'
+import { READ_TIMEOUT_MS, ReadTimeoutError } from '@/core/readDeadline'
+import { RpcRateLimitError } from '@/core/rpcPolicy'
+import { formatDate } from '@/utils/format'
 import { RpcConfigurationError } from '@/core/rpc'
 import { watch } from 'vue'
 
@@ -87,6 +89,35 @@ describe('vmu store request invalidation', () => {
     chainReader.readChainTimestamp.mockResolvedValue(Date.now())
   })
 
+  it('normalizes an incomplete affected response while retaining the raw diagnostic only in the console', async () => {
+    const store = useVmuStore()
+    store.$patch({
+      chain: 'eth',
+      wallet: walletA,
+      syncedAt: 123,
+      stale: false,
+      vmuCount: 1,
+      vmus: [mintingVmu()]
+    })
+    chainReader.readVmuCount.mockResolvedValue(1)
+    chainReader.readGlobalRank.mockResolvedValue(100)
+    chainReader.readVmuStates.mockResolvedValueOnce([])
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await store.refreshAffected([1])
+      expect(store.error).toBe('RPC read failed. Refresh or check RPC settings.')
+      expect(warn).toHaveBeenCalledWith(
+        'VMU refresh failed',
+        expect.objectContaining({ message: 'Incomplete affected VMU result' })
+      )
+      expect(store.vmus).toHaveLength(1)
+      expect(store.transactionReady).toBe(false)
+    } finally {
+      store.detach()
+      warn.mockRestore()
+    }
+  })
+
   it('checks configured RPC health before reading wallet state', async () => {
     snapshots.loadSnapshot.mockResolvedValue(null)
     chainReader.readVmuCount.mockResolvedValue(0)
@@ -101,6 +132,108 @@ describe('vmu store request invalidation', () => {
       chainReader.readVmuCount.mock.invocationCallOrder[0]
     )
   })
+
+  for (const mode of ['full', 'affected'] as const) {
+    it.each([401, 403, 404])(
+      `normalizes an HTTP %i ${mode} error without exposing SDK text`,
+      async (status) => {
+        const store = useVmuStore()
+        snapshots.loadSnapshot.mockResolvedValue(null)
+        chainReader.readVmuCount.mockResolvedValue(1)
+        chainReader.readGlobalRank.mockResolvedValue(100)
+        chainReader.readWalletVmus.mockResolvedValue([mintingVmu()])
+        await store.load('eth', walletA)
+        chainReader.readVmuCount.mockRejectedValueOnce(
+          Object.assign(new Error(`server response ${status}: private diagnostic`), {
+            response: { statusCode: status }
+          })
+        )
+        await (mode === 'full' ? store.refresh() : store.refreshAffected([1]))
+        expect(store.error).toBe('RPC read failed. Refresh or check RPC settings.')
+        expect(store.stale).toBe(true)
+        expect(store.transactionReady).toBe(false)
+        store.detach()
+      }
+    )
+
+    it.each(['failed', 'partial'] as const)(
+      `does not schedule repeated full scans after ${mode} %s reads`,
+      async (failure) => {
+        vi.useFakeTimers()
+        try {
+          const store = useVmuStore()
+          const old = mintingVmu()
+          snapshots.loadSnapshot.mockResolvedValue(null)
+          chainReader.readVmuCount.mockResolvedValue(1)
+          chainReader.readGlobalRank.mockResolvedValue(100)
+          chainReader.readWalletVmus.mockResolvedValue([old])
+          await store.load('eth', walletA)
+          const scanned = mode === 'full' ? chainReader.readWalletVmus : chainReader.readVmuStates
+          if (failure === 'failed') scanned.mockRejectedValueOnce(new Error('offline'))
+          else scanned.mockResolvedValueOnce([{ ...old, status: 'READ_ERROR', readOk: false }])
+          await (mode === 'full' ? store.refresh() : store.refreshAffected([1]))
+          expect(store.transactionReady).toBe(false)
+          const refresh = vi.spyOn(store, 'refresh')
+          chainReader.readChainTimestamp.mockResolvedValue(old.maturityTs + 10_000)
+          for (let index = 0; index < 5; index++) {
+            await store.refreshChainTime()
+            await vi.advanceTimersByTimeAsync(1500)
+          }
+          expect(refresh).not.toHaveBeenCalled()
+          expect(store.vmus).toEqual([old])
+          store.detach()
+        } finally {
+          vi.useRealTimers()
+          vi.restoreAllMocks()
+        }
+      }
+    )
+
+    it(`describes a retained complete inventory after an incomplete ${mode} refresh`, async () => {
+      const store = useVmuStore()
+      const old = mintingVmu()
+      snapshots.loadSnapshot.mockResolvedValue(null)
+      chainReader.readVmuCount.mockResolvedValue(1)
+      chainReader.readGlobalRank.mockResolvedValue(100)
+      chainReader.readWalletVmus.mockResolvedValue([old])
+      await store.load('eth', walletA)
+      const loadedAt = store.syncedAt!
+      const scanned = mode === 'full' ? chainReader.readWalletVmus : chainReader.readVmuStates
+      scanned.mockResolvedValueOnce([{ ...old, status: 'READ_ERROR', readOk: false }])
+      await (mode === 'full' ? store.refresh() : store.refreshAffected([1]))
+      expect(store.error).toBe(
+        `The last refresh did not complete; the list below was loaded at ${formatDate(loadedAt)}.`
+      )
+      expect(store.vmus).toEqual([old])
+      expect(store.readErrors).toBe(0)
+      expect(store.transactionReady).toBe(false)
+      store.detach()
+    })
+
+    it.each([new RpcRateLimitError(), new ReadTimeoutError('RPC read', 12000)])(
+      `preserves a known ${mode} read failure: %s`,
+      async (error) => {
+        const store = useVmuStore()
+        store.$patch({
+          chain: 'eth',
+          wallet: walletA,
+          syncedAt: 123,
+          stale: false,
+          vmuCount: 1,
+          vmus: [mintingVmu()]
+        })
+        rpcHealth.ensureHealthyReadProvider.mockRejectedValueOnce(error)
+        await (mode === 'full' ? store.refresh() : store.refreshAffected([1]))
+        expect(store.error).toBe(
+          error instanceof ReadTimeoutError
+            ? `RPC read timed out. ${error.diagnostic} Refresh or check RPC settings.`
+            : error.message
+        )
+        expect(store.transactionReady).toBe(false)
+        store.detach()
+      }
+    )
+  }
 
   it('retains the last successful snapshot and cache when manual refresh fails', async () => {
     const store = useVmuStore()
@@ -129,7 +262,7 @@ describe('vmu store request invalidation', () => {
     expect(store.chainTimestampMs).toBe(chainTimestampMs)
     expect(store.syncedAt).toBe(syncedAt)
     expect(store.loading).toBe(false)
-    expect(store.error).toBe('Refresh RPC unavailable')
+    expect(store.error).toBe('RPC read failed. Refresh or check RPC settings.')
     expect(snapshots.clearSnapshot).not.toHaveBeenCalled()
     expect(snapshots.saveSnapshot).not.toHaveBeenCalled()
     store.detach()
@@ -196,7 +329,11 @@ describe('vmu store request invalidation', () => {
       expect(store.syncedAt).toBe(syncedAt)
       expect(store.stale).toBe(true)
       expect(store.transactionReady).toBe(false)
-      expect(store.error).toContain(failure === 'scan' ? 'scan failed' : 'failed to read')
+      expect(store.error).toBe(
+        failure === 'scan'
+          ? 'RPC read failed. Refresh or check RPC settings.'
+          : `The last refresh did not complete; the list below was loaded at ${formatDate(syncedAt!)}.`
+      )
       expect(snapshots.saveSnapshot).not.toHaveBeenCalled()
       expect(snapshots.clearSnapshot).not.toHaveBeenCalled()
       store.detach()
@@ -267,7 +404,9 @@ describe('vmu store request invalidation', () => {
       expect(store.syncedAt).toBeNull()
       expect(store.transactionReady).toBe(false)
       expect(store.loading).toBe(false)
-      expect(store.error).toBe(change === 'disconnect' ? null : 'new context offline')
+      expect(store.error).toBe(
+        change === 'disconnect' ? null : 'RPC read failed. Refresh or check RPC settings.'
+      )
       expect(snapshots.saveSnapshot).not.toHaveBeenCalled()
       expect(snapshots.clearSnapshot).not.toHaveBeenCalled()
       store.detach()
@@ -424,7 +563,7 @@ describe('vmu store request invalidation', () => {
       }
     )
 
-    it(`preserves unrelated error text during a ${kind} refresh`, async () => {
+    it(`uses fixed advice for an unknown ${kind} read failure`, async () => {
       const store = useVmuStore()
       store.$patch({
         chain: 'eth',
@@ -437,7 +576,7 @@ describe('vmu store request invalidation', () => {
       rpcHealth.ensureHealthyReadProvider.mockRejectedValueOnce(new Error('Unrelated read fixture'))
       try {
         await (kind === 'full' ? store.refresh() : store.refreshAffected([1]))
-        expect(store.error).toBe('Unrelated read fixture')
+        expect(store.error).toBe('RPC read failed. Refresh or check RPC settings.')
       } finally {
         store.detach()
       }
@@ -525,12 +664,12 @@ describe('vmu store request invalidation', () => {
         expect(store.loading).toBe(false)
         expect(store.stale).toBe(true)
         expect(store.transactionReady).toBe(false)
-        expect(store.error).toBe('restarted read offline')
+        expect(store.error).toBe('RPC read failed. Refresh or check RPC settings.')
         save.resolve()
         await first
         expect(store.stale).toBe(true)
         expect(store.transactionReady).toBe(false)
-        expect(store.error).toBe('restarted read offline')
+        expect(store.error).toBe('RPC read failed. Refresh or check RPC settings.')
         expect(schedule).not.toHaveBeenCalled()
       } finally {
         save.resolve()

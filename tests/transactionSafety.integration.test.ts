@@ -228,6 +228,24 @@ async function detachAtWalletTimeout(harness: Awaited<ReturnType<typeof installO
   return { prepared, onStep }
 }
 
+it.each(['READ_ERROR', 'missing', 'MINTING'] as const)(
+  'distinguishes a selected VMU %s from an actual on-chain state change',
+  async (status) => {
+    const harness = await installOfflineHarness()
+    const { readVmuStatuses } = await import('@/core/chainReader')
+    vi.mocked(readVmuStatuses).mockResolvedValueOnce(
+      status === 'missing' ? new Map() : new Map([[1, status]])
+    )
+    const expected =
+      status === 'MINTING'
+        ? 'VMU state changed on-chain (ids 1). Refresh and retry.'
+        : 'Could not re-read the selected VMUs (ids 1). No transaction was submitted. Refresh and retry.'
+    await expect(harness.prepare()).rejects.toThrow(expected)
+    expect(harness.sendRequests()).toEqual([])
+    expect(harness.locks.lockedIds('eth', WALLET)).toEqual(new Set())
+  }
+)
+
 it('normalizes RPC errors with the real error class in the offline transaction harness', async () => {
   const harness = await installOfflineHarness()
   const { RpcConfigurationError } = await vi.importActual<typeof import('@/core/rpc')>('@/core/rpc')

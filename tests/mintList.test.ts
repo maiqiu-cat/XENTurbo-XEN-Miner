@@ -162,6 +162,64 @@ describe('MintList selection context', () => {
     wrapper.unmount()
   })
 
+  it('keeps the page but clears selection during refresh, without flashing a stale warning', async () => {
+    const { wrapper, store, wallet } = mountClaimableList()
+    store.vmus = Array.from({ length: 250 }, (_, index) => ({
+      ...store.vmus[0],
+      id: index + 1,
+      maturityTs: index * 1000
+    }))
+    store.vmuCount = 250
+    await nextTick()
+    await wrapper.get('button[aria-label="Next page"]').trigger('click')
+    await wrapper.get('input[type="checkbox"]').trigger('click')
+    expect(wrapper.text()).toContain('1 VMUs selected')
+    store.refreshGen += 1
+    store.loading = true
+    store.stale = true
+    await nextTick()
+    expect(wrapper.text()).toContain('Page 2 of 3')
+    expect(wrapper.text()).not.toContain('VMUs selected')
+    expect(wrapper.find('[data-testid="stale-vmu-warning"]').exists()).toBe(false)
+    expect(wrapper.get('input[type="checkbox"]').attributes('disabled')).toBeDefined()
+    store.syncedAt = 2
+    store.stale = false
+    store.loading = false
+    await nextTick()
+    expect(wrapper.text()).toContain('Page 2 of 3')
+    wallet.contextGen += 1
+    await nextTick()
+    expect(wrapper.text()).toContain('Page 1 of 3')
+    await wrapper.get('button[aria-label="Next page"]').trigger('click')
+    store.vmus = store.vmus.slice(0, 100)
+    await nextTick()
+    expect(wrapper.findAll('tbody tr')).toHaveLength(100)
+    expect(wrapper.text()).not.toContain('Page 2')
+  })
+
+  it.each(['focus', 'visibilitychange', 'pageshow'])(
+    'does not rescan stale matured rows after repeated %s events',
+    async (event) => {
+      vi.useFakeTimers()
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+      const { wrapper, store } = mountClaimableList()
+      store.vmus[0].status = 'MINTING'
+      store.stale = true
+      const refresh = vi.spyOn(store, 'refresh').mockResolvedValue()
+      chainClock.readChainTimestamp.mockResolvedValue(Date.now())
+      for (let index = 0; index < 5; index++) {
+        const resume = new Event(event)
+        if (event === 'pageshow') Object.defineProperty(resume, 'persisted', { value: true })
+        ;(event === 'visibilitychange' ? document : window).dispatchEvent(resume)
+        await flushPromises()
+        await vi.advanceTimersByTimeAsync(1500)
+      }
+      expect(refresh).not.toHaveBeenCalled()
+      expect(store.transactionReady).toBe(false)
+      wrapper.unmount()
+    }
+  )
+
   it('advances with a monotonic clock and waits for chain confirmation at maturity', async () => {
     vi.useFakeTimers()
     const chainTime = 1_800_000_000_000

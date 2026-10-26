@@ -43,11 +43,13 @@ export async function probeReleaseEndpoint(url, config, fetchImpl = fetch) {
   const payload = []
   const signal = AbortSignal.timeout(10_000)
   let readingResponse = false
+  let parsingBody = false
   try {
     // Match the browser's public endpoint wire limit; retain one total time budget.
     for (let start = 0; start < requests.length; start += 3) {
       const batch = requests.slice(start, start + 3)
       readingResponse = false
+      parsingBody = false
       const response = await fetchImpl(url, {
         method: 'POST',
         redirect: 'error',
@@ -57,7 +59,9 @@ export async function probeReleaseEndpoint(url, config, fetchImpl = fetch) {
       })
       if (!response.ok) return { healthy: false, url, error: `HTTP_STATUS: ${response.status}` }
       readingResponse = true
+      parsingBody = true
       const part = await response.json()
+      parsingBody = false
       rpcBatchResults(
         part,
         batch.map(({ id }) => id)
@@ -66,7 +70,10 @@ export async function probeReleaseEndpoint(url, config, fetchImpl = fetch) {
     }
   } catch (error) {
     const interrupted =
-      signal.aborted || error?.name === 'AbortError' || error?.name === 'TimeoutError'
+      signal.aborted ||
+      error?.name === 'AbortError' ||
+      error?.name === 'TimeoutError' ||
+      (parsingBody && error instanceof TypeError)
     return {
       healthy: false,
       url,
