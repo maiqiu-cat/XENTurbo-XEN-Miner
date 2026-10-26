@@ -2157,6 +2157,114 @@ test('refresh preserves the visible page without a transient stale banner or tab
 test.describe('Traditional Chinese interface', () => {
   test.use({ locale: 'zh-TW' })
 
+  for (const chainId of [1, 137] as const) {
+    for (const failure of ['http-ordinary-first-error', 'batch-invalid-request'] as const) {
+      test(`restores the list after ${failure} (${chainId}) without changing safety or language`, async ({
+        page
+      }) => {
+        await emulateDesktopGoogleChrome(page)
+        await mockSameOriginRpc(page, { vmuCount: 2 })
+        await installInjectedWallet(page)
+        const endpoints = chainId === 1 ? ETHEREUM_RPC_ROUTES : POLYGON_RPC_ROUTES
+        let faulty = false
+        const posts: string[] = []
+        const failed = new Set<string>()
+        const errors: string[] = []
+        page.on('pageerror', (error) => errors.push(error.message))
+        let release!: () => void
+        const delayed = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        for (const endpoint of endpoints) {
+          await page.route(endpoint, async (route) => {
+            const payload = route.request().postDataJSON()
+            const batch = Array.isArray(payload) ? payload : [payload]
+            const isCount = batch.some((call: { method: string; params: unknown[] }) => {
+              const tx = call.params[0] as { to?: string; data?: string } | undefined
+              return (
+                call.method === 'eth_call' &&
+                tx?.to?.toLowerCase() === FACTORY.toLowerCase() &&
+                tx.data?.startsWith(factoryInterface.getFunction('vmuCount')!.selector)
+              )
+            })
+            if (faulty && isCount) {
+              const url = route.request().url()
+              posts.push(url)
+              if (posts.length === 1) await delayed
+              if (
+                failure === 'http-ordinary-first-error' ? !failed.has(url) : endpoints[0].test(url)
+              ) {
+                failed.add(url)
+                return route.fulfill({
+                  status: failure === 'http-ordinary-first-error' ? 500 : 200,
+                  json: {
+                    jsonrpc: '2.0',
+                    id: null,
+                    error:
+                      failure === 'http-ordinary-first-error'
+                        ? { code: -32603, message: 'Internal error' }
+                        : { code: -32600, message: 'batch size too large' }
+                  }
+                })
+              }
+            }
+            return route.fallback()
+          })
+        }
+        await page.goto('/')
+        await expect(page).toHaveTitle('XENTurbo XEN Miner')
+        await page.evaluate((id) => window.__walletMock.emitChain(id), `0x${chainId.toString(16)}`)
+        await page.getByRole('button', { name: '連接錢包' }).first().click()
+        await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeEnabled()
+        const rows = await page.locator('tbody tr').allTextContents()
+        await page.locator('tbody input[type="checkbox"]').first().check()
+        faulty = true
+        await page.getByRole('button', { name: '重新整理', exact: true }).click()
+        try {
+          await expect(
+            page.getByRole('button', { name: '正在重新整理…', exact: true })
+          ).toBeDisabled()
+          await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeDisabled()
+          await expect(page.locator('tbody input[type="checkbox"]').first()).toBeDisabled()
+          await expect(page.locator('.action-bar')).toHaveCount(0)
+        } finally {
+          release()
+        }
+        await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeEnabled()
+        await expect(page.locator('.err-banner,.rank-banner,.tag-warn')).toHaveCount(0)
+        await expect(page.getByTestId('stale-vmu-warning')).toHaveCount(0)
+        expect(await page.locator('tbody tr').allTextContents()).toEqual(rows)
+        await expect(page.locator('tbody input[type="checkbox"]').first()).not.toBeChecked()
+        if (failure === 'http-ordinary-first-error') {
+          expect(posts).toHaveLength(5)
+          endpoints.forEach((endpoint, index) => expect(posts[index]).toMatch(endpoint))
+          expect(posts[4]).toBe(posts[0])
+        } else {
+          expect(posts).toHaveLength(2)
+          expect(posts[0]).toMatch(endpoints[0])
+          expect(posts[1]).toMatch(endpoints[1])
+        }
+        await captureQaScreenshot(page, `rpc-recovered-${chainId}-${failure}-zh`)
+        await page.getByTestId('language-selector').selectOption('en')
+        await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+        await expect(page.locator('.group-note')).toContainText('2 VMUs total')
+        faulty = false
+        await page.reload()
+        await expect(page.getByTestId('language-selector')).toHaveValue('en')
+        await page.evaluate((id) => window.__walletMock.emitChain(id), `0x${chainId.toString(16)}`)
+        await page.getByRole('button', { name: 'Connect Wallet' }).first().click()
+        await expect(page.getByRole('button', { name: 'Confirm Mint', exact: true })).toBeEnabled()
+        await expect(page.locator('.err-banner,.rank-banner,.tag-warn')).toHaveCount(0)
+        expect(await page.evaluate(() => window.__walletMock.stats())).toEqual({
+          sendAttempts: 0,
+          successfulBroadcasts: 0
+        })
+        expect(await page.evaluate(() => localStorage.getItem('sm.customRpc'))).toBeNull()
+        expect(errors).toEqual([])
+      })
+    }
+  }
+
   for (const scenario of ['cached', 'failed-retry'] as const) {
     test(`keeps stale data labelled while the ${scenario} refresh is pending`, async ({ page }) => {
       await page.setViewportSize({ width: scenario === 'cached' ? 1280 : 390, height: 900 })
@@ -2442,6 +2550,8 @@ test.describe('Traditional Chinese interface', () => {
       'hidden-retry-after',
       'json-rate-limit',
       'batch-rate-limit',
+      'http-ordinary-no-retry-after',
+      'http-ordinary-visible-retry-after',
       'visible-retry-after'
     ] as const) {
       test(`explains an exhausted RPC rate limit (${chainId}, ${failure}) and restores the list without signing`, async ({
@@ -2466,6 +2576,8 @@ test.describe('Traditional Chinese interface', () => {
         const errors: string[] = []
         const unexpected: string[] = []
         const endpoints = chainId === 1 ? ETHEREUM_RPC_ROUTES : POLYGON_RPC_ROUTES
+        const visibleDelay =
+          failure === 'visible-retry-after' || failure === 'http-ordinary-visible-retry-after'
         page.on('pageerror', (error) => errors.push(error.message))
         await page.route('https://**/*', async (route) => {
           const url = route.request().url()
@@ -2517,9 +2629,19 @@ test.describe('Traditional Chinese interface', () => {
               return route.fulfill({ json: Array.isArray(payload) ? replies : replies[0] })
             }
             const headers: Record<string, string> = { 'Access-Control-Allow-Origin': '*' }
-            if (failure !== 'no-retry-after') headers['Retry-After'] = '1'
-            if (failure === 'visible-retry-after')
-              headers['Access-Control-Expose-Headers'] = 'Retry-After'
+            if (failure !== 'no-retry-after' && failure !== 'http-ordinary-no-retry-after')
+              headers['Retry-After'] = '1'
+            if (visibleDelay) headers['Access-Control-Expose-Headers'] = 'Retry-After'
+            if (failure.startsWith('http-ordinary-'))
+              return route.fulfill({
+                status: 429,
+                headers,
+                json: {
+                  jsonrpc: '2.0',
+                  id: null,
+                  error: { code: -32603, message: 'Internal error' }
+                }
+              })
             return route.fulfill({ status: 429, headers, body: 'Fixture rate limit' })
           }
           return route.fallback()
@@ -2542,14 +2664,12 @@ test.describe('Traditional Chinese interface', () => {
         await expect(page.getByRole('button', { name: '確認鑄造', exact: true })).toBeDisabled()
         await expect(page.locator('.action-bar')).toHaveCount(0)
         await expect(page.locator('tbody input[type="checkbox"]').first()).toBeDisabled()
-        const chinese =
-          failure === 'visible-retry-after'
-            ? 'RPC 節點受到限流。請於 1 秒後重試。RPC 清單已保留。'
-            : 'RPC 節點受到限流。請稍候再重試。RPC 清單已保留。'
-        const english =
-          failure === 'visible-retry-after'
-            ? 'RPC endpoints are rate-limited. Retry in 1s. Your RPC list was preserved.'
-            : 'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
+        const chinese = visibleDelay
+          ? 'RPC 節點受到限流。請於 1 秒後重試。RPC 清單已保留。'
+          : 'RPC 節點受到限流。請稍候再重試。RPC 清單已保留。'
+        const english = visibleDelay
+          ? 'RPC endpoints are rate-limited. Retry in 1s. Your RPC list was preserved.'
+          : 'RPC endpoints are rate-limited. Please wait and retry. Your RPC list was preserved.'
         await expect(page.locator('.err-banner')).toHaveText(chinese, { timeout: 10_000 })
         await expect(page.getByRole('button', { name: '重新整理', exact: true })).toBeEnabled()
         // Retry backoff >= pool cooldown (both 1s); equality is eligible, not a skipped attempt.
@@ -2559,7 +2679,7 @@ test.describe('Traditional Chinese interface', () => {
         expect(await page.evaluate(() => window.__rateLimitHeaders)).toEqual(
           failure === 'json-rate-limit' || failure === 'batch-rate-limit'
             ? []
-            : Array(16).fill(failure === 'visible-retry-after' ? '1' : null)
+            : Array(16).fill(visibleDelay ? '1' : null)
         )
         await expect(page.locator('body')).not.toContainText('missing revert data')
         await expect(page.locator('body')).not.toContainText('server response 429')

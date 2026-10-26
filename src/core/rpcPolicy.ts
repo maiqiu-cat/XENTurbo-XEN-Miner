@@ -8,8 +8,8 @@ function record(value: unknown): ErrorRecord | undefined {
   return value !== null && typeof value === 'object' ? (value as ErrorRecord) : undefined
 }
 
-/** Recover only a single structured error, never diagnostic text or another batch item's reply. */
-export function rpcResponseError(error: unknown): ErrorRecord | undefined {
+/** Extract a single HTTP error or an unassigned whole-batch BAD_DATA reply. */
+function rpcErrorResponse(error: unknown): { rpc: ErrorRecord; unassigned: boolean } | undefined {
   const value = record(error)
   let body: unknown
   if (value?.code === 'SERVER_ERROR') {
@@ -20,7 +20,7 @@ export function rpcResponseError(error: unknown): ErrorRecord | undefined {
     } catch {
       return undefined
     }
-  } else if (value?.code === 'BAD_DATA') {
+  } else if (value?.code === 'BAD_DATA' && value.shortMessage === 'missing response for request') {
     body = value.value
   } else {
     return undefined
@@ -29,7 +29,13 @@ export function rpcResponseError(error: unknown): ErrorRecord | undefined {
   if (!reply || 'result' in reply || (value.code === 'BAD_DATA' && reply.id != null))
     return undefined
   const rpc = record(reply.error)
-  return rpc && Number.isSafeInteger(rpc.code) && typeof rpc.message === 'string' ? rpc : undefined
+  return rpc && Number.isSafeInteger(rpc.code) && typeof rpc.message === 'string'
+    ? { rpc, unassigned: reply.id == null }
+    : undefined
+}
+
+export function rpcResponseError(error: unknown): ErrorRecord | undefined {
+  return rpcErrorResponse(error)?.rpc
 }
 
 export class RpcReadInvalidatedError extends Error {
@@ -79,11 +85,12 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
   if (isRpcReadCancelled(error)) return 'permanent'
   if (error instanceof ReadTimeoutError) return 'transient'
 
-  const rpc =
+  const directRpc =
     record(record(value?.info)?.error) ??
     record(value?.error) ??
-    (typeof value?.code === 'number' ? value : undefined) ??
-    rpcResponseError(error)
+    (typeof value?.code === 'number' ? value : undefined)
+  const responseRpc = directRpc ? undefined : rpcErrorResponse(error)
+  const rpc = directRpc ?? responseRpc?.rpc
   const message = typeof rpc?.message === 'string' ? rpc.message : ''
   const response = record(value?.response)
   const status = Number(response?.statusCode ?? value?.status)
@@ -95,6 +102,13 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
     .filter((part): part is string => typeof part === 'string')
     .join(' ')
   const data = [value?.data, rpc?.data, record(rpc?.data)?.data]
+  const capacity =
+    status === 413 ||
+    /(?:result|response|returndata|payload|batch|query|logs?).{0,100}(?:exceed|limit|maximum|too (?:large|big|many)|more than)|(?:limit|maximum).{0,60}(?:bytes|items|results|response|payload|batch)/i.test(
+      message
+    )
+  // An unassigned -32600 rejects the request envelope, not an individual call's semantics.
+  if (rpc?.code === -32600 && responseRpc?.unassigned) return capacity ? 'capacity' : 'endpoint'
   if (
     data.some((part) => typeof part === 'string' && /^0x[0-9a-f]+$/i.test(part)) ||
     /execution reverted|\brevert(?:ed)?\b/i.test(message) ||
@@ -107,14 +121,7 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
   ) {
     return 'permanent'
   }
-  if (
-    status === 413 ||
-    /(?:result|response|returndata|payload|batch|query|logs?).{0,100}(?:exceed|limit|maximum|too (?:large|big|many)|more than)|(?:limit|maximum).{0,60}(?:bytes|items|results|response|payload|batch)/i.test(
-      message
-    )
-  ) {
-    return 'capacity'
-  }
+  if (capacity) return 'capacity'
 
   // Validated RPC semantics win; HTTP status wins over unstructured HTML/SDK text.
   if (!rpc) {
@@ -148,6 +155,9 @@ export function rpcFailureKind(error: unknown): RpcFailureKind {
   ) {
     return 'transient'
   }
+  // Unclassified structured errors still retain the HTTP transport's retry/cooldown signal.
+  if (status === 429) return 'rate-limit'
+  if (status === 408 || (status >= 500 && status <= 599)) return 'transient'
   return 'endpoint'
 }
 

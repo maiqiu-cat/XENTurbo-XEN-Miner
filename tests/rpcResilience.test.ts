@@ -30,6 +30,8 @@ interface Failure {
   discoveryDelay?: number
   body?: string
   malformedReceipt?: boolean
+  receiptResult?: unknown
+  readFailures?: number
 }
 
 const originalTransport = new FetchRequest('https://rpc.example/').getUrlFunc
@@ -66,9 +68,10 @@ beforeEach(() => {
     const payload = JSON.parse(new TextDecoder().decode(request.body!)) as RpcCall | RpcCall[]
     const batch = Array.isArray(payload) ? payload : [payload]
     requests.push({ url: request.url, calls: batch })
-    const failure = failures.get(request.url)
-    if (failure?.discoveryDelay && batch.every(({ method }) => method === 'eth_chainId')) {
-      await new Promise((resolve) => setTimeout(resolve, failure.discoveryDelay))
+    let failure = failures.get(request.url)
+    const discoveryDelay = failure?.discoveryDelay
+    if (discoveryDelay && batch.every(({ method }) => method === 'eth_chainId')) {
+      await new Promise((resolve) => setTimeout(resolve, discoveryDelay))
     }
     if (batch.some(({ method }) => method === 'eth_chainId'))
       discoveries.set(request.url, (discoveries.get(request.url) ?? 0) + 1)
@@ -83,8 +86,13 @@ beforeEach(() => {
       return { statusCode: 503, statusMessage: 'Unavailable', headers: {}, body: new Uint8Array() }
     }
     const reads = batch.some(({ method }) => method !== 'eth_chainId')
-    if (failure?.delay && reads) {
-      await new Promise((resolve) => setTimeout(resolve, failure.delay))
+    if (reads && failure?.readFailures !== undefined) {
+      if (failure.readFailures === 0) failure = undefined
+      else failure.readFailures -= 1
+    }
+    const readDelay = failure?.delay
+    if (readDelay && reads) {
+      await new Promise((resolve) => setTimeout(resolve, readDelay))
     }
     const replies = batch.map(({ id, method }) => {
       if (method !== 'eth_chainId' && failure?.error) {
@@ -94,26 +102,28 @@ beforeEach(() => {
         return {
           jsonrpc: '2.0',
           id,
-          result: failure?.malformedReceipt
-            ? { transactionHash: hash }
-            : receiptAvailable
-              ? {
-                  blockHash: `0x${'b'.repeat(64)}`,
-                  blockNumber: '0x2a',
-                  contractAddress: null,
-                  cumulativeGasUsed: '0x5208',
-                  effectiveGasPrice: '0x3b9aca00',
-                  from: address,
-                  gasUsed: '0x5208',
-                  logs: [],
-                  logsBloom: `0x${'0'.repeat(512)}`,
-                  status: '0x1',
-                  to: address,
-                  transactionHash: hash,
-                  transactionIndex: '0x0',
-                  type: '0x2'
-                }
-              : null
+          result:
+            failure?.receiptResult ??
+            (failure?.malformedReceipt
+              ? { transactionHash: hash }
+              : receiptAvailable
+                ? {
+                    blockHash: `0x${'b'.repeat(64)}`,
+                    blockNumber: '0x2a',
+                    contractAddress: null,
+                    cumulativeGasUsed: '0x5208',
+                    effectiveGasPrice: '0x3b9aca00',
+                    from: address,
+                    gasUsed: '0x5208',
+                    logs: [],
+                    logsBloom: `0x${'0'.repeat(512)}`,
+                    status: '0x1',
+                    to: address,
+                    transactionHash: hash,
+                    transactionIndex: '0x0',
+                    type: '0x2'
+                  }
+                : null)
         }
       const result =
         method === 'eth_chainId'
@@ -169,6 +179,134 @@ function readRequests(method = 'eth_getTransactionCount') {
 }
 
 describe('bounded read-only RPC failover', () => {
+  it.each([408, 500, 503])(
+    'recovers a single endpoint after one HTTP %s ordinary JSON-RPC failure',
+    async (status) => {
+      const provider = await ready(1)
+      failures.set(urls[0], {
+        status,
+        readFailures: 1,
+        body: JSON.stringify({ id: null, error: { code: -32603, message: 'Internal error' } })
+      })
+      const sleep = vi.fn(
+        (delay: number) => new Promise<void>((resolve) => setTimeout(resolve, delay))
+      )
+      const result = withRetry(() => provider.send('eth_getCode', [address, 'latest']), {
+        sleep,
+        jitterRatio: 0
+      }).catch((error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(await result).toBe('0x6001')
+      expect(sleep.mock.calls).toEqual([[400]])
+      expect(readRequests('eth_getCode').map(({ url }) => url)).toEqual([urls[0], urls[0]])
+      expect(requests).toHaveLength(2)
+    }
+  )
+
+  it.each([500, 429])(
+    'recovers after every endpoint fails once with HTTP %s and an ordinary RPC body',
+    async (status) => {
+      const provider = await ready(3)
+      for (const url of urls)
+        failures.set(url, {
+          status,
+          readFailures: 1,
+          body: JSON.stringify({ id: null, error: { code: -32603, message: 'Internal error' } })
+        })
+      const result = withRetry(() => provider.send('eth_getCode', [address, 'latest']), {
+        jitterRatio: 0
+      }).catch((error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(2_000)
+      expect(await result).toBe('0x6001')
+      expect(readRequests('eth_getCode').map(({ url }) => url)).toEqual([...urls, urls[0]])
+      expect(
+        requests
+          .filter(({ calls }) => calls.every(({ method }) => method === 'eth_chainId'))
+          .map(({ url }) => url)
+      ).toEqual(urls.slice(1))
+      expect(requests).toHaveLength(6)
+    }
+  )
+
+  it.each([undefined, '5'])(
+    'cools down and retries an ordinary HTTP 429 RPC body with Retry-After %s',
+    async (retryAfter) => {
+      const provider = await ready(1)
+      failures.set(urls[0], {
+        status: 429,
+        retryAfter,
+        body: JSON.stringify({ id: null, error: { code: -32603, message: 'Internal error' } })
+      })
+      const first = provider
+        .send('eth_getCode', [address, 'latest'])
+        .catch((error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(100)
+      const cause = await first
+      expect(rpcFailureKind(cause)).toBe('rate-limit')
+      expect(normalizeError(cause)).toBe(
+        new RpcRateLimitError(retryAfter ? 5_000 : undefined).message
+      )
+      const skipped = provider
+        .send('eth_getCode', [address, 'latest'])
+        .catch((error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(100)
+      expect(await skipped).toMatchObject({ code: 'RPC_RATE_LIMITED', cause })
+      expect(readRequests('eth_getCode')).toHaveLength(1)
+      await vi.advanceTimersByTimeAsync(retryAfter ? 5_000 : 1_000)
+      requests.length = 0
+      const sleep = vi.fn(
+        (delay: number) => new Promise<void>((resolve) => setTimeout(resolve, delay))
+      )
+      const result = withRetry(() => provider.send('eth_getCode', [address, 'latest']), {
+        sleep,
+        jitterRatio: 0
+      }).catch((error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(20_000)
+      expect(await result).toMatchObject({
+        code: 'RPC_RATE_LIMITED',
+        cause: { code: 'SERVER_ERROR' }
+      })
+      expect(sleep.mock.calls).toEqual(
+        retryAfter ? [[5_000], [5_000], [5_000]] : [[1_000], [1_000], [1_600]]
+      )
+      expect(readRequests('eth_getCode')).toHaveLength(4)
+    }
+  )
+
+  for (const status of [200, 400, 429, 503]) {
+    it.each(['Invalid request', 'batch size too large'])(
+      `fails over from HTTP ${status} whole-batch -32600 without replaying the rejected endpoint: %s`,
+      async (message) => {
+        const provider = await ready()
+        failures.set(urls[0], {
+          status,
+          body: JSON.stringify({ id: null, error: { code: -32600, message } })
+        })
+        const read = () =>
+          withRetry(() => provider.send('eth_getCode', [address, 'latest'])).catch(
+            (error: unknown) => error
+          )
+        const first = read()
+        await vi.advanceTimersByTimeAsync(1_000)
+        expect(await first).toBe('0x6001')
+        const second = read()
+        await vi.advanceTimersByTimeAsync(1_000)
+        expect(await second).toBe('0x6001')
+        expect(readRequests('eth_getCode').map(({ url }) => url)).toEqual([
+          urls[0],
+          urls[1],
+          urls[1]
+        ])
+        expect(
+          requests
+            .filter(({ calls }) => calls.every(({ method }) => method === 'eth_chainId'))
+            .map(({ url }) => url)
+        ).toEqual([urls[1]])
+        expect(requests).toHaveLength(4)
+      }
+    )
+  }
+
   for (const status of [400, 500, 503]) {
     it.each([
       { code: 3, message: 'execution reverted', data: '0x08c379a0' },
@@ -772,6 +910,24 @@ describe('bounded read-only RPC failover', () => {
     expect(requests).toHaveLength(completed)
   })
 
+  it.each([
+    { code: -32602, message: 'opaque receipt diagnostic' },
+    { code: 3, message: 'opaque receipt diagnostic', data: '0xabcd' }
+  ])('does not interpret an invalid receipt result as a batch RPC error: %j', async (error) => {
+    const provider = await ready()
+    failures.set(urls[0], { receiptResult: { error } })
+    receiptAvailable = true
+    const result = provider.waitForTransaction(hash, 1, 10_000).catch((failure: unknown) => failure)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(await result).toMatchObject({ hash, status: 1 })
+    expect(readRequests('eth_getTransactionReceipt').map(({ url }) => url)).toEqual(
+      urls.slice(0, 2)
+    )
+    const completed = requests.length
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(requests).toHaveLength(completed)
+  })
+
   it('requires the requested confirmation count and supports a zero-confirmation read', async () => {
     const provider = await ready(1)
     const pending = provider.waitForTransaction(hash, 0)
@@ -914,6 +1070,77 @@ describe('bounded read-only RPC failover', () => {
 })
 
 describe('one retry layer and structured errors', () => {
+  for (const status of [200, 400, 408, 429, 500, 502, 503, 504]) {
+    for (const wrapper of ['responseBody', 'info.error', 'error'] as const) {
+      it.each([
+        { code: -32603, message: 'Internal error' },
+        { code: -32000, message: 'upstream connect failure' }
+      ])(
+        `falls back to HTTP ${status} only for unclassified ${wrapper} RPC semantics: %j`,
+        (error) => {
+          const failure = {
+            code: 'SERVER_ERROR',
+            response: { statusCode: status },
+            ...(wrapper === 'responseBody'
+              ? { info: { responseBody: JSON.stringify({ id: null, error }) } }
+              : wrapper === 'info.error'
+                ? { info: { error } }
+                : { error })
+          }
+          const expected =
+            status === 429
+              ? 'rate-limit'
+              : status === 408 || status >= 500
+                ? 'transient'
+                : 'endpoint'
+          expect(rpcFailureKind(failure)).toBe(expected)
+          expect(isRetryableRpcError(failure)).toBe(expected !== 'endpoint')
+        }
+      )
+    }
+  }
+
+  for (const wrapper of ['responseBody', 'batch-object', 'batch-array'] as const) {
+    for (const id of [null, undefined]) {
+      it.each([
+        ['Invalid request', 'endpoint'],
+        ['batch size too large', 'capacity'],
+        ['rate limit', 'endpoint']
+      ] as const)(
+        `classifies unassigned -32600 as envelope rejection (${wrapper}, ${String(id)}): %s`,
+        (message, expected) => {
+          const envelope = { id, error: { code: -32600, message } }
+          const failure =
+            wrapper === 'responseBody'
+              ? {
+                  code: 'SERVER_ERROR',
+                  response: { statusCode: 429 },
+                  info: { responseBody: JSON.stringify(envelope) }
+                }
+              : {
+                  code: 'BAD_DATA',
+                  shortMessage: 'missing response for request',
+                  value: wrapper === 'batch-array' ? [envelope] : envelope
+                }
+          expect(rpcFailureKind(failure)).toBe(expected)
+          expect(isRetryableRpcError(failure)).toBe(false)
+        }
+      )
+    }
+  }
+
+  it.each([undefined, 'Invalid RPC receipt response', 'invalid value for value.hash'])(
+    'does not extract JSON-RPC semantics from unrelated BAD_DATA: %s',
+    (shortMessage) => {
+      const failure = {
+        code: 'BAD_DATA',
+        shortMessage,
+        value: { error: { code: -32602, message: 'opaque diagnostic' } }
+      }
+      expect(rpcFailureKind(failure)).toBe('endpoint')
+    }
+  )
+
   for (const status of [400, 403, 404, 413, 429, 500, 502, 503]) {
     it.each([
       [{ code: 3, message: 'execution reverted', data: '0xabcd' }, 'permanent'],
@@ -931,7 +1158,13 @@ describe('one retry layer and structured errors', () => {
           code: 'SERVER_ERROR',
           shortMessage: `server response ${status}`,
           response: { statusCode: status },
-          info: { responseBody: JSON.stringify({ jsonrpc: '2.0', id: null, error }) }
+          info: {
+            responseBody: JSON.stringify({
+              jsonrpc: '2.0',
+              id: error.code === -32600 ? 1 : null,
+              error
+            })
+          }
         }
         expect(rpcFailureKind(failure)).toBe(kind)
         expect(isRetryableRpcError(failure)).toBe(false)
@@ -964,7 +1197,9 @@ describe('one retry layer and structured errors', () => {
                 shortMessage: 'missing response for request',
                 value: wrapper === 'batch-array' ? [envelope] : envelope
               }
-        expect(rpcFailureKind(failure)).toBe(kind)
+        expect(rpcFailureKind(failure)).toBe(
+          wrapper === 'http' && error.code === -32603 ? 'transient' : kind
+        )
         if (kind === 'rate-limit')
           expect(normalizeError(failure)).toBe(new RpcRateLimitError().message)
       }

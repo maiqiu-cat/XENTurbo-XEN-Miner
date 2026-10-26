@@ -3,8 +3,107 @@ import { once } from 'node:events'
 import { FetchRequest } from 'ethers'
 import { expect, it, vi } from 'vitest'
 import { writeCustomRpc } from '@/config/chains'
-import { ensureHealthyReadProvider, resetProviders } from '@/core/rpc'
+import { ensureHealthyReadProvider, resetProviders, withRetry } from '@/core/rpc'
 import { ReadTimeoutError } from '@/core/readDeadline'
+
+it.each(['http-500', 'http-429', 'batch-invalid-request'] as const)(
+  'recovers from %s through real loopback HTTP and Node ethers transport',
+  async (failure) => {
+    const nativeFetch = globalThis.fetch
+    const transport = new FetchRequest('https://transport.example/').getUrlFunc
+    const endpoints = ['https://transport.example/', 'https://peer.example/']
+    const reads: Array<{ endpoint: string; time: number }> = []
+    const server = createServer((request, response) => {
+      let body = ''
+      request.on('data', (chunk) => {
+        body += String(chunk)
+      })
+      request.on('end', () => {
+        const payload = JSON.parse(body)
+        const batch = Array.isArray(payload) ? payload : [payload]
+        const reading = batch.some(
+          (call: { method: string }) => call.method === 'eth_getTransactionCount'
+        )
+        if (reading) reads.push({ endpoint: request.url!, time: performance.now() })
+        response.setHeader('content-type', 'application/json')
+        if (reading && reads.length === 1) {
+          response.statusCode = failure === 'http-500' ? 500 : failure === 'http-429' ? 429 : 200
+          if (failure === 'http-429') response.setHeader('retry-after', '1')
+          response.end(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: null,
+              error:
+                failure === 'batch-invalid-request'
+                  ? { code: -32600, message: 'batch size too large' }
+                  : { code: -32603, message: 'Internal error' }
+            })
+          )
+          return
+        }
+        const replies = batch.map(({ id, method }: { id: number; method: string }) => ({
+          jsonrpc: '2.0',
+          id,
+          result:
+            method === 'eth_chainId'
+              ? '0x1'
+              : method === 'eth_getBlockByNumber'
+                ? { number: '0x2a', timestamp: '0x1234', hash: `0x${'a'.repeat(64)}` }
+                : method === 'eth_call'
+                  ? `0x${'0'.repeat(64)}`
+                  : '0x2a'
+        }))
+        response.end(JSON.stringify(Array.isArray(payload) ? replies : replies[0]))
+      })
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('Loopback fixture did not start')
+    const remap = (input: string) => {
+      expect(endpoints).toContain(input)
+      return `http://127.0.0.1:${address.port}/${input === endpoints[0] ? 'first' : 'second'}`
+    }
+    const storage = new Map<string, string>()
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => storage.set(key, value)
+    })
+    vi.stubGlobal('fetch', (input: string, options?: RequestInit) =>
+      nativeFetch(remap(input), options)
+    )
+    FetchRequest.registerGetUrl((request, signal) => {
+      const local = request.clone()
+      local.url = remap(request.url)
+      return transport(local, signal)
+    })
+    try {
+      resetProviders()
+      writeCustomRpc('eth', failure === 'batch-invalid-request' ? endpoints : endpoints.slice(0, 1))
+      const provider = await ensureHealthyReadProvider('eth')
+      await provider.getBlockNumber()
+      await expect(
+        withRetry(
+          () =>
+            provider.getTransactionCount('0x0000000000000000000000000000000000000001', 'pending'),
+          { jitterRatio: 0 }
+        )
+      ).resolves.toBe(42)
+      expect(reads.map(({ endpoint }) => endpoint)).toEqual(
+        failure === 'batch-invalid-request' ? ['/first', '/second'] : ['/first', '/first']
+      )
+      if (failure === 'http-429')
+        expect(reads[1].time - reads[0].time).toBeGreaterThanOrEqual(1_000)
+    } finally {
+      resetProviders()
+      FetchRequest.registerGetUrl(transport)
+      vi.unstubAllGlobals()
+      server.closeAllConnections()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  },
+  10_000
+)
 
 it('exercises real health probes and the 12-second ethers transport timeout on loopback only', async () => {
   const nativeFetch = globalThis.fetch
