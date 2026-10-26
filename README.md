@@ -1,6 +1,6 @@
 # XENTurbo XEN Miner
 
-Current release: **v1.1.11**. The page header displays the same version as the source package and Git release tag.
+Current release: **v1.1.12**. The page header displays the same version as the source package and Git release tag.
 
 ### v1.1.11 Stale List Recovery
 
