@@ -28,7 +28,7 @@ import { CONTRACTS } from '@/config/contracts'
 import { APP_VERSION } from '@/config/version'
 import { rpcConfigurationMessage } from '@/core/rpc'
 import LanguageSelect from '@/components/LanguageSelect.vue'
-import { t, message } from '@/i18n'
+import { t, message, i18n } from '@/i18n'
 import { STALE_PREPARATION_MESSAGE } from '@/i18n/messages'
 
 const wallet = useWalletStore()
@@ -895,6 +895,15 @@ const explorerAddrUrl = computed(() => {
         {{ t('All code is open source. GitHub:') }}
         <a href="https://github.com/maiqiu-cat/XENTurbo-XEN-Miner" target="_blank" rel="noreferrer">
           maiqiu-cat/XENTurbo-XEN-Miner <span aria-hidden="true">↗</span>
+        </a>
+      </p>
+      <p>
+        <a
+          :href="i18n.locale.value === 'zh-Hant' ? '/docs/zh-hant/' : '/docs/en/'"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          {{ t('Documentation') }} <span aria-hidden="true">↗</span>
         </a>
       </p>
     </footer>

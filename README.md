@@ -122,7 +122,7 @@ and RPC diagnostics without a known translation are kept verbatim.
 
 Before connecting a wallet or signing a transaction:
 
-- Verify that the address is `miner.xenturbo.io` or `xenturbo.io/miner`.
+- Verify that the Miner address is `miner.xenturbo.io`; the legacy entry is not a guaranteed Miner destination.
 - Review every transaction carefully in your wallet before signing.
 - CryptoCell and XENTurbo will never ask for your seed phrase or private key.
 - Gas fees are determined and displayed by your wallet.
@@ -457,6 +457,31 @@ measured JavaScript chunk and exits non-zero when either limit is exceeded.
   Custom endpoints must use HTTPS and return the selected chain ID before they are saved.
 - For a stuck pending transaction, use MetaMask Activity to choose **Speed up** or
   **Cancel**, then recheck the pending status in the Miner.
+
+## Public documentation and crawl checks
+
+The build generates ten static documents, five topics in English and Traditional
+Chinese, at `/docs/en/` and `/docs/zh-hant/`. These routes become public only after
+the SEO release and its reviewed server-routing configuration are deployed.
+They require no JavaScript, initialize no wallet, make no RPC calls and do not
+change the application's saved language preference. The Miner remains at `/`.
+
+Public content is allowlisted in `site/content.json`; existing review notes,
+private operations material and other repository directories are not published.
+Contract links are generated from the application's chain and contract config.
+The content review date and documented release are explicit, not reset on every build.
+
+Run `npm run build && npm run check:seo` to check canonical URLs, both languages,
+structured data, the XML sitemap, production robots policy, share image and output
+allowlist. Local Vite development/preview responses use `X-Robots-Tag: noindex,
+nofollow` and a disallow-all robots response. Production build files do not inherit
+that preview policy. No crawler-specific training permission has been added.
+
+See [Public site maintenance and release checklist](site/README.md) for the
+deployment gate, Search Console/Bing follow-up, and rollback scope. The candidate
+Nginx route include is not automatically installed and must not be appended beside
+conflicting existing locations. No production routing or CDN settings are changed
+by building or previewing this branch.
 
 ## Open-source notice
 

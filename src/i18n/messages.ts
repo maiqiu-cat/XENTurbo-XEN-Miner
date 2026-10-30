@@ -46,6 +46,7 @@ export const messages = {
     '僅建立空的 VMU 代理合約（不開始鑄造期限）。之後使用「空槽鑄造」開始鑄造。',
   'Contract:': '合約：',
   'All code is open source. GitHub:': '所有程式碼均為開源。GitHub：',
+  Documentation: '使用文件',
   'Please use PC Chrome': '請使用電腦版 Chrome',
   'Get Chrome': '下載 Chrome',
   'XENTurbo XEN Miner requires Google Chrome.': 'XENTurbo XEN Miner 需要使用 Google Chrome。',

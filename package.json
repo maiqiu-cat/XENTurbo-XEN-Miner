@@ -24,9 +24,10 @@
     "lint": "eslint . --max-warnings=0",
     "format:check": "prettier --check .",
     "check:bundle": "node scripts/check-bundle-size.mjs",
+    "check:seo": "node scripts/check-seo.mjs",
     "audit:prod": "npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org",
     "audit:dependencies": "npm audit --audit-level=high --registry=https://registry.npmjs.org",
-    "verify": "npm run check:public-safety && npm run lint && npm run format:check && npm run test:coverage && npm run typecheck && npm run build && npm run check:bundle && npm run audit:prod && npm run audit:dependencies && playwright test"
+    "verify": "npm run check:public-safety && npm run lint && npm run format:check && npm run test:coverage && npm run typecheck && npm run build && npm run check:bundle && npm run check:seo && npm run audit:prod && npm run audit:dependencies && playwright test"
   },
   "dependencies": {
     "ethers": "^6.13.2",

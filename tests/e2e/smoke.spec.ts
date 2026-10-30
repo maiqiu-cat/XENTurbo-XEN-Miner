@@ -494,6 +494,39 @@ async function installInjectedWallet(
   )
 }
 
+test('documentation opens separately without changing wallet state or the saved language', async ({
+  page
+}) => {
+  await emulateDesktopGoogleChrome(page)
+  await mockSameOriginRpc(page)
+  await installInjectedWallet(page)
+  await page.goto('/')
+  await page
+    .getByRole('banner')
+    .getByRole('button', { name: 'Connect Wallet', exact: true })
+    .click()
+  await expect(page.getByRole('button', { name: /0x1111/ })).toBeVisible()
+  const stats = await page.evaluate(() => window.__walletMock.stats())
+  await page.getByLabel('Language', { exact: true }).selectOption('zh-Hant')
+  const docs = page.getByRole('contentinfo').getByRole('link', { name: /使用文件/ })
+  await expect(docs).toHaveAttribute('href', '/docs/zh-hant/')
+  await expect(docs).toHaveAttribute('rel', 'noopener noreferrer')
+  const popupPromise = page.waitForEvent('popup')
+  await docs.click()
+  const popup = await popupPromise
+  await popup.waitForLoadState('domcontentloaded')
+  await expect(popup.getByRole('heading', { level: 1 })).toHaveText('XENTurbo XEN Miner')
+  expect(await page.evaluate(() => window.__walletMock.stats())).toEqual(stats)
+  expect(await page.evaluate(() => localStorage.getItem('xenturbo.language.v1'))).toBe('zh-Hant')
+  await expect(page).toHaveURL(/\/$/)
+  await expect(page.getByRole('button', { name: /0x1111/ })).toBeVisible()
+  await popup.close()
+  await page.reload()
+  await expect(
+    page.getByRole('contentinfo').getByRole('link', { name: /使用文件/ })
+  ).toHaveAttribute('href', '/docs/zh-hant/')
+})
+
 test('production preview renders in desktop Chrome without console errors and sends security headers', async ({
   page
 }) => {
