@@ -3,6 +3,9 @@ import { readFileSync } from 'node:fs'
 import { defineConfig } from 'vitest/config'
 import vue from '@vitejs/plugin-vue'
 import { contentSecurityPolicy } from './src/config/security'
+import { CHAINS } from './src/config/chains'
+import { CONTRACTS } from './src/config/contracts'
+import { publicSitePlugin } from './scripts/public-site.mjs'
 
 const packageVersion = (
   JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as {
@@ -20,7 +23,16 @@ const securityHeaders = {
 }
 
 export default defineConfig({
-  plugins: [vue()],
+  appType: 'mpa',
+  plugins: [
+    vue(),
+    publicSitePlugin({
+      version: packageVersion,
+      chains: CHAINS,
+      contracts: CONTRACTS,
+      headers: securityHeaders
+    })
+  ],
   define: {
     __APP_VERSION__: JSON.stringify(packageVersion)
   },

@@ -1,0 +1,326 @@
+{
+  "reviewedOn": "2026-10-31",
+  "reviewedVersion": "1.1.12",
+  "en": {
+    "language": "English",
+    "documentation": "Documentation",
+    "openMiner": "Open Miner",
+    "reviewed": "Content reviewed",
+    "documentedVersion": "Documented version",
+    "source": "Source code",
+    "contracts": "Configured mainnet contracts",
+    "previewAlt": "XENTurbo XEN Miner desktop interface before connecting a wallet",
+    "topics": {
+      "overview": {
+        "title": "XENTurbo XEN Miner",
+        "description": "XEN batch minting, claiming and re-minting on Ethereum and Polygon, with an injected wallet and on-chain data. Source code is public.",
+        "sections": [
+          {
+            "heading": "What is XENTurbo XEN Miner?",
+            "paragraphs": [
+              "XENTurbo XEN Miner is a browser application for batch XEN minting, claiming and re-minting on Ethereum and Polygon. It reads contract state from the selected chain and asks an injected wallet to authorize transactions.",
+              "The word Miner refers to XEN minting. This is not Bitcoin proof-of-work mining, a hashrate rental service or a guaranteed-return product. Token estimates are not guaranteed rewards or financial returns."
+            ]
+          },
+          {
+            "heading": "Supported environment",
+            "paragraphs": [
+              "Use Google Chrome on a desktop or laptop and an injected EIP-1193 wallet. The transaction flow requires an externally owned account; contract wallets are not supported. The Miner retains its mobile and unsupported-browser warning.",
+              "The interface supports English and Traditional Chinese. It follows the browser language by default; a manual choice is saved locally when browser storage is available. These documentation pages have separate language URLs and do not change the app's saved preference."
+            ]
+          },
+          {
+            "heading": "Public source code and local operation",
+            "paragraphs": [
+              "The frontend source and local run instructions are available in the public GitHub repository. Running locally still requires blockchain RPC access and a wallet for transactions. It does not remove network fees or contract risks.",
+              "This documentation contains public product information only. Reading it does not connect a wallet, initialize the Miner, or send blockchain RPC requests."
+            ]
+          }
+        ]
+      },
+      "operations": {
+        "title": "Mint, claim and re-mint XEN",
+        "description": "Understand VMUs, empty slots, grouped rows and the General Mint, Claim and Re-Mint operations before signing a transaction.",
+        "sections": [
+          {
+            "heading": "What is a VMU?",
+            "paragraphs": [
+              "A VMU is a virtual minting unit represented by a contract proxy. A list row can group several VMUs with the same term and maturity. Selecting two rows does not necessarily select two VMUs; check the selected VMU count.",
+              "A slot can be empty, maturing or claimable. Maturity uses chain time rather than relying only on the computer clock. Estimated XEN values can change and are not a promise of the final result."
+            ]
+          },
+          {
+            "heading": "Which operation should I choose?",
+            "items": [
+              "General Mint allocates new VMUs and starts minting for the selected term.",
+              "Create Slots allocates empty VMUs without starting a mint.",
+              "Empty Slots Mint starts a mint on the number of available empty slots you enter.",
+              "Claim only withdraws eligible XEN and leaves the slots empty.",
+              "Claim & Re-Mint claims eligible XEN and starts a new mint on the same selected VMUs."
+            ]
+          },
+          {
+            "heading": "Before and after signing",
+            "paragraphs": [
+              "Check the chain, account, operation, VMU count, term and wallet transaction details. Counts, terms and IDs must be valid whole numbers. Per-operation limits vary by chain; use the limits shown in the app.",
+              "The app reads contract fees and nonce through the wallet before sending; the wallet manages gas pricing. Network gas and any applicable contract fees are separate from whether the source code is available at no charge.",
+              "After broadcasting, wait for the receipt and result verification. A submitted hash or a successful receipt alone does not prove every requested VMU changed as expected. Inspect partial-success warnings before taking further action."
+            ]
+          }
+        ]
+      },
+      "rpc-and-pending": {
+        "title": "RPC, refresh and pending transactions",
+        "description": "Resolve read-node failures and rate limits without deleting RPC settings or resending a transaction that may already be on-chain.",
+        "sections": [
+          {
+            "heading": "What happens when a read node fails?",
+            "paragraphs": [
+              "Configured RPC endpoints serve list reads, displays and preparation estimates. The app validates HTTPS and the chain ID for saved endpoints and uses healthy nodes. Wallet authorization and sending remain with the injected wallet.",
+              "An RPC failure can be caused by the provider or by local connectivity, DNS, a firewall or a proxy/VPN. Check connectivity and retry the health check, or change the RPC settings manually. The app does not delete the configured list when nodes become unavailable. Do not put credentials in an RPC URL."
+            ]
+          },
+          {
+            "heading": "What does the rate-limit warning mean?",
+            "paragraphs": [
+              "A provider may return HTTP 429 or a JSON-RPC rate-limit error. When a usable Retry-After value is available, the message can show a bounded wait. Without it, including when browser CORS rules hide the header, the app uses a general rate-limit message rather than inventing a server countdown.",
+              "Wait before retrying and avoid repeatedly refreshing. A successful node health probe does not guarantee that later contract reads will succeed or that a public endpoint has unlimited capacity."
+            ]
+          },
+          {
+            "heading": "Why is my old list still visible?",
+            "paragraphs": [
+              "After a failed full refresh, the last successful list can remain visible with an outdated-data warning. It is read-only: operations are blocked until a full refresh succeeds. Background refreshes may invalidate a preparation that has not opened a wallet request.",
+              "A refresh clears list selection. Recheck the refreshed data before selecting VMUs again. A refresh does not cancel an already opened wallet request or reverse an already broadcast transaction."
+            ]
+          },
+          {
+            "heading": "A transaction is pending or confirmation timed out",
+            "paragraphs": [
+              "Do not resend solely because confirmation stopped or timed out. Check the pending panel, wallet activity and the correct chain's explorer. The application retains unresolved records and relevant locks to reduce duplicate submissions.",
+              "Closing a dialog or cancelling local preparation does not undo a transaction already broadcast. Wallet replacement or cancellation is a separate on-chain action and can itself cost gas."
+            ]
+          }
+        ]
+      },
+      "security": {
+        "title": "Wallet safety, fees and recovery limits",
+        "description": "Understand wallet authorization, stale-data gates, local recovery limits and the risks that remain when using the XENTurbo XEN Miner.",
+        "sections": [
+          {
+            "heading": "Protect wallet authorization",
+            "paragraphs": [
+              "Use the official Miner URL and verify the chain and transaction details in your wallet. The Miner does not ask you to enter a seed phrase or private key. Never paste either into a website, RPC setting or support conversation.",
+              "Signing can spend native currency and change on-chain state. A transaction that reverts on-chain can still consume gas. Failures before the wallet request opens spend nothing. Check the wallet and explorer for what a transaction actually charged. Source availability and passing tests do not guarantee that every contract, browser extension, RPC provider or transaction is safe."
+            ]
+          },
+          {
+            "heading": "Why an operation can remain blocked",
+            "paragraphs": [
+              "Pending transactions, unresolved nonce differences, unreadable records, lock conflicts, unsupported wallets and outdated lists can block sending. Do not bypass those checks by editing storage or clearing all site data.",
+              "Recovery is deliberately conservative. A damaged lock without a transaction hash is retained and has no automatic in-app deletion path. A backup or a successful RPC check alone is not proof that it is safe to resend.",
+              "One maintainer verification question, tracked as P2-C in the repository README, remains unproven: whether historical VMU destruction and count semantics match both current deployments. The CREATE2 verification gate has not been relaxed. Do not interpret this documentation as evidence that the question was resolved."
+            ]
+          },
+          {
+            "heading": "Local data and privacy",
+            "paragraphs": [
+              "The frontend has no application backend or database server, but the browser stores preferences, snapshots, transaction records and locks locally. Public RPC providers can observe the addresses queried and the connecting IP address.",
+              "The production Miner loads Cloudflare Web Analytics. These static documentation pages load no analytics or wallet scripts. Do not include wallet activity, RPC credentials or recovery exports in public issues. Clear browser data only after understanding the pending-state and recovery consequences."
+            ]
+          }
+        ]
+      },
+      "versions": {
+        "title": "Version, source and verification scope",
+        "description": "Find the documented release and source, distinguish mocked validation from real-chain evidence, and understand known verification limits.",
+        "sections": [
+          {
+            "heading": "Version and evidence",
+            "paragraphs": [
+              "The Miner shows its application version beside the product name. The documentation review date and documented source version are listed on each page. These are explicit content-review records, not the time of your visit or a claim that a live chain probe just passed.",
+              "Use the linked versioned source and repository README for implementation details and release history. The deployed frontend version does not imply a smart-contract upgrade."
+            ]
+          },
+          {
+            "heading": "What verification does and does not establish",
+            "paragraphs": [
+              "The repository has unit, component and Playwright tests, linting, type checks, dependency audit and bundle-size gates. Mocked wallets and RPC fixtures test controlled behavior without spending funds; they are not proof of current public-node health or a real-wallet transaction.",
+              "A result from an earlier release is historical evidence, not a fresh production check. Check the relevant pull request and CI run for the exact revision and tests. No test suite establishes that a product has no vulnerabilities or that an operation will always succeed."
+            ]
+          },
+          {
+            "heading": "Known limits",
+            "items": [
+              "Ethereum and Polygon mainnets are supported; other chains and contract wallets are not supported by this interface.",
+              "The transaction interface requires desktop Chrome; documentation remains readable on other browsers and mobile devices.",
+              "Unresolved transactions and damaged locks without a hash are not automatically discarded.",
+              "One maintainer verification question, tracked as P2-C in the repository README, remains unproven: whether historical VMU destruction and count semantics match both current deployments. The CREATE2 verification gate has not been relaxed. Public RPC rate limits and availability remain external dependencies."
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "zh-hant": {
+    "language": "繁體中文",
+    "documentation": "使用文件",
+    "openMiner": "開啟 Miner",
+    "reviewed": "內容核對日期",
+    "documentedVersion": "文件對應版本",
+    "source": "原始碼",
+    "contracts": "設定中的主網合約",
+    "previewAlt": "XENTurbo XEN Miner 尚未連接錢包時的桌面介面",
+    "topics": {
+      "overview": {
+        "title": "XENTurbo XEN Miner",
+        "description": "透過注入式錢包及鏈上資料，在 Ethereum 與 Polygon 批次鑄造、領取及重新鑄造 XEN 的工具，原始碼公開。",
+        "sections": [
+          {
+            "heading": "XENTurbo XEN Miner 是什麼？",
+            "paragraphs": [
+              "XENTurbo XEN Miner 是用於 Ethereum 與 Polygon 的瀏覽器應用程式，支援批次鑄造、領取及重新鑄造 XEN。應用程式從所選鏈讀取合約狀態，並透過注入式錢包授權交易。",
+              "此處的 Miner 指 XEN 鑄造，不是 Bitcoin 工作量證明挖礦、算力租賃服務或保證收益產品。XEN 預估數量不代表保證可領取的獎勵或投資回報。"
+            ]
+          },
+          {
+            "heading": "支援的環境",
+            "paragraphs": [
+              "請使用桌上型或筆記型電腦的 Google Chrome，以及支援 EIP-1193 的注入式錢包。交易流程要求一般外部帳戶，不支援合約錢包。Miner 原有的行動裝置與不支援瀏覽器提示維持不變。",
+              "操作介面支援英文與繁體中文，預設依瀏覽器語言選擇；手動選擇在瀏覽器儲存空間可用時會保存在本機。本文件的語言版本使用獨立網址，不會改變應用程式已儲存的語言偏好。"
+            ]
+          },
+          {
+            "heading": "公開原始碼與本機執行",
+            "paragraphs": [
+              "前端原始碼與本機執行方式可在公開 GitHub 儲存庫查看。本機執行仍需區塊鏈 RPC 存取，交易仍需錢包授權，也不會免除網路費用或合約風險。",
+              "本文件僅包含公開產品資訊。閱讀文件不會連接錢包、啟動 Miner，或發送區塊鏈 RPC 請求。"
+            ]
+          }
+        ]
+      },
+      "operations": {
+        "title": "XEN 鑄造、領取與重新鑄造",
+        "description": "在簽署交易前，了解 VMU、空槽、分組列，以及一般鑄造、領取和重新鑄造的差異。",
+        "sections": [
+          {
+            "heading": "VMU 是什麼？",
+            "paragraphs": [
+              "VMU 是以代理合約表示的虛擬鑄造單位。清單的一列可能合併多個期限與到期時間相同的 VMU。勾選兩列不一定等於兩個 VMU，請核對已選取的 VMU 總數。",
+              "槽位可能為空槽、尚未到期或可領取。到期判斷使用鏈上時間，而不是只依賴電腦時鐘。XEN 預估值可能變動，不保證最終結果。"
+            ]
+          },
+          {
+            "heading": "各操作有何差異？",
+            "items": [
+              "一般鑄造會配置新的 VMU，並依所選期限開始鑄造。",
+              "建立空槽只配置空的 VMU，不會開始鑄造。",
+              "空槽鑄造會依輸入的數量，使用可用空槽開始鑄造。",
+              "僅領取會提取符合條件的 XEN，並將槽位留空。",
+              "領取並重新鑄造會領取符合條件的 XEN，再於同一批所選 VMU 開始新的鑄造。"
+            ]
+          },
+          {
+            "heading": "簽署前後要核對什麼？",
+            "paragraphs": [
+              "請核對鏈、帳戶、操作、VMU 數量、期限及錢包中的交易詳情。數量、期限與 ID 必須為有效整數。各鏈的操作數量上限不同，請以介面顯示的上限為準。",
+              "發送前，應用程式透過錢包讀取合約費用與 nonce；Gas 定價由錢包處理。網路 Gas 與適用的合約費用，不會因原始碼可免費取得而免除。",
+              "廣播後，請等待收據及操作結果驗證。取得交易 hash 或成功收據，不代表每個指定 VMU 都已符合預期。若顯示部分成功，請先核對結果再進行其他操作。"
+            ]
+          }
+        ]
+      },
+      "rpc-and-pending": {
+        "title": "RPC、重新整理與待處理交易",
+        "description": "處理讀取節點故障與限流，同時保留 RPC 設定，避免重送可能已上鏈的交易。",
+        "sections": [
+          {
+            "heading": "讀取節點故障時會怎樣？",
+            "paragraphs": [
+              "設定的 RPC 節點用於清單讀取、顯示與準備階段預估。儲存節點時會驗證 HTTPS 與 chain ID，並選用健康節點。交易授權與發送仍由注入式錢包處理。",
+              "RPC 故障可能來自供應商，也可能與使用者端連線、DNS、防火牆或代理／VPN 有關。請檢查網路後重新檢查節點，或手動修改 RPC 設定。節點不可用時，應用程式不會刪除已設定清單。請勿在 RPC 網址中放入憑據。"
+            ]
+          },
+          {
+            "heading": "限流提示代表什麼？",
+            "paragraphs": [
+              "供應商可能回傳 HTTP 429 或 JSON-RPC 限流錯誤。若能讀取有效的 Retry-After，提示可顯示有上限的等待時間；若缺少此標頭，或瀏覽器因 CORS 規則無法讀取，就會顯示一般限流提示，不會捏造伺服器倒數時間。",
+              "請稍候再試，避免連續重新整理。節點健康檢查成功，不代表後續合約讀取一定成功，也不代表公開節點沒有使用量限制。"
+            ]
+          },
+          {
+            "heading": "為何仍顯示舊清單？",
+            "paragraphs": [
+              "完整重新整理失敗後，介面可能保留上次成功讀取的清單，並提示資料可能過期。這些資料僅供查看，完整重新整理成功前會阻擋操作。背景重新整理也可能作廢尚未開啟錢包請求的準備。",
+              "重新整理會清除清單勾選。請核對新資料後重新選取 VMU。重新整理不會取消已開啟的錢包請求，也不會撤回已廣播交易。"
+            ]
+          },
+          {
+            "heading": "交易待處理或確認逾時怎麼辦？",
+            "paragraphs": [
+              "請勿只因確認停止或逾時就重送。請查看待處理面板、錢包活動及正確鏈的區塊瀏覽器。應用程式會保留未解決紀錄與相關鎖，以降低重複提交的風險。",
+              "關閉彈窗或取消本機準備，不會撤回已廣播交易。錢包中的替換或取消是另一項鏈上操作，也可能產生 Gas 費用。"
+            ]
+          }
+        ]
+      },
+      "security": {
+        "title": "錢包安全、費用與恢復限制",
+        "description": "了解錢包授權、過期資料門禁、本機恢復限制，以及使用 XENTurbo XEN Miner 仍需承擔的風險。",
+        "sections": [
+          {
+            "heading": "保護錢包授權",
+            "paragraphs": [
+              "請使用官方 Miner 網址，並在錢包中核對鏈與交易詳情。Miner 不會要求輸入助記詞或私鑰。請勿將其貼到網站、RPC 設定或客服對話。",
+              "簽署可能花費原生代幣並改變鏈上狀態。交易在鏈上回退時仍可能消耗 Gas；錢包請求開啟前失敗則不會花費。實際費用請以錢包與區塊瀏覽器為準。原始碼公開與測試通過，不保證所有合約、瀏覽器擴充功能、RPC 供應商或交易皆安全。"
+            ]
+          },
+          {
+            "heading": "為何操作會持續被阻擋？",
+            "paragraphs": [
+              "待處理交易、尚未解決的 nonce 差異、無法讀取的紀錄、鎖衝突、不支援的錢包及過期清單，都可能阻擋發送。請勿藉由修改儲存資料或清空全部網站資料繞過檢查。",
+              "恢復流程刻意採取保守策略。沒有交易 hash 的損壞鎖會保留，沒有可自動刪除的應用程式內入口。備份完成或 RPC 檢查成功，本身不代表可以安全重送。",
+              "維護者在儲存庫 README 以 P2-C 追蹤的一項驗證問題仍未證實：歷史 VMU 銷毀與數量語義是否符合目前兩個部署。CREATE2 驗證門禁沒有放寬。本文件不代表該問題已被證明解決。"
+            ]
+          },
+          {
+            "heading": "本機資料與隱私",
+            "paragraphs": [
+              "前端沒有應用程式後端或資料庫伺服器，但瀏覽器仍會在本機儲存偏好、快照、交易紀錄與鎖。公開 RPC 供應商可以看到查詢的地址及連線 IP。",
+              "正式 Miner 會載入 Cloudflare Web Analytics；這些靜態文件不載入分析或錢包腳本。請勿將錢包活動、RPC 憑據或恢復匯出檔放到公開 issue。清除瀏覽器資料前，應先了解對待處理狀態與恢復流程的影響。"
+            ]
+          }
+        ]
+      },
+      "versions": {
+        "title": "版本、原始碼與驗證範圍",
+        "description": "查找文件對應版本與原始碼，區分模擬測試與真實鏈上證據，並了解已知驗證限制。",
+        "sections": [
+          {
+            "heading": "版本與證據",
+            "paragraphs": [
+              "Miner 在產品名稱旁顯示應用程式版本。每頁文件列出內容核對日期與對應原始碼版本；這是明確的內容核對紀錄，不是本次瀏覽時間，也不代表剛完成線上鏈節點檢查。",
+              "請透過帶版本的原始碼連結與儲存庫 README 查看實作及版本歷史。前端版本變更不代表智慧合約已升級。"
+            ]
+          },
+          {
+            "heading": "驗證可以證明什麼？",
+            "paragraphs": [
+              "儲存庫包含單元、元件與 Playwright 測試，以及 lint、型別、依賴稽核和包體門禁。模擬錢包與 RPC 夾具可在不花費資金的情況下驗證受控行為，但不能證明公開節點目前健康，或真實錢包交易已成功。",
+              "舊版本結果是歷史證據，不是最新正式環境檢查。請查看相關 PR 與 CI 執行紀錄，核對實際提交和測試範圍。任何測試套件都不能保證沒有漏洞，或每次操作必定成功。"
+            ]
+          },
+          {
+            "heading": "已知限制",
+            "items": [
+              "支援 Ethereum 與 Polygon 主網；此介面不支援其他鏈或合約錢包。",
+              "交易介面要求桌面 Chrome；其他瀏覽器及行動裝置仍可閱讀本文件。",
+              "未解決交易與沒有 hash 的損壞鎖不會自動丟棄。",
+              "維護者在儲存庫 README 以 P2-C 追蹤的一項驗證問題仍未證實：歷史 VMU 銷毀與數量語義是否符合目前兩個部署。CREATE2 驗證門禁沒有放寬。公開 RPC 的限流與可用性仍是外部依賴。"
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

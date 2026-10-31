@@ -56,6 +56,24 @@ describe('CLI release gates', () => {
     expect(isMainModule(import.meta.url, process.execPath)).toBe(false)
     expect(() => isMainModule(import.meta.url, 'nonexistent-entry.mjs')).toThrow()
   })
+  it.each([false, true])('fails the SEO CLI gate for a missing build (symlink: %s)', (symlink) => {
+    const directory = mkdtempSync(join(tmpdir(), 'miner-seo-cli-'))
+    directories.push(directory)
+    const source = fileURLToPath(new URL('../scripts/check-seo.mjs', import.meta.url))
+    const alias = join(directory, 'seo #?%.mjs')
+    if (symlink) symlinkSync(source, alias)
+    const result = spawnSync(process.execPath, [symlink ? alias : source], {
+      cwd: directory,
+      env: {},
+      encoding: 'utf8',
+      timeout: 8_000
+    })
+    expect(result.error).toBeUndefined()
+    expect(result.signal).toBeNull()
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('Public SEO gate failed: build directory is not readable.')
+    expect(result.stdout).not.toContain('passed')
+  })
   it.each([[], ['--other'], ['']])('rejects a missing CLI value: %j', (...argv) => {
     expect(() => cliValue(argv as string[], 0, '--rpc')).toThrow('ARGUMENT_VALUE_REQUIRED')
   })

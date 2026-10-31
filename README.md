@@ -1,6 +1,6 @@
 # XENTurbo XEN Miner
 
-Current release: **v1.1.12**. The page header displays the same version as the source package and Git release tag.
+Current release: **v1.1.13**. The page header displays the same version as the source package and Git release tag.
 
 ### v1.1.11 Stale List Recovery
 
@@ -122,7 +122,7 @@ and RPC diagnostics without a known translation are kept verbatim.
 
 Before connecting a wallet or signing a transaction:
 
-- Verify that the address is `miner.xenturbo.io` or `xenturbo.io/miner`.
+- Verify that the Miner address is `miner.xenturbo.io`; the legacy entry is not a guaranteed Miner destination.
 - Review every transaction carefully in your wallet before signing.
 - CryptoCell and XENTurbo will never ask for your seed phrase or private key.
 - Gas fees are determined and displayed by your wallet.
@@ -369,14 +369,20 @@ and estimates.
 - `npm run lint` - ESLint checks for Vue and TypeScript
 - `npm run format:check` - Prettier formatting check
 - `npm run check:bundle` - enforce gzip bundle budgets against `dist/`
+- `npm run check:nginx` - validate candidate routes and HTTP caching with isolated local Nginx and Chromium
 - `npm run check:public-safety` - scan public-source and commit privacy rules, plus version consistency
 - `npm run check:version` - validate the displayed/package version and release-tag consistency
 - `npm run audit:prod` - check production dependency advisories
 - `npm run audit:dependencies` - check all dependency advisories
 - `npm run probe:release` - read-only chain/contract release probe, at most three JSON-RPC items per POST
 - `npm run check:rpc-health` - check every script-configured default RPC for HTTPS, chain ID, and factory `FEE()`
-- `npm run verify` - run unit, type, build, bundle, audit, and browser release gates
+- `npm run verify` - run unit, type, build, bundle, SEO, audit, local Nginx, and browser release gates
 - `npm run verify:create2 -- --chain eth --wallet 0x...` - verify derivation against the selected live chain
+
+`verify` and `check:nginx` require Nginx on `PATH` (or `NGINX_BIN` set to its binary)
+and Playwright Chromium (`npx playwright install chromium`). Run them as a non-root
+user: the Nginx permission/cache checks intentionally reject root. `check:nginx`
+also requires a completed `npm run build`; `verify` builds before running it.
 
 `verify:create2` requires an explicit witness address for the selected chain: pass
 `--wallet 0x...`, or set `CREATE2_WITNESS_ETH` / `CREATE2_WITNESS_POLYGON`. It scans
@@ -457,6 +463,32 @@ measured JavaScript chunk and exits non-zero when either limit is exceeded.
   Custom endpoints must use HTTPS and return the selected chain ID before they are saved.
 - For a stuck pending transaction, use MetaMask Activity to choose **Speed up** or
   **Cancel**, then recheck the pending status in the Miner.
+
+## Public documentation and crawl checks
+
+The build generates ten static documents, five topics in English and Traditional
+Chinese, at `/docs/en/` and `/docs/zh-hant/`. Deploying the generated files can
+make these routes public even under the old server rules. Deploy the reviewed
+routing configuration with the files so unknown addresses return a real 404.
+They require no JavaScript, initialize no wallet, make no RPC calls and do not
+change the application's saved language preference. The Miner remains at `/`.
+
+Public content is allowlisted in `site/content.json`; existing review notes,
+private operations material and other repository directories are not published.
+Contract links are generated from the application's chain and contract config.
+The content review date and documented release are explicit, not reset on every build.
+
+Run `npm run build && npm run check:seo` to check canonical URLs, both languages,
+structured data, the XML sitemap, production robots policy, share image and output
+allowlist. Local Vite development/preview responses use `X-Robots-Tag: noindex,
+nofollow` and a disallow-all robots response. Production build files do not inherit
+that preview policy. No crawler-specific training permission has been added.
+
+See [Public site maintenance and release checklist](site/README.md) for the
+deployment gate, Search Console/Bing follow-up, and rollback scope. The candidate
+Nginx route include is not automatically installed and must not be appended beside
+conflicting existing locations. No production routing or CDN settings are changed
+by building or previewing this branch.
 
 ## Open-source notice
 

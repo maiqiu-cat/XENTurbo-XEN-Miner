@@ -35,10 +35,17 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm run check:bundle
+      - run: npm run check:seo
       - run: npm run audit:prod
       - run: npm run audit:dependencies
 
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium
 
+      - name: Install Nginx for isolated loopback checks
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends nginx
+
+      - run: npm run check:nginx
       - run: npx playwright test
