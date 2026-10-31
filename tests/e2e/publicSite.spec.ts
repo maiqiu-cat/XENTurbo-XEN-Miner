@@ -19,7 +19,12 @@ test.describe('static documentation without JavaScript', () => {
             ? 'One maintainer verification question, tracked as P2-C in the repository README, remains unproven: whether historical VMU destruction and count semantics match both current deployments. The CREATE2 verification gate has not been relaxed.'
             : '維護者在儲存庫 README 以 P2-C 追蹤的一項驗證問題仍未證實：歷史 VMU 銷毀與數量語義是否符合目前兩個部署。CREATE2 驗證門禁沒有放寬。'
         )
-        await expect(page.getByRole('link', { name: 'README', exact: true })).toHaveAttribute(
+        await expect(
+          page.getByRole('link', {
+            name: locale === 'en' ? 'README: P2-C verification scope' : 'README：P2-C 驗證範圍',
+            exact: true
+          })
+        ).toHaveAttribute(
           'href',
           'https://github.com/maiqiu-cat/XENTurbo-XEN-Miner/blob/v1.1.12/README.md#pr-7-validation-scope'
         )

@@ -166,6 +166,9 @@ http {
         assert.equal((await request(location.pathname + location.search)).status, 200)
       })
     }
+    // A real file proves the route allowlist blocks it, not just a missing-file 404.
+    await mkdir(join(root, 'docs/reviews'), { recursive: true })
+    await writeFile(join(root, 'docs/reviews/private.md'), 'Private-route regression fixture.\n')
     for (const path of [
       '/missing',
       '/docs/en/missing/',

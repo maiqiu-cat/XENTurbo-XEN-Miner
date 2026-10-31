@@ -369,14 +369,20 @@ and estimates.
 - `npm run lint` - ESLint checks for Vue and TypeScript
 - `npm run format:check` - Prettier formatting check
 - `npm run check:bundle` - enforce gzip bundle budgets against `dist/`
+- `npm run check:nginx` - validate candidate routes and HTTP caching with isolated local Nginx and Chromium
 - `npm run check:public-safety` - scan public-source and commit privacy rules, plus version consistency
 - `npm run check:version` - validate the displayed/package version and release-tag consistency
 - `npm run audit:prod` - check production dependency advisories
 - `npm run audit:dependencies` - check all dependency advisories
 - `npm run probe:release` - read-only chain/contract release probe, at most three JSON-RPC items per POST
 - `npm run check:rpc-health` - check every script-configured default RPC for HTTPS, chain ID, and factory `FEE()`
-- `npm run verify` - run unit, type, build, bundle, audit, and browser release gates
+- `npm run verify` - run unit, type, build, bundle, SEO, audit, local Nginx, and browser release gates
 - `npm run verify:create2 -- --chain eth --wallet 0x...` - verify derivation against the selected live chain
+
+`verify` and `check:nginx` require Nginx on `PATH` (or `NGINX_BIN` set to its binary)
+and Playwright Chromium (`npx playwright install chromium`). Run them as a non-root
+user: the Nginx permission/cache checks intentionally reject root. `check:nginx`
+also requires a completed `npm run build`; `verify` builds before running it.
 
 `verify:create2` requires an explicit witness address for the selected chain: pass
 `--wallet 0x...`, or set `CREATE2_WITNESS_ETH` / `CREATE2_WITNESS_POLYGON`. It scans

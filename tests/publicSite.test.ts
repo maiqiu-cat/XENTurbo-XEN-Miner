@@ -83,9 +83,14 @@ describe('allowlisted static public documents', () => {
   it('describes public source without making a new licensing claim in metadata or documents', () => {
     for (const html of [
       rootMetadata(facts.version),
-      ...LOCALES.map((locale) => files.get(docPath(locale))!.body)
+      ...LOCALES.flatMap((locale) => TOPICS.map((topic) => files.get(docPath(locale, topic))!.body))
     ]) {
       expect(html).not.toMatch(/open[ -]source|開源/i)
+    }
+    for (const html of [
+      rootMetadata(facts.version),
+      ...LOCALES.map((locale) => files.get(docPath(locale))!.body)
+    ]) {
       expect(html).toMatch(/Source code is public\.|原始碼公開/)
     }
   })
@@ -151,6 +156,63 @@ describe('allowlisted static public documents', () => {
     expect(text).toContain(first)
     expect(text).toContain(second)
   })
+  it.each([
+    [
+      'en',
+      'security',
+      'backup is not resend permission',
+      'A backup or a successful RPC check alone is not proof that it is safe to resend.'
+    ],
+    [
+      'zh-hant',
+      'security',
+      'backup is not resend permission',
+      '備份完成或 RPC 檢查成功，本身不代表可以安全重送。'
+    ],
+    [
+      'en',
+      'rpc-and-pending',
+      'closing does not undo broadcast',
+      'Closing a dialog or cancelling local preparation does not undo a transaction already broadcast.'
+    ],
+    [
+      'zh-hant',
+      'rpc-and-pending',
+      'closing does not undo broadcast',
+      '關閉彈窗或取消本機準備，不會撤回已廣播交易。'
+    ],
+    [
+      'en',
+      'rpc-and-pending',
+      'refresh does not cancel wallet requests',
+      'A refresh does not cancel an already opened wallet request or reverse an already broadcast transaction.'
+    ],
+    [
+      'zh-hant',
+      'rpc-and-pending',
+      'refresh does not cancel wallet requests',
+      '重新整理不會取消已開啟的錢包請求，也不會撤回已廣播交易。'
+    ],
+    ['en', 'rpc-and-pending', 'refresh clears selection', 'A refresh clears list selection.'],
+    ['zh-hant', 'rpc-and-pending', 'refresh clears selection', '重新整理會清除清單勾選。'],
+    [
+      'en',
+      'rpc-and-pending',
+      'RPC URLs must not contain credentials',
+      'Do not put credentials in an RPC URL.'
+    ],
+    [
+      'zh-hant',
+      'rpc-and-pending',
+      'RPC URLs must not contain credentials',
+      '請勿在 RPC 網址中放入憑據。'
+    ]
+  ])('retains %s/%s safety rule: %s', (locale, topic, _rule, sentence) => {
+    const text = parse(files.get(docPath(locale, topic))!.body).querySelector(
+      'article'
+    )!.textContent
+    expect(text).toContain(sentence)
+  })
   for (const locale of LOCALES) {
     for (const topic of ['security', 'versions']) {
       it(`${locale}/${topic} explains the unproven CREATE2 question and links to its versioned evidence`, () => {
@@ -168,7 +230,7 @@ describe('allowlisted static public documents', () => {
           doc.querySelector(
             'a[href="https://github.com/maiqiu-cat/XENTurbo-XEN-Miner/blob/v1.1.12/README.md#pr-7-validation-scope"]'
           )?.textContent
-        ).toBe('README')
+        ).toBe(locale === 'en' ? 'README: P2-C verification scope' : 'README：P2-C 驗證範圍')
       })
     }
   }
