@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import { chmod, cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { request as httpRequest } from 'node:http'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -166,6 +167,39 @@ http {
         assert.equal((await request(location.pathname + location.search)).status, 200)
       })
     }
+    await check('canonical redirects do not reflect untrusted request headers', async () => {
+      for (const requestHeaders of [
+        { Host: 'untrusted.invalid' },
+        { Host: 'untrusted.invalid:8443' },
+        {
+          Host: 'miner.xenturbo.io',
+          'X-Forwarded-Host': 'untrusted.invalid',
+          Forwarded: 'host=untrusted.invalid;proto=https'
+        }
+      ]) {
+        for (const [path, target] of aliases) {
+          // Node fetch does not reliably forward a custom Host. Use the real HTTP transport.
+          const response = await new Promise((resolve, reject) => {
+            const pending = httpRequest(
+              origin + path + '?reference=one&lang=two',
+              { headers: requestHeaders, agent: false, signal: AbortSignal.timeout(5_000) },
+              (incoming) => {
+                incoming.on('error', reject)
+                incoming.on('end', () => resolve(incoming))
+                incoming.resume()
+              }
+            )
+            pending.on('error', reject)
+            pending.end()
+          })
+          assert.equal(response.statusCode, 301, path)
+          assert.equal(response.headers.location, target + '?reference=one&lang=two', path)
+          assert.equal(response.headers['cache-control'], 'no-cache', path)
+          for (const [, name, value] of expectedHeaders)
+            assert.equal(response.headers[name.toLowerCase()], value, `${path}: ${name}`)
+        }
+      }
+    })
     // A real file proves the route allowlist blocks it, not just a missing-file 404.
     await mkdir(join(root, 'docs/reviews'), { recursive: true })
     await writeFile(join(root, 'docs/reviews/private.md'), 'Private-route regression fixture.\n')

@@ -54,9 +54,11 @@ process on an ephemeral port. It copies `dist/` to a temporary directory, cleans
 up the process/files afterward, and never reloads an installed service. Nginx must
 be on `PATH`, or its executable can be selected with `NGINX_BIN`.
 
-The 51 checks include all generated language/topic URLs, canonical aliases with
+The 52 checks include all generated language/topic URLs, canonical aliases with
 query preservation, security headers, production robots, XML, real 404 bodies and
-noindex headers, and HEAD. Successful asset responses (200/206/304) retain immutable
+noindex headers, and HEAD. Every canonical alias is also checked with untrusted
+Host/forwarding headers: its Location must stay relative and preserve the query.
+Successful asset responses (200/206/304) retain immutable
 caching; permission-denied 403 and unsupported-method 405 must not receive it.
 A real Chromium context loads a temporarily unreadable script, then verifies that
 restoring the same file restores both a new page and the original page on reload.
