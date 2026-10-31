@@ -42,4 +42,10 @@ jobs:
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium
 
+      - name: Install Nginx for isolated loopback checks
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends nginx
+
+      - run: npm run check:nginx
       - run: npx playwright test

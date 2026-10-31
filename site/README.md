@@ -29,8 +29,10 @@ the 404 page and the approved screenshot enter the build. Never copy all of
 ## Local verification
 
 1. Run `npm run verify`. This includes the output allowlist and SEO gate, existing
-   unit/component checks and browser E2E tests. Browsers and RPCs are mocked in
-   transaction tests; passing them is not a live-chain or real-wallet claim.
+   unit/component checks, isolated Nginx checks and browser E2E tests. Wallets and
+   RPCs are mocked in transaction tests; passing them is not a live-chain or
+   real-wallet claim. Install Nginx and Playwright Chromium first and run as a
+   non-root user, so permission-denied fixtures cannot be bypassed by root.
 2. Run `npm run preview -- --host 127.0.0.1 --port 4175 --strictPort` on a free port.
    Confirm English/Traditional Chinese navigation and refresh, static text with
    JavaScript disabled, image loading, no overflow, no console/CSP errors, and no
@@ -44,6 +46,27 @@ the 404 page and the approved screenshot enter the build. Never copy all of
 5. Keep the existing JS budgets: 100 KiB gzip per chunk and 190 KiB total. Do not
    add runtime SEO dependencies to the application bundle.
 
+### Reproducible Nginx checks
+
+After building, run `npm run check:nginx`. It reads the committed candidate routes
+and security headers, checks syntax, and starts a separate loopback-only Nginx
+process on an ephemeral port. It copies `dist/` to a temporary directory, cleans
+up the process/files afterward, and never reloads an installed service. Nginx must
+be on `PATH`, or its executable can be selected with `NGINX_BIN`.
+
+The 51 checks include all generated language/topic URLs, canonical aliases with
+query preservation, security headers, production robots, XML, real 404 bodies and
+noindex headers, and HEAD. Successful asset responses (200/206/304) retain immutable
+caching; permission-denied 403 and unsupported-method 405 must not receive it.
+A real Chromium context loads a temporarily unreadable script, then verifies that
+restoring the same file restores both a new page and the original page on reload.
+An access-log assertion also proves that a subsequent successful load uses HTTP
+cache. This test uses no Playwright routing or CDP cache disabling.
+
+This replaces the previously uncommitted 28-check local script. It runs in CI as
+well as `verify`; missing Nginx/Chromium or a failed check is a failure, not a skip.
+Passing these local HTTP checks does not validate production TLS, CDN or SELinux.
+
 ## Production gate (requires separate release authorization)
 
 1. Follow the project's private deployment/operations manual. Back up the current
@@ -54,15 +77,29 @@ the 404 page and the approved screenshot enter the build. Never copy all of
    an additional include beside duplicate locations. Retain existing TLS,
    hostname, root, HTTP-to-HTTPS redirect and security headers. Do not overwrite
    unrelated local Nginx edits. Verify syntax before reloading only the affected site.
+   The legacy `ops/nginx/xenturbo-xen-miner.conf` still contains the SPA fallback;
+   it is not the SEO release configuration and must not silently replace the
+   reviewed candidate routes during a later reinstall.
+   Before any activation, determine the actual certificate renewal authenticator.
+   If it uses webroot, separately review and test an explicit
+   `/.well-known/acme-challenge/` location; the candidate catch-all currently returns
+   404 there. Do not assume renewal works, or add broad file access to solve it.
+   File-based search ownership verification likewise needs separate review.
 3. Publish the complete build atomically using the existing release procedure.
    Deploying files alone does not fix the old catch-all fallback for unknown URLs.
 4. Validate origin and CDN separately: `/` and ten documents return 200; known
    index/slash aliases return one canonical redirect; missing pages and assets
-   return 404; `robots.txt` is text and `sitemap.xml` is XML. All public canonical
+   return 404 with the intended 404 body and `X-Robots-Tag: noindex`, without
+   immutable caching; `robots.txt` is text and `sitemap.xml` is XML. All public canonical
    URLs use the Miner HTTPS origin. Public pages must not have preview `noindex`.
 5. Purge changed HTML, document/CSS/image URLs, robots and sitemap as needed.
    Keep hashed app assets immutable. Verify security headers, document content,
    language links, app interactions and TLS through the CDN after cache refresh.
+   Verify new-directory permissions and SELinux labels, the redirect behavior of
+   monitors using `/index.html`, and that untrusted Host values are not reflected
+   into public redirect destinations. Confirm the CDN does not inject analytics
+   or other scripts into the static documents. Verify origin/CDN cache behavior
+   separately; local browser caching is not cleared by a CDN purge.
 6. Update the private manual with the release, backup, verification and rollback
    evidence. Do not publish the private manual in this repository or website.
 

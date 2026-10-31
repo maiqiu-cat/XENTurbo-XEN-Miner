@@ -461,8 +461,9 @@ measured JavaScript chunk and exits non-zero when either limit is exceeded.
 ## Public documentation and crawl checks
 
 The build generates ten static documents, five topics in English and Traditional
-Chinese, at `/docs/en/` and `/docs/zh-hant/`. These routes become public only after
-the SEO release and its reviewed server-routing configuration are deployed.
+Chinese, at `/docs/en/` and `/docs/zh-hant/`. Deploying the generated files can
+make these routes public even under the old server rules. Deploy the reviewed
+routing configuration with the files so unknown addresses return a real 404.
 They require no JavaScript, initialize no wallet, make no RPC calls and do not
 change the application's saved language preference. The Miner remains at `/`.
 

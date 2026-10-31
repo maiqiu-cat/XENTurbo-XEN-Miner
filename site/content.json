@@ -1,5 +1,5 @@
 {
-  "reviewedOn": "2026-10-30",
+  "reviewedOn": "2026-10-31",
   "reviewedVersion": "1.1.12",
   "en": {
     "language": "English",
@@ -13,7 +13,7 @@
     "topics": {
       "overview": {
         "title": "XENTurbo XEN Miner",
-        "description": "Open-source XEN batch minting, claiming and re-minting on Ethereum and Polygon, with an injected wallet and on-chain data.",
+        "description": "XEN batch minting, claiming and re-minting on Ethereum and Polygon, with an injected wallet and on-chain data. Source code is public.",
         "sections": [
           {
             "heading": "What is XENTurbo XEN Miner?",
@@ -30,7 +30,7 @@
             ]
           },
           {
-            "heading": "Open source and local operation",
+            "heading": "Public source code and local operation",
             "paragraphs": [
               "The frontend source and local run instructions are available in the public GitHub repository. Running locally still requires blockchain RPC access and a wallet for transactions. It does not remove network fees or contract risks.",
               "This documentation contains public product information only. Reading it does not connect a wallet, initialize the Miner, or send blockchain RPC requests."
@@ -54,7 +54,7 @@
             "items": [
               "General Mint allocates new VMUs and starts minting for the selected term.",
               "Create Slots allocates empty VMUs without starting a mint.",
-              "Empty Slots Mint starts a mint using selected empty slots.",
+              "Empty Slots Mint starts a mint on the number of available empty slots you enter.",
               "Claim only withdraws eligible XEN and leaves the slots empty.",
               "Claim & Re-Mint claims eligible XEN and starts a new mint on the same selected VMUs."
             ]
@@ -111,7 +111,7 @@
             "heading": "Protect wallet authorization",
             "paragraphs": [
               "Use the official Miner URL and verify the chain and transaction details in your wallet. The Miner does not ask you to enter a seed phrase or private key. Never paste either into a website, RPC setting or support conversation.",
-              "Signing can spend native currency and change on-chain state. Gas and contract fees may apply even when an operation fails. Source availability and passing tests do not guarantee that every contract, browser extension, RPC provider or transaction is safe."
+              "Signing can spend native currency and change on-chain state. A transaction that reverts on-chain can still consume gas. Failures before the wallet request opens spend nothing. Check the wallet and explorer for what a transaction actually charged. Source availability and passing tests do not guarantee that every contract, browser extension, RPC provider or transaction is safe."
             ]
           },
           {
@@ -119,7 +119,7 @@
             "paragraphs": [
               "Pending transactions, unresolved nonce differences, unreadable records, lock conflicts, unsupported wallets and outdated lists can block sending. Do not bypass those checks by editing storage or clearing all site data.",
               "Recovery is deliberately conservative. A damaged lock without a transaction hash is retained and has no automatic in-app deletion path. A backup or a successful RPC check alone is not proof that it is safe to resend.",
-              "The unresolved contract-semantics question tracked as P2-C remains unproven. Its existing verification gate has not been relaxed. Do not interpret this documentation as evidence that it was resolved."
+              "One maintainer verification question, tracked as P2-C in the repository README, remains unproven: whether historical VMU destruction and count semantics match both current deployments. The CREATE2 verification gate has not been relaxed. Do not interpret this documentation as evidence that the question was resolved."
             ]
           },
           {
@@ -155,7 +155,7 @@
               "Ethereum and Polygon mainnets are supported; other chains and contract wallets are not supported by this interface.",
               "The transaction interface requires desktop Chrome; documentation remains readable on other browsers and mobile devices.",
               "Unresolved transactions and damaged locks without a hash are not automatically discarded.",
-              "P2-C remains unproven and its gate remains strict. Public RPC rate limits and availability remain external dependencies."
+              "One maintainer verification question, tracked as P2-C in the repository README, remains unproven: whether historical VMU destruction and count semantics match both current deployments. The CREATE2 verification gate has not been relaxed. Public RPC rate limits and availability remain external dependencies."
             ]
           }
         ]
@@ -174,7 +174,7 @@
     "topics": {
       "overview": {
         "title": "XENTurbo XEN Miner",
-        "description": "透過注入式錢包及鏈上資料，在 Ethereum 與 Polygon 批次鑄造、領取及重新鑄造 XEN 的開源工具。",
+        "description": "透過注入式錢包及鏈上資料，在 Ethereum 與 Polygon 批次鑄造、領取及重新鑄造 XEN 的工具，原始碼公開。",
         "sections": [
           {
             "heading": "XENTurbo XEN Miner 是什麼？",
@@ -191,7 +191,7 @@
             ]
           },
           {
-            "heading": "開源與本機執行",
+            "heading": "公開原始碼與本機執行",
             "paragraphs": [
               "前端原始碼與本機執行方式可在公開 GitHub 儲存庫查看。本機執行仍需區塊鏈 RPC 存取，交易仍需錢包授權，也不會免除網路費用或合約風險。",
               "本文件僅包含公開產品資訊。閱讀文件不會連接錢包、啟動 Miner，或發送區塊鏈 RPC 請求。"
@@ -215,7 +215,7 @@
             "items": [
               "一般鑄造會配置新的 VMU，並依所選期限開始鑄造。",
               "建立空槽只配置空的 VMU，不會開始鑄造。",
-              "空槽鑄造會使用選取的空槽開始鑄造。",
+              "空槽鑄造會依輸入的數量，使用可用空槽開始鑄造。",
               "僅領取會提取符合條件的 XEN，並將槽位留空。",
               "領取並重新鑄造會領取符合條件的 XEN，再於同一批所選 VMU 開始新的鑄造。"
             ]
@@ -272,7 +272,7 @@
             "heading": "保護錢包授權",
             "paragraphs": [
               "請使用官方 Miner 網址，並在錢包中核對鏈與交易詳情。Miner 不會要求輸入助記詞或私鑰。請勿將其貼到網站、RPC 設定或客服對話。",
-              "簽署可能花費原生代幣並改變鏈上狀態。操作失敗時仍可能產生 Gas 或合約費用。原始碼公開與測試通過，不保證所有合約、瀏覽器擴充功能、RPC 供應商或交易皆安全。"
+              "簽署可能花費原生代幣並改變鏈上狀態。交易在鏈上回退時仍可能消耗 Gas；錢包請求開啟前失敗則不會花費。實際費用請以錢包與區塊瀏覽器為準。原始碼公開與測試通過，不保證所有合約、瀏覽器擴充功能、RPC 供應商或交易皆安全。"
             ]
           },
           {
@@ -280,7 +280,7 @@
             "paragraphs": [
               "待處理交易、尚未解決的 nonce 差異、無法讀取的紀錄、鎖衝突、不支援的錢包及過期清單，都可能阻擋發送。請勿藉由修改儲存資料或清空全部網站資料繞過檢查。",
               "恢復流程刻意採取保守策略。沒有交易 hash 的損壞鎖會保留，沒有可自動刪除的應用程式內入口。備份完成或 RPC 檢查成功，本身不代表可以安全重送。",
-              "以 P2-C 追蹤的合約語義問題仍未證實，現有驗證門禁沒有放寬。本文件不代表該問題已被證明解決。"
+              "維護者在儲存庫 README 以 P2-C 追蹤的一項驗證問題仍未證實：歷史 VMU 銷毀與數量語義是否符合目前兩個部署。CREATE2 驗證門禁沒有放寬。本文件不代表該問題已被證明解決。"
             ]
           },
           {
@@ -316,7 +316,7 @@
               "支援 Ethereum 與 Polygon 主網；此介面不支援其他鏈或合約錢包。",
               "交易介面要求桌面 Chrome；其他瀏覽器及行動裝置仍可閱讀本文件。",
               "未解決交易與沒有 hash 的損壞鎖不會自動丟棄。",
-              "P2-C 仍未證實且門禁維持嚴格；公開 RPC 的限流與可用性仍是外部依賴。"
+              "維護者在儲存庫 README 以 P2-C 追蹤的一項驗證問題仍未證實：歷史 VMU 銷毀與數量語義是否符合目前兩個部署。CREATE2 驗證門禁沒有放寬。公開 RPC 的限流與可用性仍是外部依賴。"
             ]
           }
         ]

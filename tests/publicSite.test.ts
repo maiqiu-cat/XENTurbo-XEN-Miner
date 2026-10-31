@@ -58,7 +58,7 @@ describe('allowlisted static public documents', () => {
           SITE_ORIGIN + path
         )
         const schema = JSON.parse(doc.querySelector('script')!.textContent)
-        expect(schema.dateModified).toBe('2026-10-30')
+        expect(schema.dateModified).toBe('2026-10-31')
         expect(schema.citation).toContain('/tree/v1.1.12')
         expect(doc.querySelectorAll('script:not([type="application/ld+json"])')).toHaveLength(0)
         expect(doc.querySelectorAll('link[rel="alternate"]')).toHaveLength(3)
@@ -80,14 +80,107 @@ describe('allowlisted static public documents', () => {
         ).not.toBeNull()
       }
   })
-  it('retains explicit safety limits in both languages without promising complete security', () => {
-    for (const locale of LOCALES) {
-      const text = files.get(docPath(locale, 'security'))!.body
-      expect(text).toContain('P2-C')
-      expect(text).toContain(
-        locale === 'en' ? 'has no automatic in-app deletion path' : '沒有可自動刪除'
-      )
+  it('describes public source without making a new licensing claim in metadata or documents', () => {
+    for (const html of [
+      rootMetadata(facts.version),
+      ...LOCALES.map((locale) => files.get(docPath(locale))!.body)
+    ]) {
+      expect(html).not.toMatch(/open[ -]source|開源/i)
+      expect(html).toMatch(/Source code is public\.|原始碼公開/)
     }
+  })
+  it.each([
+    [
+      'en',
+      'A transaction that reverts on-chain can still consume gas. Failures before the wallet request opens spend nothing. Check the wallet and explorer for what a transaction actually charged.'
+    ],
+    [
+      'zh-hant',
+      '交易在鏈上回退時仍可能消耗 Gas；錢包請求開啟前失敗則不會花費。實際費用請以錢包與區塊瀏覽器為準。'
+    ]
+  ])('distinguishes reverted gas from pre-wallet failures in %s', (locale, sentence) => {
+    const text = parse(files.get(docPath(locale, 'security'))!.body).querySelector(
+      'article'
+    )!.textContent
+    expect(text).toContain(sentence)
+    expect(text).not.toMatch(
+      /Gas and contract fees may apply even when an operation fails|操作失敗時仍可能產生 Gas 或合約費用/
+    )
+  })
+  it.each([
+    [
+      'en',
+      'security',
+      'The Miner does not ask you to enter a seed phrase or private key.',
+      'Never paste either into a website, RPC setting or support conversation.'
+    ],
+    [
+      'zh-hant',
+      'security',
+      'Miner 不會要求輸入助記詞或私鑰。',
+      '請勿將其貼到網站、RPC 設定或客服對話。'
+    ],
+    [
+      'en',
+      'security',
+      'A damaged lock without a transaction hash is retained and has no automatic in-app deletion path.',
+      'Do not bypass those checks by editing storage or clearing all site data.'
+    ],
+    [
+      'zh-hant',
+      'security',
+      '沒有交易 hash 的損壞鎖會保留，沒有可自動刪除的應用程式內入口。',
+      '請勿藉由修改儲存資料或清空全部網站資料繞過檢查。'
+    ],
+    [
+      'en',
+      'rpc-and-pending',
+      'Do not resend solely because confirmation stopped or timed out.',
+      'It is read-only: operations are blocked until a full refresh succeeds.'
+    ],
+    [
+      'zh-hant',
+      'rpc-and-pending',
+      '請勿只因確認停止或逾時就重送。',
+      '這些資料僅供查看，完整重新整理成功前會阻擋操作。'
+    ]
+  ])('retains explicit %s/%s safety instructions', (locale, topic, first, second) => {
+    const text = parse(files.get(docPath(locale, topic))!.body).querySelector(
+      'article'
+    )!.textContent
+    expect(text).toContain(first)
+    expect(text).toContain(second)
+  })
+  for (const locale of LOCALES) {
+    for (const topic of ['security', 'versions']) {
+      it(`${locale}/${topic} explains the unproven CREATE2 question and links to its versioned evidence`, () => {
+        const doc = parse(files.get(docPath(locale, topic))!.body)
+        const text = doc.querySelector('article')!.textContent
+        expect(text).toContain(
+          locale === 'en'
+            ? 'One maintainer verification question, tracked as P2-C in the repository README, remains unproven: whether historical VMU destruction and count semantics match both current deployments. The CREATE2 verification gate has not been relaxed.'
+            : '維護者在儲存庫 README 以 P2-C 追蹤的一項驗證問題仍未證實：歷史 VMU 銷毀與數量語義是否符合目前兩個部署。CREATE2 驗證門禁沒有放寬。'
+        )
+        expect(text).not.toMatch(
+          /P2-C (?:is resolved|has been proven|is verified)|gate has been relaxed|P2-C 已證實|門禁已放寬/
+        )
+        expect(
+          doc.querySelector(
+            'a[href="https://github.com/maiqiu-cat/XENTurbo-XEN-Miner/blob/v1.1.12/README.md#pr-7-validation-scope"]'
+          )?.textContent
+        ).toBe('README')
+      })
+    }
+  }
+  it.each([
+    ['en', 'Empty Slots Mint starts a mint on the number of available empty slots you enter.'],
+    ['zh-hant', '空槽鑄造會依輸入的數量，使用可用空槽開始鑄造。']
+  ])('describes the empty-slot count input in %s', (locale, sentence) => {
+    const text = parse(files.get(docPath(locale, 'operations'))!.body).querySelector(
+      'article'
+    )!.textContent
+    expect(text).toContain(sentence)
+    expect(text).not.toMatch(/selected empty slots|選取的空槽/)
   })
   it('escapes text and structured data rather than accepting markup from content', () => {
     expect(escapeHtml(`<script a="'">&`)).toBe('&lt;script a=&quot;&#39;&quot;&gt;&amp;')

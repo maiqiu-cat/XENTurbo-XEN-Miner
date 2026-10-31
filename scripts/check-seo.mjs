@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
 import { Window } from 'happy-dom'
+import { isMainModule } from './cli-utils.mjs'
 import { SITE_ORIGIN, SITE_CONTENT, LOCALES, TOPICS, docPath } from './public-site.mjs'
 
 export async function checkPublicBuild(directory = resolve('dist')) {
@@ -119,7 +119,7 @@ export async function checkPublicBuild(directory = resolve('dist')) {
   return { errors, documents: documents.length }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+if (isMainModule(import.meta.url)) {
   checkPublicBuild()
     .then(({ errors, documents }) => {
       if (errors.length) {

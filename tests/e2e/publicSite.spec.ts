@@ -3,6 +3,53 @@ import { SITE_ORIGIN, SITE_CONTENT, LOCALES, TOPICS, docPath } from '../../scrip
 
 test.describe('static documentation without JavaScript', () => {
   test.use({ javaScriptEnabled: false })
+  for (const locale of LOCALES) {
+    test(`${locale} exposes precise fees, public-source facts and unchanged safety limits`, async ({
+      page
+    }) => {
+      await page.goto(docPath(locale))
+      await expect(page.locator('article')).toContainText(
+        locale === 'en' ? 'Source code is public.' : '原始碼公開'
+      )
+      await expect(page.locator('article')).not.toContainText(/open[ -]source|開源/i)
+      for (const topic of ['security', 'versions']) {
+        await page.goto(docPath(locale, topic))
+        await expect(page.locator('article')).toContainText(
+          locale === 'en'
+            ? 'One maintainer verification question, tracked as P2-C in the repository README, remains unproven: whether historical VMU destruction and count semantics match both current deployments. The CREATE2 verification gate has not been relaxed.'
+            : '維護者在儲存庫 README 以 P2-C 追蹤的一項驗證問題仍未證實：歷史 VMU 銷毀與數量語義是否符合目前兩個部署。CREATE2 驗證門禁沒有放寬。'
+        )
+        await expect(page.getByRole('link', { name: 'README', exact: true })).toHaveAttribute(
+          'href',
+          'https://github.com/maiqiu-cat/XENTurbo-XEN-Miner/blob/v1.1.12/README.md#pr-7-validation-scope'
+        )
+        if (topic === 'security') {
+          await expect(page.locator('article')).toContainText(
+            locale === 'en'
+              ? 'A transaction that reverts on-chain can still consume gas. Failures before the wallet request opens spend nothing. Check the wallet and explorer for what a transaction actually charged.'
+              : '交易在鏈上回退時仍可能消耗 Gas；錢包請求開啟前失敗則不會花費。實際費用請以錢包與區塊瀏覽器為準。'
+          )
+          await expect(page.locator('article')).toContainText(
+            locale === 'en'
+              ? 'A damaged lock without a transaction hash is retained and has no automatic in-app deletion path.'
+              : '沒有交易 hash 的損壞鎖會保留，沒有可自動刪除的應用程式內入口。'
+          )
+        }
+      }
+      await page.goto(docPath(locale, 'rpc-and-pending'))
+      await expect(page.locator('article')).toContainText(
+        locale === 'en'
+          ? 'Do not resend solely because confirmation stopped or timed out.'
+          : '請勿只因確認停止或逾時就重送。'
+      )
+      await page.goto(docPath(locale, 'operations'))
+      await expect(page.locator('article')).toContainText(
+        locale === 'en'
+          ? 'Empty Slots Mint starts a mint on the number of available empty slots you enter.'
+          : '空槽鑄造會依輸入的數量，使用可用空槽開始鑄造。'
+      )
+    })
+  }
   for (const locale of LOCALES)
     for (const topic of TOPICS) {
       test(`${locale}/${topic} is readable and has reciprocal language links`, async ({ page }) => {

@@ -160,6 +160,7 @@ function renderDocument(locale, topic, facts) {
 <p class="review-date">${text.reviewed}: <time datetime="${SITE_CONTENT.reviewedOn}">${SITE_CONTENT.reviewedOn}</time> · ${text.documentedVersion}: v${SITE_CONTENT.reviewedVersion} · ${link(source, text.source)}</p>
 ${topic === 'overview' ? `<figure><img src="${IMAGE}" alt="${text.previewAlt}" width="1200" height="630" loading="lazy" decoding="async"><figcaption>${text.previewAlt}</figcaption></figure>` : ''}
 ${doc.sections.map((section) => `<section><h2>${escapeHtml(section.heading)}</h2>${(section.paragraphs ?? []).map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join('')}${section.items ? `<ul>${section.items.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>` : ''}</section>`).join('')}
+${['security', 'versions'].includes(topic) ? `<p>${link(`${REPOSITORY}/blob/v${SITE_CONTENT.reviewedVersion}/README.md#pr-7-validation-scope`, 'README')}</p>` : ''}
 ${topic === 'overview' ? contractSection(locale, facts.chains, facts.contracts) : ''}
 </article></main><footer>Copyright 2026 · ${link(`${SITE_ORIGIN}/`, 'Miner.XENTurbo.io')} · ${link(REPOSITORY, 'GitHub')}</footer></body></html>`
 }
